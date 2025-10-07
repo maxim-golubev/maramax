@@ -30,7 +30,7 @@ Bonus: speak commands to **rewrite selected text** via AWS Bedrock (Claude).
 
 ## Why this project?
 
-Parakeet Dictation gives you **on-device** speech-to-text on macOS with a **single push-to-talk key** (Globe/Function). It’s built to be:
+Parakeet Dictation gives you **on-device** speech-to-text on macOS with a **single push-to-talk key**. It’s built to be:
 
 - **Private**: Audio is processed locally on your Mac.
 - **Fast**: Parakeet models are optimized and run great on Apple Silicon via MLX.
@@ -52,10 +52,7 @@ Parakeet Dictation gives you **on-device** speech-to-text on macOS with a **sing
 
 ## Demo
 
-_Add a short GIF here showing:_
-
-1. Globe key down → speaking → Globe key up → text appears
-2. Selecting text → Globe key → “make this friendlier” → selection is replaced
+TBD
 
 ---
 
@@ -66,7 +63,6 @@ _Add a short GIF here showing:_
 - **Microphone**
 - **Accessibility permission** (to paste text programmatically)
 - **PortAudio** (for PyAudio)
-- Optional (for AI edits): **AWS account with Bedrock access** (Claude)
 
 ---
 
@@ -84,21 +80,10 @@ brew install portaudio ffmpeg
 git clone https://github.com/osadalakmal/parakeet-dictation.git
 cd parakeet-dictation
 
-python3 -m venv .venv
+uv venv -p 3.12.5
 source .venv/bin/activate
-
-pip install -r requirements.txt
+uv add -r requirements.txt
 ```
-
----
-
-## Configuration
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your AWS region and credentials if you want Bedrock-powered editing.
 
 ---
 
@@ -107,15 +92,14 @@ Edit `.env` with your AWS region and credentials if you want Bedrock-powered edi
 ### Push-to-talk dictation
 
 1. Launch the app (see Development or Background sections below).
-2. Press the **Globe** (🌐) / Function key to start recording.
+2. Press the **Ctrl+Alt+A** (🌐) / Function key to start recording.
 3. Speak normally.
-4. Press the key again to stop. The app will transcribe and paste the text at your current cursor position.
+4. Release the keys again to stop. The app will transcribe and paste the text at your current cursor position.
 
-### Voice-driven text editing (Claude via Bedrock)
+### Voice-driven text editing (Qwen via MLX)
 
 1. Select text in any app.
 2. Press the Globe / Fn key and speak an instruction, e.g.:
-  - “Make this more professional”
   - “Fix the grammar”
   - “Summarize this”
   - “Translate to Spanish”
@@ -143,14 +127,13 @@ Without Accessibility permission, the app cannot paste text for you.
 ## Run in the background
 
 ```bash
-pip install -r requirements.txt
-nohup ./run.sh >/dev/null 2>&1 & disown
+nohup PYTHONPATH=src python -m parakeet_dictation.main >/dev/null 2>&1 & disown
 ```
 
 Stop it later:
 
 ```bash
-ps aux | grep 'src/main.py'
+ps aux | grep 'parakeet_dictation'
 kill -9 <PID>
 ```
 
@@ -160,7 +143,6 @@ kill -9 <PID>
 
 - No audio: ensure `portaudio` is installed
 - Nothing pastes: check Accessibility permissions
-- Bedrock errors: check AWS credentials and region
 - High CPU usage: first run warms up the model
 
 ---
@@ -168,39 +150,38 @@ kill -9 <PID>
 ## Development
 
 ```bash
-python src/main.py
+source .venv/bin/activate
+PYTHONPATH=src PARAKEET_LOG=debug python -m parakeet_dictation.main
 ```
 
 - Menu bar UI via `rumps`
 - Hotkey via `pynput`
 - Audio capture via `pyaudio`
 - ASR via `parakeet-mlx`
-- Optional Claude-powered edits via Bedrock
+- AI powered edits via Qwen
 
 ---
 
 ## Roadmap
 
-- Preferences UI
-- Streaming/partial results
-- macOS app packaging
+- Preferences UI (Status bar is pretty finicky)
+- Streaming/partial results (It seems nice to start pasting things soon as we can)
+- macOS app packaging (Non techie folks can use this as well)
 - Latency/quality settings
-- Crash logging
 
 ---
 
 ## FAQ
 
-**Does dictation send audio to the cloud?** No. Local only. Editing uses Bedrock if enabled.  
-**What languages are supported?** English.  
-**Intel Macs?** Works but slower.
+**Does dictation send audio to the cloud?** No. Local only.
+**What languages are supported?** English. That's the only one I know :). Feel free to try other languages parkeet supports.
 
 ---
 
 ## Credits
 
 - Parakeet MLX (NVIDIA Parakeet on Apple Silicon)
-- Originally forked from a Whisper-based dictation app
+- Originally forked from a [Whisper-based dictation app](https://github.com/ashwin-pc/whisper-dictation)
 
 ---
 
