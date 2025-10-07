@@ -1,7 +1,7 @@
 # Parakeet Dictation (macOS)
 
 Local, fast, privacy-friendly dictation for macOS using NVIDIA Parakeet (MLX on Apple Silicon) with a push-to-talk hotkey.  
-Bonus: speak commands to **rewrite selected text** via AWS Bedrock (Claude).
+Bonus: speak commands to **rewrite selected text** via Qwen.
 
 ---
 
