@@ -1,5 +1,8 @@
 build
+build.bak.*
 dist
+dist.bak.*
 .env
 __pycache__
+*.egg-info/
 .vscode/launch.json

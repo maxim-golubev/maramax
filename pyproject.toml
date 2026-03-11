@@ -1,27 +1,18 @@
 [project]
 name = "parakeet-dictation"
-version = "0.1.6"
-description = "A dication tool powered by Parakeet"
+version = "0.2.0"
+description = "A dictation tool powered by Parakeet"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "parakeet-mlx",
-    "soundfile>=0.12",
-    "audresample>=0.3",
     "numpy<2.3",
-    "dacite>=1.8",
-    "tqdm>=4.66",
     "pyaudio~=0.2.14",
-    "pynput~=1.8.1",
     "rumps~=0.4.0",
-    "numba>=0.61.2",
     "pyperclip~=1.9.0",
     "python-dotenv~=1.1.1",
-    "mlx-lm",
-    # macOS-only Cocoa bridge
-    'pyobjc-framework-Cocoa~=11.1; platform_system == "Darwin"',
-    "pyobjc-framework-cocoa~=11.1",
+    "pyobjc-framework-cocoa~=11.1; platform_system == 'Darwin'",
 ]
 
 [build-system]
@@ -34,8 +25,9 @@ parakeet-dictation = "parakeet_dictation.main:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-dir]
-"" = "src"
-
 [project.optional-dependencies]
-dev = ["build", "pytest", "ruff", "mypy"]
+dev = ["build", "pytest", "ruff", "mypy", "py2app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["build", "dist", "build.bak.*", "dist.bak.*"]
