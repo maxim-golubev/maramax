@@ -1,189 +1,140 @@
-# Parakeet Dictation (macOS)
+# Maramax
 
-Local, fast, privacy-friendly dictation for macOS using NVIDIA Parakeet (MLX on Apple Silicon) with a push-to-talk hotkey.  
-Bonus: speak commands to **rewrite selected text** via Qwen.
+On-device speech-to-text for macOS. Lives in your menu bar, transcribes with a single hotkey, and never sends audio off your machine.
 
----
-
-## Table of Contents
-
-- [Why this project?](#why-this-project)
-- [Features](#features)
-- [Demo](#demo)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Usage](#usage)
-  - [Push-to-talk dictation](#push-to-talk-dictation)
-  - [Voice-driven text editing (Claude via Bedrock)](#voice-driven-text-editing-claude-via-bedrock)
-  - [Menu bar controls](#menu-bar-controls)
-- [Permissions (macOS)](#permissions-macos)
-- [Run in the background](#run-in-the-background)
-- [Troubleshooting](#troubleshooting)
-- [Development](#development)
-- [Roadmap](#roadmap)
-- [FAQ](#faq)
-- [Credits](#credits)
-- [License](#license)
+Built with [NVIDIA Parakeet](https://github.com/nvidia/parakeet-mlx) running locally through MLX on Apple Silicon.
 
 ---
 
-## Why this project?
+## What it does
 
-Parakeet Dictation gives you **on-device** speech-to-text on macOS with a **single push-to-talk key**. It’s built to be:
+Press **Option+Space** anywhere on your Mac. A floating overlay appears, recording starts, and when you stop it the transcript lands in your clipboard. That's the whole workflow.
 
-- **Private**: Audio is processed locally on your Mac.
-- **Fast**: Parakeet models are optimized and run great on Apple Silicon via MLX.
-- **Practical**: Dictate into *any* app, or select text and **say how to transform it** (“make this more professional”, “translate to Spanish”, etc.)-the app rewrites it via AWS Bedrock and pastes it in place.
+It also transcribes audio and video files — drag them onto the overlay or use the file picker. Everything stays local, everything goes to history.
 
----
+### At a glance
 
-## Features
-
-- 🖥️ **Menu bar** app (stays out of your way)
-- 🎙️ **Push-to-talk**: Press the **Globe / Fn** key to start recording, press again to transcribe & paste
-- ⚡ **Local ASR** with **NVIDIA Parakeet** (Apple Silicon via MLX)
-- ⌨️ **Auto-paste at cursor** in the foreground app
-- ✨ **Voice-driven text editing** (optional): when text is selected, your speech is treated as an instruction and the selection is replaced with the result (via AWS Bedrock → Claude)
-- ✅ Clear **recording status** via the menu bar icon
-- 🧰 Simple **background mode** (no UI) for power users
-
----
-
-## Demo
-
-TBD
+- **Menu bar app** with a native floating overlay (not Electron, not a web view)
+- **Push-to-talk dictation** with global hotkey and auto-copy
+- **File transcription** for audio/video via drag-and-drop, with chunked processing and progress
+- **Input device selection** — picks your active mic by default, or choose manually
+- **Transcription history** stored locally
+- **Cancellable** — cancel any transcription mid-flight from the overlay
+- **Fully local** — no network calls, no accounts, no telemetry
 
 ---
 
 ## Requirements
 
-- **macOS 12+** (Apple Silicon recommended for speed)
-- **Python 3.10+**
-- **Microphone**
-- **Accessibility permission** (to paste text programmatically)
-- **PortAudio** (for PyAudio)
+- macOS 12+ on Apple Silicon (Intel Macs will work but slowly)
+- Python 3.10+
+- PortAudio and FFmpeg:
+  ```bash
+  brew install portaudio ffmpeg
+  ```
 
 ---
 
-## Installation
-
-### 1. Install system deps
+## Install
 
 ```bash
-brew install portaudio ffmpeg
+git clone https://github.com/maxim-golubev/maramax.git
+cd maramax
+uv venv -p 3.12
+uv sync
 ```
 
-### 2. Clone & install Python deps
+### Run from source
 
 ```bash
-git clone https://github.com/osadalakmal/parakeet-dictation.git
-cd parakeet-dictation
-
-uv venv -p 3.12.5
-source .venv/bin/activate
-uv add -r requirements.txt
+./run.sh
 ```
+
+### Build a standalone .app
+
+```bash
+uv sync --extra dev
+bash build_app.sh
+# Output: dist/Maramax.app — drag to /Applications
+```
+
+The first launch downloads the Parakeet model (~400 MB) to your local cache. After that it starts in seconds.
 
 ---
 
 ## Usage
 
-### Push-to-talk dictation
+| Action | Shortcut |
+|---|---|
+| Open overlay | **Option+Space** |
+| Start/stop recording | **Cmd+R** |
+| Copy transcript | **Cmd+C** |
+| Close overlay | **Esc** |
 
-1. Launch the app (see Development or Background sections below).
-2. Press the **Ctrl+Alt+A** (🌐) / Function key to start recording.
-3. Speak normally.
-4. Release the keys again to stop. The app will transcribe and paste the text at your current cursor position.
+**Dictation**: Option+Space opens the overlay and starts recording automatically. Cmd+R stops recording and triggers transcription. The result is copied to your clipboard.
 
-### Voice-driven text editing (Qwen via MLX)
+**File transcription**: Drag audio or video files onto the overlay, or click **Files...** to use the picker. Supports aac, aiff, flac, m4a, mov, mp3, mp4, ogg, opus, wav, and webm.
 
-1. Select text in any app.
-2. Press the Globe / Fn key and speak an instruction, e.g.:
-  - “Fix the grammar”
-  - “Summarize this”
-  - “Translate to Spanish”
-3. Press the key again to stop. The selected text will be replaced with the edited version.
-
-When no text is selected, your speech is treated as dictation and the text is inserted normally.
-
-### Menu bar controls
-
-- Start/Stop Listening - toggles recording
-- Settings - (future) configuration UI
-- Quit - exits the app
+**Menu bar**: Right-click the menu bar icon for quick access to overlay, history, recording controls, and file import.
 
 ---
 
-## Permissions (macOS)
+## Permissions
 
-- **Microphone**: System Settings → Privacy & Security → Microphone → allow your Terminal/app
-- **Accessibility**: System Settings → Privacy & Security → Accessibility → allow your Terminal/app
+macOS will prompt for these on first use:
 
-Without Accessibility permission, the app cannot paste text for you.
+- **Microphone** — for recording audio
+- **Accessibility** — for the global hotkey (Option+Space)
+
+Grant them in System Settings > Privacy & Security.
 
 ---
 
-## Run in the background
+## How it works
 
-```bash
-nohup PYTHONPATH=src python -m parakeet_dictation.main >/dev/null 2>&1 & disown
+The app is a Python menu bar app ([rumps](https://github.com/jaredks/rumps)) with a native AppKit overlay ([PyObjC](https://pyobjc.readthedocs.io/)). Audio capture uses PyAudio, global hotkeys use the Carbon API, and transcription runs through [parakeet-mlx](https://github.com/nvidia/parakeet-mlx) — NVIDIA's Parakeet ASR model compiled for Apple Silicon via [MLX](https://github.com/ml-explore/mlx).
+
+Long files are transcribed in chunks with overlap to avoid cutting words at boundaries. Transcription runs in a background thread so the UI stays responsive, and any job can be cancelled from the overlay.
+
+The standalone .app is built with py2app. MLX is a namespace package with C extensions, which required some non-trivial packaging workarounds — see `build_app.sh` and `packaging/setup.py` if you're curious.
+
+---
+
+## Project structure
+
 ```
-
-Stop it later:
-
-```bash
-ps aux | grep 'parakeet_dictation'
-kill -9 <PID>
+src/parakeet_dictation/
+  app.py            # Core controller, owns all state and coordinates components
+  overlay.py        # Native NSPanel overlay UI
+  transcription.py  # Audio recording and Parakeet transcription
+  hotkeys.py        # Global hotkey registration via Carbon API
+  history.py        # Local transcript history store
+  clipboard.py      # Clipboard integration
+  config.py         # App configuration
+  paths.py          # Resource path resolution
+  main.py           # Entry point
+packaging/
+  setup.py          # py2app configuration
+  maramax_app.py    # Bundle entry point
+build_app.sh        # Build + package script
 ```
 
 ---
 
 ## Troubleshooting
 
-- No audio: ensure `portaudio` is installed
-- Nothing pastes: check Accessibility permissions
-- High CPU usage: first run warms up the model
-
----
-
-## Development
-
-```bash
-source .venv/bin/activate
-PYTHONPATH=src PARAKEET_LOG=debug python -m parakeet_dictation.main
-```
-
-- Menu bar UI via `rumps`
-- Hotkey via `pynput`
-- Audio capture via `pyaudio`
-- ASR via `parakeet-mlx`
-- AI powered edits via Qwen
-
----
-
-## Roadmap
-
-- Preferences UI (Status bar is pretty finicky)
-- Streaming/partial results (It seems nice to start pasting things soon as we can)
-- macOS app packaging (Non techie folks can use this as well)
-- Latency/quality settings
-
----
-
-## FAQ
-
-**Does dictation send audio to the cloud?** No. Local only.
-**What languages are supported?** English. That's the only one I know :). Feel free to try other languages parkeet supports.
+- **No audio captured**: Make sure `portaudio` is installed before Python deps. Check Microphone permission.
+- **File transcription fails**: Install `ffmpeg` (`brew install ffmpeg`).
+- **Hotkey doesn't work**: Grant Accessibility permission. Restart the app after granting.
+- **Slow first transcription**: The model warms up on first use. Subsequent transcriptions are fast.
 
 ---
 
 ## Credits
 
-- Parakeet MLX (NVIDIA Parakeet on Apple Silicon)
-- Originally forked from a [Whisper-based dictation app](https://github.com/ashwin-pc/whisper-dictation)
-
----
+- [parakeet-mlx](https://github.com/nvidia/parakeet-mlx) — NVIDIA Parakeet ASR on Apple Silicon
+- [MLX](https://github.com/ml-explore/mlx) — Apple's ML framework for Apple Silicon
+- Originally forked from [parakeet-dictation](https://github.com/osadalakmal/parakeet-dictation)
 
 ## License
 
