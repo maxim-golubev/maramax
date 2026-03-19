@@ -9,11 +9,13 @@ from PyObjCTools import AppHelper
 
 from .clipboard import ClipboardError, copy_text
 from .config import AppConfig
+from .export import ExportError, export_results
 from .history import HistoryStore
 from .hotkeys import GlobalHotKeyManager, HotKeyError
 from .logger_config import setup_logging
 from .overlay import OverlayController
 from .paths import resource_path
+from .queue import TranscriptionQueue
 from .transcription import AudioRecorder, InputDevice, ParakeetTranscriber, TranscriptionError
 
 logger = setup_logging()
@@ -38,6 +40,7 @@ class DictationApp(rumps.App):
         self.transcriber = ParakeetTranscriber()
         self.recorder = AudioRecorder()
         self.history_store = HistoryStore(history_limit=self.config.history_limit)
+        self.queue = TranscriptionQueue()
         self.current_transcript = ""
         self.recording_active = False
         self.is_transcribing = False
@@ -46,19 +49,20 @@ class DictationApp(rumps.App):
         self._hide_after_transcription = False
         self._force_copy_after_transcription = False
         self._cancel_event = threading.Event()
+        self._queue_cancel_event = threading.Event()
         self._status_token = 0
-        self._base_status = "Loading speech model…"
+        self._base_status = "Loading speech model\u2026"
         self._state_lock = threading.Lock()
         self.hotkey_manager: GlobalHotKeyManager | None = None
         self._hotkey_error_message: str | None = None
 
-        self.status_item = rumps.MenuItem("Status: Loading speech model…")
+        self.status_item = rumps.MenuItem("Status: Loading speech model\u2026")
         self.menu = [
             rumps.MenuItem("Show Overlay"),
             rumps.MenuItem("Show History"),
             rumps.MenuItem("Toggle Recording"),
             rumps.MenuItem("Copy Last Transcript"),
-            rumps.MenuItem("Open Media Files…"),
+            rumps.MenuItem("Open Media Files\u2026"),
             rumps.MenuItem("Clear History"),
             None,
             self.status_item,
@@ -136,7 +140,7 @@ class DictationApp(rumps.App):
         self.overlay_controller.set_recording(True)
         self.overlay_controller.show_mode("result")
         self.start_recording()
-        # Refresh AFTER start_recording — start() reinits PyAudio, so
+        # Refresh AFTER start_recording -- start() reinits PyAudio, so
         # list_input_devices() reads the fresh cache without a second reinit.
         self._refresh_input_devices()
 
@@ -147,6 +151,7 @@ class DictationApp(rumps.App):
                 action = "stop_recording"
             elif self.is_transcribing:
                 self._cancel_event.set()
+                self._queue_cancel_event.set()
                 self._hide_after_transcription = True
                 return
             else:
@@ -197,7 +202,7 @@ class DictationApp(rumps.App):
         else:
             AppHelper.callAfter(self.overlay_controller.prepare_for_recording)
         self.recording_active = True
-        self._push_status("Recording…", recording=True)
+        self._push_status("Recording\u2026", recording=True)
 
     def stop_recording_requested(self, auto_copy: bool | None = None, hide_after: bool = False) -> None:
         if not self.recording_active:
@@ -214,7 +219,7 @@ class DictationApp(rumps.App):
         self.is_transcribing = True
         self._cancel_event.clear()
         pcm_bytes = self.recorder.stop()
-        self._push_status("Transcribing…", recording=False)
+        self._push_status("Transcribing\u2026", recording=False)
         AppHelper.callAfter(self.overlay_controller.set_transcribing, True)
         threading.Thread(
             target=self._transcribe_recording_worker,
@@ -262,92 +267,159 @@ class DictationApp(rumps.App):
         finally:
             self.is_transcribing = False
             AppHelper.callAfter(self.overlay_controller.set_transcribing, False)
+            AppHelper.callAfter(self._restore_base_status)
             self._finalize_deferred_overlay_actions()
 
-    def handle_media_files(self, paths) -> None:
+    # -- Queue delegate methods --
+
+    def queue_add_files(self, paths) -> None:
         normalized = [str(Path(path)) for path in paths if path]
         if not normalized:
             return
 
-        if self.recording_active or self.is_transcribing:
-            self._push_status("Finish the current recording first", recording=self.recording_active)
+        self.queue.add_many(normalized)
+        self._refresh_queue_on_main()
+        self._show_overlay_on_main("queue")
+
+    def queue_remove_item(self, item_id: str) -> None:
+        self.queue.remove(item_id)
+        self._refresh_queue_on_main()
+
+    def queue_move_item(self, item_id: str, new_index: int) -> None:
+        self.queue.move(item_id, new_index)
+        self._refresh_queue_on_main()
+
+    def queue_clear_requested(self) -> None:
+        self.queue.clear()
+        self._refresh_queue_on_main()
+
+    def queue_start_requested(self) -> None:
+        if not self.transcriber.is_ready():
+            self._push_status("Model is still loading, please wait", recording=False)
             return
 
-        self.current_transcript = ""
-        self.overlay_controller.set_current_text("")
-        self._show_overlay_on_main("result")
-        session = self._overlay_session
-        self.is_transcribing = True
-        self._cancel_event.clear()
-        self._push_status("Transcribing files…", recording=False)
-        AppHelper.callAfter(self.overlay_controller.set_transcribing, True)
-        threading.Thread(target=self._transcribe_files_worker, args=(normalized, session), daemon=True).start()
+        if self.is_transcribing or self.recording_active:
+            self._push_status("Finish the current operation first", recording=self.recording_active)
+            return
 
-    def _transcribe_files_worker(self, paths: list[str], session: int) -> None:
-        sections = []
-        failures = []
+        if self.queue.pending_count() == 0:
+            self._push_status("No files in queue", recording=False, revert_after=5)
+            return
+
+        output_config = self.overlay_controller.show_output_mode_dialog()
+        if output_config is None:
+            return
+
+        self.is_transcribing = True
+        self._queue_cancel_event.clear()
+        self._cancel_event.clear()
+        session = self._overlay_session
+        AppHelper.callAfter(self.overlay_controller.set_queue_processing, True)
+        AppHelper.callAfter(self.overlay_controller.set_transcribing, True)
+        self._push_status("Processing queue\u2026", recording=False)
+        threading.Thread(
+            target=self._process_queue_worker,
+            args=(output_config, session),
+            daemon=True,
+        ).start()
+
+    def _process_queue_worker(self, output_config, session: int) -> None:
+        items = self.queue.items()
+        pending = [item for item in items if item.status == "pending"]
 
         try:
-            for index, path in enumerate(paths, start=1):
-                if self._cancel_event.is_set():
-                    self._push_status("Cancelled", recording=False, revert_after=5)
-                    return
-                file_name = os.path.basename(path)
-                self._push_status(f"Transcribing file {index}/{len(paths)}: {file_name}", recording=False)
+            for index, item in enumerate(pending, start=1):
+                if self._queue_cancel_event.is_set():
+                    self.queue.set_status(item.id, "cancelled")
+                    self._refresh_queue_on_main()
+                    continue
 
-                def _file_progress(current_pos, total_pos, _fn=file_name, _idx=index, _total=len(paths)):
-                    if self._cancel_event.is_set():
+                self.queue.set_status(item.id, "processing")
+                self._refresh_queue_on_main()
+
+                def _progress(current_pos, total_pos, _fn=item.filename, _idx=index, _total=len(pending)):
+                    if self._queue_cancel_event.is_set():
                         raise TranscriptionError("Cancelled")
                     pct = int(current_pos / total_pos * 100) if total_pos > 0 else 0
                     prefix = f"[{_idx}/{_total}] " if _total > 1 else ""
                     self._push_status(f"{prefix}{_fn}: {pct}%", recording=False)
 
+                self._push_status(
+                    f"[{index}/{len(pending)}] {item.filename}", recording=False,
+                )
+
                 try:
-                    text = self.transcriber.transcribe_file(path, progress_callback=_file_progress)
+                    text = self.transcriber.transcribe_file(
+                        item.path, progress_callback=_progress,
+                    )
                 except TranscriptionError as exc:
-                    if self._cancel_event.is_set():
-                        self._push_status("Cancelled", recording=False, revert_after=5)
-                        return
-                    failures.append(f"{file_name}: {exc}")
-                    logger.error(str(exc))
+                    if self._queue_cancel_event.is_set():
+                        self.queue.set_status(item.id, "cancelled")
+                    else:
+                        self.queue.set_status(item.id, "failed", error=str(exc))
+                        logger.error(f"Queue item failed: {item.filename}: {exc}")
+                    self._refresh_queue_on_main()
                     continue
                 except Exception as exc:
-                    failures.append(f"{file_name}: unexpected error")
-                    logger.error(f"Unexpected error transcribing {file_name}: {exc}")
+                    self.queue.set_status(item.id, "failed", error=str(exc))
+                    logger.error(f"Queue item error: {item.filename}: {exc}")
+                    self._refresh_queue_on_main()
                     continue
 
                 if not text:
-                    failures.append(f"{file_name}: no speech detected")
+                    self.queue.set_status(item.id, "failed", error="No speech detected")
+                    self._refresh_queue_on_main()
                     continue
 
-                self.history_store.add_entry("file", file_name, text)
-                sections.append(f"{file_name}\n{text}")
+                self.queue.set_status(item.id, "done", result_text=text)
+                self.history_store.add_entry("file", item.filename, text)
+                self._refresh_queue_on_main()
 
-            if not sections:
-                message = failures[0] if failures else "No transcription output was produced"
-                self._push_status(message, recording=False, revert_after=5)
-                return
+            # Export results
+            completed_items = [i for i in self.queue.items() if i.status == "done" and i.result_text]
+            if completed_items and not self._queue_cancel_event.is_set():
+                try:
+                    summary = export_results(completed_items, output_config)
+                    self._push_status(summary, recording=False, revert_after=5)
+                    if output_config.mode.value == "clipboard":
+                        self._flash_copy_feedback_on_main()
+                except ExportError as exc:
+                    logger.error(f"Export failed: {exc}")
+                    self._push_status(f"Export failed: {exc}", recording=False, revert_after=5)
+            elif self._queue_cancel_event.is_set():
+                if completed_items:
+                    try:
+                        summary = export_results(completed_items, output_config)
+                        self._push_status(
+                            f"Queue cancelled. {summary}", recording=False, revert_after=5,
+                        )
+                    except ExportError:
+                        self._push_status("Queue cancelled", recording=False, revert_after=5)
+                else:
+                    self._push_status("Queue cancelled", recording=False, revert_after=5)
+            else:
+                failed_items = [i for i in self.queue.items() if i.status == "failed"]
+                if failed_items:
+                    self._push_status("All items failed", recording=False, revert_after=5)
+                else:
+                    self._push_status("No transcription output", recording=False, revert_after=5)
 
-            combined = "\n\n".join(sections)
-            self.current_transcript = combined
-            self._set_current_text_on_main(combined, session)
             self._refresh_history_on_main()
 
-            status_suffix = ". Some files failed." if failures else ""
-            with self._state_lock:
-                force_copy = self._force_copy_after_transcription
-            if self.config.auto_copy_to_clipboard or force_copy:
-                self._copy_text_with_feedback(
-                    combined,
-                    success_status=f"Copied file transcript to clipboard{status_suffix}",
-                    failure_status=f"File transcript ready, but clipboard copy failed{status_suffix}",
-                )
-            else:
-                self._push_status(f"File transcript ready{status_suffix}", recording=False, revert_after=5)
         finally:
             self.is_transcribing = False
             AppHelper.callAfter(self.overlay_controller.set_transcribing, False)
+            AppHelper.callAfter(self.overlay_controller.set_queue_processing, False)
+            AppHelper.callAfter(self._restore_base_status)
+            self._refresh_queue_on_main()
             self._finalize_deferred_overlay_actions()
+
+    def handle_media_files(self, paths) -> None:
+        self.queue_add_files(paths)
+
+    def _refresh_queue_on_main(self) -> None:
+        items = self.queue.items()
+        AppHelper.callAfter(self.overlay_controller.set_queue_items, items)
 
     def _publish_transcript(
         self, text: str, source_kind: str, source_label: str, auto_copy: bool, session: int,
@@ -459,6 +531,9 @@ class DictationApp(rumps.App):
             timer.daemon = True
             timer.start()
 
+    def _restore_base_status(self) -> None:
+        self._base_status = "Ready"
+
     def _revert_status(self, token: int) -> None:
         if token != self._status_token:
             return
@@ -497,7 +572,7 @@ class DictationApp(rumps.App):
         del sender
         self.copy_current_transcript()
 
-    @rumps.clicked("Open Media Files…")
+    @rumps.clicked("Open Media Files\u2026")
     def menu_open_files(self, sender):
         del sender
         self.show_overlay()

@@ -52,7 +52,7 @@ class HistoryStore:
 
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             return []
 
         entries = []
