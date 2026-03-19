@@ -135,6 +135,17 @@ Custom exceptions: `TranscriptionError`, `HotKeyError`, `ClipboardError`, `Expor
 | `TOKENIZERS_PARALLELISM` | Set to `false` in main.py to prevent numpy threading issues |
 | `RESOURCEPATH` | Set by py2app at runtime for bundle resource resolution |
 
+## Build & Deploy Workflow
+
+Full build-deploy-push cycle:
+```bash
+uv sync --extra dev
+bash build_app.sh
+cp -R dist/Maramax.app /Applications/
+rm -rf dist build
+git add -A && git commit -m "message" && git push origin main
+```
+
 ## Build Notes
 
 The standalone .app is built with py2app. MLX is a namespace package with C extensions, which requires workarounds in `build_app.sh`:
