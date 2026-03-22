@@ -241,13 +241,17 @@ class DictationApp(rumps.App):
                 rate=self.recorder.rate,
                 progress_callback=self._check_cancel,
             )
-            if self._cancel_event.is_set():
-                self._push_status("Cancelled", recording=False, revert_after=5)
-                return
             if not text:
-                self._push_status("No speech detected", recording=False, revert_after=5)
+                if self._cancel_event.is_set():
+                    self._push_status("Cancelled", recording=False, revert_after=5)
+                else:
+                    self._push_status("No speech detected", recording=False, revert_after=5)
                 return
 
+            # Transcription succeeded — always publish the result even if
+            # cancel was requested while inference was running.  The cancel
+            # only interrupts via _check_cancel raising TranscriptionError;
+            # if we got here, the work is done and shouldn't be discarded.
             self._publish_transcript(
                 text=text,
                 source_kind="microphone",

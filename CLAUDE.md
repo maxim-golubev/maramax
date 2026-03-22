@@ -85,6 +85,8 @@ Thread coordination:
 
 User clicks "Cancel" during transcription -> sets `_cancel_event` and `_queue_cancel_event` -> worker's progress callback checks the event and raises `TranscriptionError("Cancelled")` -> worker unwinds gracefully. Queue cancellation still exports any items that completed before the cancel.
 
+**Invariant**: If `transcribe_pcm` returns text successfully, the result is always published — even if the cancel event was set while inference was running. Cancel only discards results when it actually interrupts inference (raises `TranscriptionError` via the chunk callback). A completed transcription is never thrown away.
+
 ### Deferred Overlay Actions
 
 When transcription completes, two deferred flags may trigger post-completion actions:
@@ -104,6 +106,14 @@ File transcription uses a queue-based workflow. Dropping/picking files adds them
 History entries are always created regardless of output mode. The queue worker (`_process_queue_worker`) processes items sequentially and uses `_queue_cancel_event` for cancellation. If cancelled mid-queue, any already-completed items are still exported.
 
 The overlay's third segmented control tab ("Queue") shows a monospaced text list of items with status indicators and a count badge (e.g., "Queue (3)"). Selection for move/remove is cursor-position based in the text view. During processing, the queue list stays visible with live status updates per item, alongside a Cancel button — the overlay does not collapse to the minimal transcribing layout.
+
+### MLX Memory Management
+
+MLX uses a Metal buffer cache that holds GPU allocations between inference calls. Without cleanup, memory grows unboundedly across transcriptions. After each inference in `_transcribe_path`, the result is explicitly deleted, `gc.collect()` breaks cyclic references, and `mx.metal.clear_cache()` releases cached Metal buffers back to the OS. Model weights (referenced by `self.model`) survive the cache clear. Same cleanup runs after model warm-up.
+
+### Thread Safety Rationale
+
+Simple boolean/string flags (`recording_active`, `is_transcribing`, `overlay_visible`, `current_transcript`) are read/written without locks. This is safe because: (1) Python's GIL makes single-attribute reads/writes atomic, (2) all UI event handlers run on the main thread (AppKit serializes them), and (3) worker threads only write these flags at completion, then marshal UI updates via `AppHelper.callAfter`. The `_state_lock` protects compound state checks (e.g., `hide_overlay` reading multiple flags atomically) and flag groups that must change together (deferred overlay flags).
 
 ### Error Handling
 

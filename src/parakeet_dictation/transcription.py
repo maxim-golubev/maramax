@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import shutil
 import subprocess
@@ -10,6 +11,7 @@ import wave
 from pathlib import Path
 from typing import NamedTuple
 
+import mlx.core as mx
 import numpy as np
 import pyaudio
 from parakeet_mlx import from_pretrained
@@ -145,7 +147,9 @@ class AudioRecorder:
                 logger.warning("Recording thread did not stop in time, forcing stream close")
                 self._close_stream()
 
-        return b"".join(self.frames)
+        audio_data = b"".join(self.frames)
+        self.frames = []
+        return audio_data
 
     def is_recording(self) -> bool:
         with self._state_lock:
@@ -261,7 +265,10 @@ class ParakeetTranscriber:
         silence = np.zeros(int(0.3 * 16000), dtype=np.int16).tobytes()
         temp_path = self._write_wav_file(silence, channels=1, sample_width=2, rate=16000)
         try:
-            self.model.transcribe(temp_path)
+            result = self.model.transcribe(temp_path)
+            del result
+            gc.collect()
+            mx.metal.clear_cache()
         finally:
             try:
                 os.unlink(temp_path)
@@ -325,17 +332,28 @@ class ParakeetTranscriber:
         if progress_callback is not None:
             kwargs["chunk_callback"] = progress_callback
         result = self.model.transcribe(str(file_path), **kwargs)
-        return (getattr(result, "text", "") or "").strip()
+        text = (getattr(result, "text", "") or "").strip()
+        del result
+        gc.collect()
+        mx.metal.clear_cache()
+        return text
 
     def _write_wav_file(self, frames: bytes, channels: int, sample_width: int, rate: int) -> str:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
             temp_path = temp_file.name
 
-        with wave.open(temp_path, "wb") as wav_file:
-            wav_file.setnchannels(channels)
-            wav_file.setsampwidth(sample_width)
-            wav_file.setframerate(rate)
-            wav_file.writeframes(frames)
+        try:
+            with wave.open(temp_path, "wb") as wav_file:
+                wav_file.setnchannels(channels)
+                wav_file.setsampwidth(sample_width)
+                wav_file.setframerate(rate)
+                wav_file.writeframes(frames)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
 
         return temp_path
 
