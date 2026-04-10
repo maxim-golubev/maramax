@@ -17,6 +17,7 @@ from AppKit import (
     NSOpenPanel,
     NSPanel,
     NSPopUpButton,
+    NSPopUpMenuWindowLevel,
     NSSavePanel,
     NSScrollView,
     NSSegmentedControl,
@@ -277,7 +278,7 @@ class OverlayController(NSObject):
 
         self.drop_label = self._make_label(
             NSMakeRect(48, 12, 592, 16),
-            "Drop audio or video files here, or switch to Queue to batch process.",
+            "Drop a file to transcribe. Switch to Queue to batch process multiple files.",
             11,
             False,
         )
@@ -673,6 +674,13 @@ class OverlayController(NSObject):
         popup.addItemWithTitle_("Save as Single File")
         alert.setAccessoryView_(popup)
 
+        # The overlay panel sits at NSStatusWindowLevel, which would otherwise
+        # obscure modal dialogs. Lift the alert (and follow-up file pickers)
+        # above that level so they render in front of the overlay.
+        alert_window = alert.window()
+        if alert_window is not None:
+            alert_window.setLevel_(NSPopUpMenuWindowLevel)
+
         response = alert.runModal()
         if response != 1000:  # NSAlertFirstButtonReturn
             return None
@@ -691,6 +699,7 @@ class OverlayController(NSObject):
             panel.setCanChooseFiles_(False)
             panel.setAllowsMultipleSelection_(False)
             panel.setPrompt_("Choose Folder")
+            panel.setLevel_(NSPopUpMenuWindowLevel)
             if not panel.runModal():
                 return None
             return OutputConfig(
@@ -707,6 +716,7 @@ class OverlayController(NSObject):
             else:
                 panel.setAllowedFileTypes_(["txt"])
             panel.setNameFieldStringValue_("transcript.txt")
+            panel.setLevel_(NSPopUpMenuWindowLevel)
             if not panel.runModal():
                 return None
             return OutputConfig(
@@ -844,11 +854,14 @@ class OverlayController(NSObject):
     @objc.python_method
     def set_drop_state(self, active: bool):
         if active:
-            self.drop_label.setStringValue_("Drop to add to queue.")
+            if self.mode == "queue":
+                self.drop_label.setStringValue_("Drop to add to queue.")
+            else:
+                self.drop_label.setStringValue_("Drop to transcribe.")
             self.drop_label.setTextColor_(NSColor.systemBlueColor())
         else:
             self.drop_label.setStringValue_(
-                "Drop audio or video files here, or switch to Queue to batch process."
+                "Drop a file to transcribe. Switch to Queue to batch process multiple files."
             )
             self.drop_label.setTextColor_(NSColor.secondaryLabelColor())
 
@@ -867,7 +880,10 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def handle_dropped_paths(self, paths):
-        self.delegate.queue_add_files(paths)
+        if self.mode != "queue" and len(paths) == 1:
+            self.delegate.transcribe_file_directly(paths[0])
+        else:
+            self.delegate.queue_add_files(paths)
 
     @objc.python_method
     def handle_escape_key(self):
@@ -911,9 +927,10 @@ class OverlayController(NSObject):
             panel.setAllowedContentTypes_(_ALLOWED_CONTENT_TYPES)
         else:
             panel.setAllowedFileTypes_(MEDIA_EXTENSIONS)
+        panel.setLevel_(NSPopUpMenuWindowLevel)
         if panel.runModal():
             paths = [url.path() for url in panel.URLs()]
-            self.delegate.queue_add_files(paths)
+            self.handle_dropped_paths(paths)
 
     def closeOverlay_(self, sender):
         del sender
