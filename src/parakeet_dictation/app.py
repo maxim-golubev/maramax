@@ -274,6 +274,87 @@ class DictationApp(rumps.App):
             AppHelper.callAfter(self._restore_base_status)
             self._finalize_deferred_overlay_actions()
 
+    # -- Direct file transcription (single-file shortcut) --
+
+    def transcribe_file_directly(self, path: str) -> None:
+        """Transcribe a single file immediately, bypassing the queue."""
+        if not path:
+            return
+
+        if not self.transcriber.is_ready():
+            self._push_status("Model is still loading, please wait", recording=False)
+            return
+
+        if self.recording_active or self.is_transcribing:
+            self._push_status(
+                "Finish the current operation first", recording=self.recording_active,
+            )
+            return
+
+        self._reset_deferred_flags()
+        self.current_transcript = ""
+        self.is_transcribing = True
+        self._cancel_event.clear()
+        self._overlay_session += 1
+        session = self._overlay_session
+        self.overlay_visible = True
+
+        filename = Path(path).name
+        AppHelper.callAfter(self._prepare_file_transcription_on_main)
+        self._push_status(f"Transcribing {filename}\u2026", recording=False)
+        threading.Thread(
+            target=self._transcribe_file_worker,
+            args=(path, filename, session),
+            daemon=True,
+        ).start()
+
+    def _prepare_file_transcription_on_main(self) -> None:
+        self.overlay_controller.set_current_text("")
+        self.overlay_controller.show_mode("result")
+        self.overlay_controller.set_transcribing(True)
+
+    def _transcribe_file_worker(self, path: str, filename: str, session: int) -> None:
+        def _progress(current_pos, total_pos):
+            if self._cancel_event.is_set():
+                raise TranscriptionError("Cancelled")
+            pct = int(current_pos / total_pos * 100) if total_pos > 0 else 0
+            self._push_status(f"{filename}: {pct}%", recording=False)
+
+        try:
+            text = self.transcriber.transcribe_file(path, progress_callback=_progress)
+            if not text:
+                if self._cancel_event.is_set():
+                    self._push_status("Cancelled", recording=False, revert_after=5)
+                else:
+                    self._push_status("No speech detected", recording=False, revert_after=5)
+                return
+
+            # Same invariant as mic transcription: if transcribe_file returned
+            # text, publish it even if cancel was requested mid-inference.
+            self._publish_transcript(
+                text=text,
+                source_kind="file",
+                source_label=filename,
+                auto_copy=self.config.auto_copy_to_clipboard,
+                session=session,
+            )
+        except TranscriptionError as exc:
+            if self._cancel_event.is_set():
+                self._push_status("Cancelled", recording=False, revert_after=5)
+            else:
+                logger.error(str(exc))
+                self._push_status(str(exc), recording=False, revert_after=5)
+        except Exception as exc:
+            logger.error(f"Unexpected transcription error: {exc}")
+            self._push_status(
+                "Transcription failed unexpectedly", recording=False, revert_after=5,
+            )
+        finally:
+            self.is_transcribing = False
+            AppHelper.callAfter(self.overlay_controller.set_transcribing, False)
+            AppHelper.callAfter(self._restore_base_status)
+            self._finalize_deferred_overlay_actions()
+
     # -- Queue delegate methods --
 
     def queue_add_files(self, paths) -> None:
