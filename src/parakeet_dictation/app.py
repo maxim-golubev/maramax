@@ -20,13 +20,14 @@ from .logger_config import setup_logging
 from .overlay import OverlayController
 from .paths import app_support_dir, resource_path
 from .queue import TranscriptionQueue
-from .transcription import AudioRecorder, ParakeetTranscriber, TranscriptionError
+from .transcription import AudioRecorder, ParakeetTranscriber, QwenTranscriber, TranscriptionError
 
 _SETTING_LABELS = {
     "auto_start_recording": "Record Immediately on Option+Space",
     "auto_copy_to_clipboard": "Auto-Copy Result",
     "paste_to_active_app": "Paste Into Active App",
     "live_preview": "Live Preview While Speaking",
+    "high_accuracy": "High-Accuracy Model (more RAM)",
 }
 
 logger = setup_logging()
@@ -45,6 +46,7 @@ class DictationApp(rumps.App):
         self._settings_path = app_support_dir() / "settings.json"
         self.config = config or AppConfig.load(self._settings_path)
         self.transcriber = ParakeetTranscriber()
+        self.qwen = QwenTranscriber()
         self.recorder = AudioRecorder()
         self.history_store = HistoryStore(history_limit=self.config.history_limit)
         self.queue = TranscriptionQueue()
@@ -97,6 +99,8 @@ class DictationApp(rumps.App):
 
         self._start_model_watchdog()
         self._register_global_hotkeys()
+        self._warmup_thread = threading.Thread(target=self.recorder.warm_up, daemon=True)
+        self._warmup_thread.start()
 
     def _start_model_watchdog(self) -> None:
         threading.Thread(target=self._wait_for_model_readiness, daemon=True).start()
@@ -108,6 +112,11 @@ class DictationApp(rumps.App):
             logger.error(str(exc))
             self._push_status("Model failed to load", recording=False)
             return
+        finally:
+            # Stagger the heavy Qwen load until Parakeet is up so dictation
+            # is usable seconds after launch and the loads don't contend.
+            if self.config.high_accuracy:
+                self.qwen.start_loading()
 
         if self._hotkey_error_message:
             self._push_status(self._hotkey_error_message, recording=False)
@@ -166,12 +175,12 @@ class DictationApp(rumps.App):
         self._capture_previous_app()
         self._overlay_session += 1
         self.overlay_visible = True
+        # Mic first: the user starts speaking the moment they hit the hotkey,
+        # so capture must begin before any window work.
+        started = self.start_recording()
         self.overlay_controller.set_current_text("")
-        self.overlay_controller.set_recording(True)
+        self.overlay_controller.set_recording(started)
         self.overlay_controller.show_mode("result")
-        self.start_recording()
-        # Refresh AFTER start_recording -- start() reinits PyAudio, so
-        # list_input_devices() reads the fresh cache without a second reinit.
         self._refresh_input_devices()
 
     def hide_overlay(self) -> None:
@@ -206,23 +215,23 @@ class DictationApp(rumps.App):
         else:
             self.start_recording()
 
-    def start_recording(self) -> None:
+    def start_recording(self) -> bool:
         if not self.transcriber.is_ready():
             self._push_status("Model is still loading, please wait", recording=False)
-            return
+            return False
 
         if self.is_transcribing:
             self._push_status("Wait for the current transcription to finish", recording=False)
-            return
+            return False
 
         if self.recording_active:
-            return
+            return True
 
         if not self.recorder.start():
             error = self.recorder.last_error
             message = f"Microphone unavailable: {error}" if error else "Could not start recording"
             self._push_status(message, recording=False)
-            return
+            return False
 
         self._reset_deferred_flags()
         self.current_transcript = ""
@@ -232,9 +241,22 @@ class DictationApp(rumps.App):
         else:
             AppHelper.callAfter(self.overlay_controller.prepare_for_recording)
         self.recording_active = True
-        self._push_status("Recording\u2026", recording=True)
+        # Truthful feedback: "Recording\u2026" only once audio actually flows.
+        self._push_status("Starting mic\u2026", recording=True)
+        threading.Thread(
+            target=self._announce_recording_when_live,
+            args=(self._overlay_session,),
+            daemon=True,
+        ).start()
         if self.config.live_preview:
             self._start_live_preview()
+        return True
+
+    def _announce_recording_when_live(self, session: int) -> None:
+        if not self.recorder.first_frame_event.wait(timeout=3.0):
+            return
+        if self.recording_active and session == self._overlay_session:
+            self._push_status("Recording\u2026", recording=True)
 
     def stop_recording_requested(self, auto_copy: bool | None = None, hide_after: bool = False) -> None:
         if not self.recording_active:
@@ -265,18 +287,46 @@ class DictationApp(rumps.App):
         if self._cancel_event.is_set():
             raise TranscriptionError("Cancelled")
 
+    # -- Final-pass engine routing --
+    #
+    # Qwen3-ASR (when enabled and loaded) handles final passes for best
+    # accuracy; Parakeet covers live drafts, the loading window, and any
+    # Qwen failure. Qwen has no progress callback, so cancellation is
+    # checked before inference; a completed result is always published.
+
+    def _final_transcribe_pcm(self, pcm_bytes: bytes) -> str:
+        if self.config.high_accuracy and self.qwen.is_ready() and not self._cancel_event.is_set():
+            try:
+                return self.qwen.transcribe_pcm(
+                    pcm_bytes,
+                    channels=self.recorder.channels,
+                    sample_width=self.recorder.sample_width(),
+                    rate=self.recorder.rate,
+                )
+            except Exception as exc:
+                logger.error(f"High-accuracy transcription failed, falling back: {exc}")
+        return self.transcriber.transcribe_pcm(
+            pcm_bytes,
+            channels=self.recorder.channels,
+            sample_width=self.recorder.sample_width(),
+            rate=self.recorder.rate,
+            progress_callback=self._check_cancel,
+        )
+
+    def _final_transcribe_file(self, path: str, progress_callback, cancel_event: threading.Event) -> str:
+        if self.config.high_accuracy and self.qwen.is_ready() and not cancel_event.is_set():
+            try:
+                return self.qwen.transcribe_file(path)
+            except Exception as exc:
+                logger.error(f"High-accuracy transcription failed, falling back: {exc}")
+        return self.transcriber.transcribe_file(path, progress_callback=progress_callback)
+
     def _transcribe_recording_worker(self, pcm_bytes: bytes, auto_copy: bool | None, session: int) -> None:
         # The live preview stream must finish before the offline pass: it
         # holds the shared encoder in streaming (local attention) mode.
         self._finish_live_preview()
         try:
-            text = self.transcriber.transcribe_pcm(
-                pcm_bytes,
-                channels=self.recorder.channels,
-                sample_width=self.recorder.sample_width(),
-                rate=self.recorder.rate,
-                progress_callback=self._check_cancel,
-            )
+            text = self._final_transcribe_pcm(pcm_bytes)
             if not text:
                 if self._cancel_event.is_set():
                     self._push_status("Cancelled", recording=False, revert_after=5)
@@ -357,7 +407,7 @@ class DictationApp(rumps.App):
             self._push_status(f"{filename}: {pct}%", recording=False)
 
         try:
-            text = self.transcriber.transcribe_file(path, progress_callback=_progress)
+            text = self._final_transcribe_file(path, _progress, self._cancel_event)
             if not text:
                 if self._cancel_event.is_set():
                     self._push_status("Cancelled", recording=False, revert_after=5)
@@ -473,9 +523,7 @@ class DictationApp(rumps.App):
                 )
 
                 try:
-                    text = self.transcriber.transcribe_file(
-                        item.path, progress_callback=_progress,
-                    )
+                    text = self._final_transcribe_file(item.path, _progress, self._queue_cancel_event)
                 except TranscriptionError as exc:
                     if self._queue_cancel_event.is_set():
                         self.queue.set_status(item.id, "cancelled")
@@ -588,9 +636,14 @@ class DictationApp(rumps.App):
         self.recorder.set_device(device_name)
 
     def _refresh_input_devices(self) -> None:
-        devices = self.recorder.list_input_devices()
-        selected = self.recorder.get_selected_device_name()
-        AppHelper.callAfter(self.overlay_controller.update_input_devices, devices, selected)
+        # Device enumeration can rebuild the PortAudio session (~100-250ms);
+        # off the main thread so the overlay never beachballs.
+        def _enumerate():
+            devices = self.recorder.list_input_devices()
+            selected = self.recorder.get_selected_device_name()
+            AppHelper.callAfter(self.overlay_controller.update_input_devices, devices, selected)
+
+        threading.Thread(target=_enumerate, daemon=True).start()
 
     def clear_history_requested(self) -> None:
         self.history_store.clear()
@@ -700,6 +753,17 @@ class DictationApp(rumps.App):
                         revert_after=8,
                     )
                     self._open_accessibility_settings()
+                elif name == "high_accuracy":
+                    if value:
+                        self.qwen.start_loading()
+                        self._push_status(
+                            "Loading high-accuracy model…", recording=None, revert_after=8,
+                        )
+                    else:
+                        self.qwen.unload()
+                        self._push_status(
+                            "High-accuracy model unloaded", recording=None, revert_after=5,
+                        )
                 return
 
     def _save_settings(self) -> None:
@@ -757,6 +821,10 @@ class DictationApp(rumps.App):
         self.overlay_controller.set_status(self._base_status)
 
     def cleanup(self) -> None:
+        # The mic warm-up must not still be inside PortAudio when the audio
+        # session is terminated or the interpreter finalizes (segfaults).
+        self._warmup_thread.join(timeout=3.0)
+
         if self.hotkey_manager is not None:
             try:
                 self.hotkey_manager.cleanup()

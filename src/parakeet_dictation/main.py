@@ -18,7 +18,7 @@ def _get_version() -> str:
 
         return version("parakeet-dictation")
     except Exception:
-        return "0.2.0"
+        return "0.3.0"
 
 
 def _ensure_gui_app() -> None:

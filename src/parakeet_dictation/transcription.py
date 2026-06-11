@@ -22,6 +22,12 @@ from .logger_config import setup_logging
 logger = setup_logging()
 
 FFMPEG_TIMEOUT_SECONDS = 120
+FFMPEG_CANDIDATES = (
+    "ffmpeg",
+    "/opt/homebrew/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
+    "/usr/bin/ffmpeg",
+)
 
 
 class TranscriptionError(RuntimeError):
@@ -44,10 +50,14 @@ class AudioRecorder:
         self.frames: list[bytes] = []
         self.recording = False
         self.last_error: Exception | None = None
+        self.first_frame_event = threading.Event()
         self._recording_thread: threading.Thread | None = None
         self._stream = None
         self._state_lock = threading.Lock()
         self._stream_lock = threading.Lock()
+        # Serializes use of the PyAudio instance (open/enumerate/reinit) so a
+        # background device refresh can't tear it down mid-open.
+        self._audio_lock = threading.Lock()
         self._cleaned_up = False
         self._selected_device_name: str | None = None
 
@@ -65,27 +75,28 @@ class AudioRecorder:
         self.audio = pyaudio.PyAudio()
 
     def list_input_devices(self) -> list[InputDevice]:
-        if not self.is_recording():
-            self._reinit_audio()
+        with self._audio_lock:
+            if not self.is_recording():
+                self._reinit_audio()
 
-        try:
-            default_index = self.audio.get_default_input_device_info()["index"]
-        except (IOError, OSError):
-            default_index = -1
-
-        devices: list[InputDevice] = []
-        for i in range(self.audio.get_device_count()):
             try:
-                info = self.audio.get_device_info_by_index(i)
+                default_index = self.audio.get_default_input_device_info()["index"]
             except (IOError, OSError):
-                continue
-            if info.get("maxInputChannels", 0) > 0:
-                devices.append(InputDevice(
-                    device_index=i,
-                    name=info["name"],
-                    is_default=(i == default_index),
-                ))
-        return devices
+                default_index = -1
+
+            devices: list[InputDevice] = []
+            for i in range(self.audio.get_device_count()):
+                try:
+                    info = self.audio.get_device_info_by_index(i)
+                except (IOError, OSError):
+                    continue
+                if info.get("maxInputChannels", 0) > 0:
+                    devices.append(InputDevice(
+                        device_index=i,
+                        name=info["name"],
+                        is_default=(i == default_index),
+                    ))
+            return devices
 
     def _resolve_device_index(self) -> int | None:
         if self._selected_device_name is None:
@@ -100,6 +111,27 @@ class AudioRecorder:
         logger.warning(f"Input device '{self._selected_device_name}' not found, using system default")
         return None
 
+    def warm_up(self) -> None:
+        """Open and close an input stream once so CoreAudio's capture stack
+        is initialized — the first open after process start costs seconds,
+        subsequent opens are fast. Run in the background at app launch."""
+        if self.is_recording() or self._cleaned_up:
+            return
+        try:
+            with self._audio_lock:
+                stream = self.audio.open(
+                    format=self.format,
+                    channels=self.channels,
+                    rate=self.rate,
+                    input=True,
+                    frames_per_buffer=self.chunk,
+                )
+                stream.stop_stream()
+                stream.close()
+            logger.info("Microphone warmed up")
+        except Exception as exc:
+            logger.warning(f"Microphone warm-up failed: {exc}")
+
     def start(self) -> bool:
         with self._state_lock:
             if self._cleaned_up or self.recording:
@@ -109,24 +141,25 @@ class AudioRecorder:
             self.recording = True
             self.last_error = None
 
-        try:
-            self._reinit_audio()
-        except Exception as exc:
-            logger.error(f"Audio system init failed: {exc}")
-            with self._state_lock:
-                self.recording = False
-                self.last_error = exc
-            return False
+        self.first_frame_event = threading.Event()
 
-        try:
-            self._open_stream()
-        except Exception as exc:
-            logger.error(f"Microphone start failed: {exc}")
-            with self._state_lock:
-                self.recording = False
-                self.last_error = exc
-            self._close_stream()
-            return False
+        # Open on the existing audio session — rebuilding it on every start
+        # costs ~100ms of lost speech. Rebuild only if the open fails
+        # (e.g. the device list changed since init).
+        with self._audio_lock:
+            try:
+                self._open_stream()
+            except Exception:
+                try:
+                    self._reinit_audio()
+                    self._open_stream()
+                except Exception as exc:
+                    logger.error(f"Microphone start failed: {exc}")
+                    with self._state_lock:
+                        self.recording = False
+                        self.last_error = exc
+                    self._close_stream()
+                    return False
 
         thread = threading.Thread(target=self._record_loop, daemon=True)
         with self._state_lock:
@@ -166,7 +199,8 @@ class AudioRecorder:
             self.stop()
 
         self._close_stream()
-        self.audio.terminate()
+        with self._audio_lock:
+            self.audio.terminate()
 
     def sample_width(self) -> int:
         return self.audio.get_sample_size(self.format)
@@ -179,6 +213,7 @@ class AudioRecorder:
 
             if self.is_recording():
                 self.frames.append(in_data)
+                self.first_frame_event.set()
                 return (None, pyaudio.paContinue)
 
             return (None, pyaudio.paComplete)
@@ -236,13 +271,6 @@ class AudioRecorder:
 
 
 class ParakeetTranscriber:
-    FFMPEG_CANDIDATES = (
-        "ffmpeg",
-        "/opt/homebrew/bin/ffmpeg",
-        "/usr/local/bin/ffmpeg",
-        "/usr/bin/ffmpeg",
-    )
-
     def __init__(self, model_id: str = "mlx-community/parakeet-tdt-0.6b-v2"):
         self.model_id = model_id
         self.model = None
@@ -265,7 +293,7 @@ class ParakeetTranscriber:
     def _warm_model(self) -> None:
         assert self.model is not None
         silence = np.zeros(int(0.3 * 16000), dtype=np.int16).tobytes()
-        temp_path = self._write_wav_file(silence, channels=1, sample_width=2, rate=16000)
+        temp_path = write_wav_file(silence, channels=1, sample_width=2, rate=16000)
         try:
             self.model.transcribe(temp_path)
             gc.collect()
@@ -298,7 +326,7 @@ class ParakeetTranscriber:
             return ""
 
         self.wait_until_ready()
-        temp_path = self._write_wav_file(pcm_bytes, channels=channels, sample_width=sample_width, rate=rate)
+        temp_path = write_wav_file(pcm_bytes, channels=channels, sample_width=sample_width, rate=rate)
         try:
             return self._transcribe_path(temp_path, progress_callback=progress_callback)
         finally:
@@ -313,7 +341,7 @@ class ParakeetTranscriber:
         progress_callback: Callable | None = None,
     ) -> str:
         self.wait_until_ready()
-        normalized_path = self._normalize_media(file_path)
+        normalized_path = normalize_media(file_path)
         try:
             return self._transcribe_path(normalized_path, progress_callback=progress_callback)
         finally:
@@ -388,79 +416,195 @@ class ParakeetTranscriber:
         mx.clear_cache()
         return text
 
-    def _write_wav_file(self, frames: bytes, channels: int, sample_width: int, rate: int) -> str:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-            temp_path = temp_file.name
+class QwenTranscriber:
+    """High-accuracy offline transcriber (Qwen3-ASR 1.7B via MLX).
 
+    ~3.4 GB of weights, loaded in the background only while the
+    high-accuracy setting is on. No streaming and no mid-inference
+    cancellation — used for final passes, with Parakeet as fallback.
+    """
+
+    MODEL_ID = "mlx-community/Qwen3-ASR-1.7B-bf16"
+
+    def __init__(self):
+        self.model = None
+        self.load_error: Exception | None = None
+        self._load_lock = threading.Lock()
+        self._loading = False
+        self._discard_when_loaded = False
+
+    def start_loading(self) -> None:
+        with self._load_lock:
+            if self.model is not None or self._loading:
+                return
+            self._loading = True
+            self._discard_when_loaded = False
+        threading.Thread(target=self._load, daemon=True).start()
+
+    def _load(self) -> None:
         try:
-            with wave.open(temp_path, "wb") as wav_file:
-                wav_file.setnchannels(channels)
-                wav_file.setsampwidth(sample_width)
-                wav_file.setframerate(rate)
-                wav_file.writeframes(frames)
-        except Exception:
+            from qwen3_asr_mlx import Qwen3ASR
+
+            model = Qwen3ASR.from_pretrained(self.MODEL_ID)
+            model.warm_up()
+            gc.collect()
+            mx.clear_cache()
+
+            with self._load_lock:
+                discard = self._discard_when_loaded
+                self._discard_when_loaded = False
+                if not discard:
+                    self.model = model
+            if discard:
+                # The setting was switched off while we were loading.
+                model.close()
+                gc.collect()
+                mx.clear_cache()
+            else:
+                self.load_error = None
+                logger.info("Qwen3-ASR high-accuracy model loaded")
+        except Exception as exc:
+            self.load_error = exc
+            logger.error(f"High-accuracy model failed to load: {exc}")
+        finally:
+            with self._load_lock:
+                self._loading = False
+
+    def is_ready(self) -> bool:
+        return self.model is not None
+
+    def unload(self) -> None:
+        with self._load_lock:
+            if self._loading:
+                self._discard_when_loaded = True
+            model = self.model
+            self.model = None
+        if model is not None:
             try:
-                os.unlink(temp_path)
-            except OSError:
+                model.close()
+            except Exception:
                 pass
-            raise
+        gc.collect()
+        mx.clear_cache()
 
-        return temp_path
+    def transcribe_pcm(self, pcm_bytes: bytes, channels: int, sample_width: int, rate: int) -> str:
+        model = self.model
+        if model is None:
+            raise TranscriptionError("High-accuracy model not loaded")
+        if not pcm_bytes:
+            return ""
+        if sample_width != 2 or rate != 16000:
+            raise TranscriptionError("High-accuracy model expects 16-bit 16kHz PCM")
 
-    def _normalize_media(self, file_path: str | Path) -> str:
-        file_path = Path(file_path)
-        if not file_path.exists():
-            raise TranscriptionError(f"Media file not found: {file_path}")
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        if channels > 1:
+            samples = samples.reshape(-1, channels).mean(axis=1)
+        result = model.transcribe(samples, language="en")
+        text = (result.text or "").strip()
+        gc.collect()
+        mx.clear_cache()
+        return text
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-            temp_path = temp_file.name
+    def transcribe_file(self, file_path: str | Path) -> str:
+        model = self.model
+        if model is None:
+            raise TranscriptionError("High-accuracy model not loaded")
 
-        ffmpeg_path = self._resolve_ffmpeg()
-        command = [
-            ffmpeg_path,
-            "-v",
-            "error",
-            "-y",
-            "-i",
-            str(file_path),
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            temp_path,
-        ]
-
+        normalized_path = normalize_media(file_path)
         try:
-            result = subprocess.run(
-                command, capture_output=True, text=True, check=False,
-                timeout=FFMPEG_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
             try:
-                os.unlink(temp_path)
+                with wave.open(normalized_path, "rb") as wav_file:
+                    if wav_file.getnframes() == 0:
+                        return ""
+            except (wave.Error, OSError):
+                pass
+            result = model.transcribe(normalized_path, language="en")
+            text = (result.text or "").strip()
+            gc.collect()
+            mx.clear_cache()
+            return text
+        finally:
+            try:
+                os.unlink(normalized_path)
             except OSError:
                 pass
-            raise TranscriptionError(
-                f"ffmpeg timed out processing {file_path.name} "
-                f"(limit: {FFMPEG_TIMEOUT_SECONDS}s)"
-            )
 
-        if result.returncode != 0:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-            stderr = result.stderr.strip() or "ffmpeg failed"
-            raise TranscriptionError(f"Could not process {file_path.name}: {stderr}")
 
-        return temp_path
+def write_wav_file(frames: bytes, channels: int, sample_width: int, rate: int) -> str:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+        temp_path = temp_file.name
 
-    def _resolve_ffmpeg(self) -> str:
-        for candidate in self.FFMPEG_CANDIDATES:
-            resolved = shutil.which(candidate) if os.path.sep not in candidate else candidate
-            if resolved and Path(resolved).exists():
-                return str(Path(resolved))
+    try:
+        with wave.open(temp_path, "wb") as wav_file:
+            wav_file.setnchannels(channels)
+            wav_file.setsampwidth(sample_width)
+            wav_file.setframerate(rate)
+            wav_file.writeframes(frames)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
 
-        raise TranscriptionError(
-            "ffmpeg is required for media file transcription. Install it with `brew install ffmpeg`."
+    return temp_path
+
+
+def normalize_media(file_path: str | Path) -> str:
+    file_path = Path(file_path)
+    if not file_path.exists():
+        raise TranscriptionError(f"Media file not found: {file_path}")
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+        temp_path = temp_file.name
+
+    ffmpeg_path = resolve_ffmpeg()
+    command = [
+        ffmpeg_path,
+        "-v",
+        "error",
+        "-y",
+        "-i",
+        str(file_path),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        temp_path,
+    ]
+
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, check=False,
+            timeout=FFMPEG_TIMEOUT_SECONDS,
         )
+    except subprocess.TimeoutExpired:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise TranscriptionError(
+            f"ffmpeg timed out processing {file_path.name} "
+            f"(limit: {FFMPEG_TIMEOUT_SECONDS}s)"
+        )
+
+    if result.returncode != 0:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        stderr = result.stderr.strip() or "ffmpeg failed"
+        raise TranscriptionError(f"Could not process {file_path.name}: {stderr}")
+
+    return temp_path
+
+
+def resolve_ffmpeg() -> str:
+    for candidate in FFMPEG_CANDIDATES:
+        resolved = shutil.which(candidate) if os.path.sep not in candidate else candidate
+        if resolved and Path(resolved).exists():
+            return str(Path(resolved))
+
+    raise TranscriptionError(
+        "ffmpeg is required for media file transcription. Install it with `brew install ffmpeg`."
+    )
