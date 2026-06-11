@@ -43,16 +43,17 @@ Python menu bar app (`rumps`) with a native AppKit overlay (`PyObjC`). Audio cap
 ```
 src/parakeet_dictation/
   main.py            Entry point. Parses --version, inits DictationApp, installs signal handlers.
-  app.py             Core controller (DictationApp). Owns all state, coordinates components.
+  app.py             Core controller (DictationApp). Owns all state, coordinates components, Settings menu.
   overlay.py         Native NSPanel overlay: drop zone, device selector, text view, queue tab, controls.
-  transcription.py   AudioRecorder (PyAudio callback streaming) + ParakeetTranscriber (model loading, chunked inference, FFmpeg normalization).
+  transcription.py   AudioRecorder (PyAudio callback streaming) + ParakeetTranscriber (model loading, chunked inference, streaming drafts, FFmpeg normalization).
   queue.py           TranscriptionQueue (thread-safe item list), QueueItem dataclass, OutputMode/OutputConfig for save options.
   export.py          export_results() writes completed queue items to clipboard, individual files, or single file.
   hotkeys.py         GlobalHotKeyManager. Registers Option+Space via Carbon API ctypes bindings.
+  autopaste.py       Synthetic Cmd+V via CoreGraphics CGEvent ctypes bindings + Accessibility trust check.
   history.py         HistoryStore. Thread-safe JSON persistence in ~/Library/Application Support/Maramax/. Auto-migrates legacy ParakeetDictation data.
   clipboard.py       copy_text() wrapper around pyperclip with ClipboardError.
-  config.py          Frozen dataclasses: AppConfig (auto_start_recording, auto_copy, history_limit) and ShortcutConfig.
-  paths.py           resource_path() resolves assets in dev vs bundle. ensure_runtime_path() prepends homebrew/bundle bins to PATH.
+  config.py          AppConfig (mutable, persisted to settings.json with type-validated load) and frozen ShortcutConfig.
+  paths.py           resource_path() resolves assets in dev vs bundle. app_support_dir(). ensure_runtime_path() prepends homebrew/bundle bins to PATH.
   logger_config.py   Colored console logging. Reads LOG_LEVEL env var, supports NO_COLOR.
 
 packaging/
@@ -68,12 +69,13 @@ assets/
 - **Main thread**: rumps event loop + AppKit UI. All NSView/NSPanel mutations must happen here.
 - **Model loader thread**: `ParakeetTranscriber.__init__` spawns daemon thread to download/init model. Signals `ready_event` when done.
 - **Recording thread**: `AudioRecorder._record_loop` monitors PyAudio callback stream in background.
+- **Live preview worker**: `_live_preview_worker` feeds recorded PCM into `ParakeetTranscriber.stream_drafts` during recording, pushing draft text to the overlay (session-guarded).
 - **Transcription workers**: `_transcribe_recording_worker` and `_process_queue_worker` run inference off main thread.
 
 Thread coordination:
 - `threading.Lock` protects mutable state (`AudioRecorder._state_lock`, `_stream_lock`; `HistoryStore._lock`; `DictationApp._state_lock`).
 - `threading.Lock` also protects `TranscriptionQueue._lock` for queue item mutations.
-- `threading.Event` for signaling (`ParakeetTranscriber.ready_event`, `DictationApp._cancel_event`, `DictationApp._queue_cancel_event`).
+- `threading.Event` for signaling (`ParakeetTranscriber.ready_event`, `DictationApp._cancel_event`, `DictationApp._queue_cancel_event`, `DictationApp._live_stop_event`).
 - `AppHelper.callAfter()` marshals callbacks from worker threads to the main/AppKit thread.
 - `threading.Timer` for delayed UI actions (status revert, copy feedback).
 
@@ -93,6 +95,20 @@ When transcription completes, two deferred flags may trigger post-completion act
 - `_hide_after_transcription`: close overlay after transcription finishes.
 - `_force_copy_after_transcription`: copy result to clipboard after completion.
 Applied in `_finalize_deferred_overlay_actions()`.
+
+### Live Preview (Streaming Drafts)
+
+While recording, `_live_preview_worker` feeds new PCM from `recorder.frames` into `ParakeetTranscriber.stream_drafts()` (parakeet-mlx `transcribe_stream`, ~1s batches), pushing growing draft text into the overlay. Drafts use local attention with limited context and are **less accurate** than the offline pass.
+
+**Invariant**: the final transcription always comes from the offline `transcribe_pcm` pass over the full recording — drafts are display-only and are replaced on completion. The stream holds the shared encoder in streaming attention mode, so `_transcribe_recording_worker` joins the live thread (`_finish_live_preview`) before starting the offline pass. Option+Space acts as a toggle: pressing it during recording stops and finishes the dictation.
+
+### Settings
+
+`AppConfig` persists user-changeable fields (`auto_start_recording`, `auto_copy_to_clipboard`, `paste_to_active_app`, `live_preview`, `history_limit`) to `~/Library/Application Support/Maramax/settings.json` (atomic write). The menu bar Settings submenu toggles them; every toggle saves immediately. `AppConfig.load()` falls back to defaults for missing/corrupt/mistyped values.
+
+### Auto-Paste
+
+When `paste_to_active_app` is enabled, a successful mic transcription copy is followed by: hide overlay → re-activate the previously frontmost app (captured in `_capture_previous_app` before the overlay was shown) → post a synthetic Cmd+V via CGEvent (`autopaste.py`, ctypes CoreGraphics). Requires the Accessibility permission (`AXIsProcessTrusted`); enabling the setting without it opens System Settings and shows a status hint. Zero-length audio is guarded in `_transcribe_path` (it would crash the Metal encoder).
 
 ### Transcription Queue
 
@@ -128,8 +144,10 @@ Custom exceptions: `TranscriptionError`, `HotKeyError`, `ClipboardError`, `Expor
 | Constant | Location | Value |
 |---|---|---|
 | Audio format | transcription.py | 16-bit PCM, mono, 16kHz, 512-frame chunks |
-| Model ID | transcription.py | `mlx-community/parakeet-tdt-0.6b-v2` |
+| Model ID | transcription.py | `mlx-community/parakeet-tdt-0.6b-v2` (pinned: v3 regresses English WER) |
 | Chunk duration | transcription.py | 120s with 15s overlap |
+| Live draft batch | transcription.py | ~1s of PCM per `stream_drafts` step, context (256, 256) |
+| Settings file | config.py | `~/Library/Application Support/Maramax/settings.json` |
 | FFmpeg timeout | transcription.py | 120s |
 | Overlay width | overlay.py | 688px |
 | Media extensions | overlay.py | aac, aiff, flac, m4a, mov, mp3, mp4, ogg, opus, wav, webm |
@@ -166,7 +184,7 @@ The standalone .app is built with py2app. MLX is a namespace package with C exte
 
 ## Dependencies
 
-Runtime: `parakeet-mlx`, `numpy<2.3`, `pyaudio~=0.2.14`, `rumps~=0.4.0`, `pyperclip~=1.9.0`, `python-dotenv~=1.1.1`, `pyobjc-framework-cocoa~=11.1`.
+Runtime: `parakeet-mlx>=0.5.2,<0.6`, `numpy<2.3`, `pyaudio~=0.2.14`, `rumps~=0.4.0`, `pyperclip~=1.9.0`, `python-dotenv~=1.1.1`, `pyobjc-framework-cocoa~=11.1`.
 
 Dev: `pytest`, `ruff`, `mypy`, `py2app`, `build`.
 

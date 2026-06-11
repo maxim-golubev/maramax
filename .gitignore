@@ -6,3 +6,4 @@ dist.bak.*
 __pycache__
 *.egg-info/
 .vscode/launch.json
+.DS_Store

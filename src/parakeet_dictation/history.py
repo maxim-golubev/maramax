@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import shutil
 import threading
 import uuid
@@ -9,7 +8,9 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-logger = logging.getLogger("parakeet_dictation")
+from .logger_config import setup_logging
+
+logger = setup_logging()
 
 
 @dataclass

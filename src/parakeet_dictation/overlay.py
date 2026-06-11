@@ -30,7 +30,7 @@ from AppKit import (
     NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSWindowStyleMaskBorderless,
 )
-from Foundation import NSObject
+from Foundation import NSMakeRange, NSObject
 from PyObjCTools import AppHelper
 
 from .queue import OutputConfig, OutputMode
@@ -107,6 +107,12 @@ class OverlayPanel(NSPanel):
             return True
 
         if flags == NSEventModifierFlagCommand and chars == "c":
+            # If the user selected text in one of the text views, copy just
+            # the selection instead of the whole transcript.
+            responder = self.firstResponder()
+            if isinstance(responder, NSTextView) and responder.selectedRange().length > 0:
+                responder.copy_(None)
+                return True
             self.controller.handle_copy_shortcut()
             return True
 
@@ -375,12 +381,11 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def _should_show_text_area(self) -> bool:
-        if self.is_recording:
-            return False
         if self.mode == "history":
             return True
         if self.mode == "queue":
             return False
+        # While recording this shows the live draft as soon as it has text.
         return self._has_transcript()
 
     @objc.python_method
@@ -632,9 +637,10 @@ class OverlayController(NSObject):
         if not text:
             return None
 
-        # Find which line the cursor is on
-        pos = min(sel.location, len(text) - 1) if text else 0
-        line_num = text[:pos + 1].count("\n")
+        # Find which line the cursor is on. Counting newlines strictly before
+        # the cursor keeps a cursor at end-of-line on that same line.
+        pos = min(sel.location, len(text))
+        line_num = text[:pos].count("\n")
         if line_num < len(self._queue_items):
             return line_num
         return None
@@ -844,6 +850,9 @@ class OverlayController(NSObject):
             self._cancel_copy_feedback()
         self._refresh_text_view()
         self._update_layout()
+        if self.is_recording and text and self.mode == "result":
+            # Keep the tail of the live draft visible during long dictations.
+            self.text_view.scrollRangeToVisible_(NSMakeRange(len(self.text_view.string()), 0))
 
     @objc.python_method
     def set_history_text(self, text: str):

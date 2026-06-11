@@ -5,7 +5,7 @@ import enum
 import os
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 class OutputMode(enum.Enum):

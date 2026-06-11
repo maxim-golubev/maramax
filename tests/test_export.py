@@ -58,11 +58,12 @@ def test_export_individual_chosen_dir(tmp_path):
 
     item = _make_item(filename="audio.mp3", path="/original/audio.mp3", text="transcribed")
     config = OutputConfig(mode=OutputMode.INDIVIDUAL_CHOSEN_DIR, output_path=str(out_dir))
-    result = export_results([item], config)
+    summary = export_results([item], config)
 
     output = out_dir / "audio.txt"
     assert output.exists()
     assert output.read_text() == "transcribed"
+    assert str(out_dir) in summary
 
 
 def test_export_individual_handles_existing_file(tmp_path):
