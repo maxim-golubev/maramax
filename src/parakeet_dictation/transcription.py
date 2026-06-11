@@ -51,6 +51,9 @@ class AudioRecorder:
         self.recording = False
         self.last_error: Exception | None = None
         self.first_frame_event = threading.Event()
+        # Set when frames contain actual signal (Bluetooth mics deliver
+        # pure-zero frames for 1-2s while switching into headset mode).
+        self.signal_event = threading.Event()
         self._recording_thread: threading.Thread | None = None
         self._stream = None
         self._state_lock = threading.Lock()
@@ -111,6 +114,22 @@ class AudioRecorder:
         logger.warning(f"Input device '{self._selected_device_name}' not found, using system default")
         return None
 
+    def _find_builtin_index(self) -> int | None:
+        """Used only for warm-up: initializing the capture stack on the
+        built-in mic avoids flipping Bluetooth headphones out of
+        high-quality playback mode at app launch."""
+        for i in range(self.audio.get_device_count()):
+            try:
+                info = self.audio.get_device_info_by_index(i)
+            except (IOError, OSError):
+                continue
+            name = str(info.get("name", "")).lower()
+            if info.get("maxInputChannels", 0) > 0 and (
+                ("macbook" in name and "microphone" in name) or name == "built-in microphone"
+            ):
+                return i
+        return None
+
     def warm_up(self) -> None:
         """Open and close an input stream once so CoreAudio's capture stack
         is initialized — the first open after process start costs seconds,
@@ -119,13 +138,22 @@ class AudioRecorder:
             return
         try:
             with self._audio_lock:
-                stream = self.audio.open(
+                kwargs = dict(
                     format=self.format,
                     channels=self.channels,
                     rate=self.rate,
                     input=True,
                     frames_per_buffer=self.chunk,
                 )
+                # Warm up on the built-in mic when present: it initializes the
+                # capture stack without flipping Bluetooth headphones out of
+                # high-quality playback mode at app launch.
+                device_index = self._find_builtin_index()
+                if device_index is None:
+                    device_index = self._resolve_device_index()
+                if device_index is not None:
+                    kwargs["input_device_index"] = device_index
+                stream = self.audio.open(**kwargs)
                 stream.stop_stream()
                 stream.close()
             logger.info("Microphone warmed up")
@@ -142,6 +170,7 @@ class AudioRecorder:
             self.last_error = None
 
         self.first_frame_event = threading.Event()
+        self.signal_event = threading.Event()
 
         # Open on the existing audio session — rebuilding it on every start
         # costs ~100ms of lost speech. Rebuild only if the open fails
@@ -214,6 +243,11 @@ class AudioRecorder:
             if self.is_recording():
                 self.frames.append(in_data)
                 self.first_frame_event.set()
+                if not self.signal_event.is_set() and any(in_data):
+                    # A live mic always has a noise floor; exact digital
+                    # silence means the route (e.g. a Bluetooth headset
+                    # switching into mic mode) isn't delivering audio yet.
+                    self.signal_event.set()
                 return (None, pyaudio.paContinue)
 
             return (None, pyaudio.paComplete)

@@ -253,8 +253,11 @@ class DictationApp(rumps.App):
         return True
 
     def _announce_recording_when_live(self, session: int) -> None:
-        if not self.recorder.first_frame_event.wait(timeout=3.0):
-            return
+        # Wait for actual signal, not just frames: Bluetooth mics deliver
+        # silent frames for 1-2s while switching into headset mode.
+        if not self.recorder.signal_event.wait(timeout=5.0):
+            if not self.recorder.first_frame_event.is_set():
+                return
         if self.recording_active and session == self._overlay_session:
             self._push_status("Recording\u2026", recording=True)
 
