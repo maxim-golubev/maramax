@@ -101,7 +101,7 @@ Applied in `_finalize_deferred_overlay_actions()`.
 Two ASR models share the MLX/Metal runtime:
 
 - **Parakeet TDT 0.6B v2** (always loaded, ~1.2 GB): live streaming drafts, transcription while the high-accuracy model loads, and fallback on any failure. Pinned to v2 — v3 regresses English WER.
-- **Qwen3-ASR 1.7B** (`mlx-community/Qwen3-ASR-1.7B-bf16`, ~3.4 GB, loaded in background when the `high_accuracy` setting is on — default): final passes for mic dictation, single files, and queue items. Best English WER available on MLX (5.76 vs Parakeet's 6.05 on Open ASR). No streaming, no mid-inference cancellation (cancel is checked before inference; queue items remain cancellable between files; the completed-result-is-always-published invariant holds).
+- **Qwen3-ASR 1.7B** (`mlx-community/Qwen3-ASR-1.7B-bf16`, ~4 GB, loaded in background when the `high_accuracy` setting is on — **default off**: the ~5% relative WER gain reads as ~1 corrected word per 7-10 short messages, while costing ~1.5s per 10s of audio at stop vs Parakeet's ~0.3s; it shines on long files and formatting): final passes for mic dictation, single files, and queue items. Best English WER available on MLX (5.76 vs Parakeet's 6.05 on Open ASR). No streaming, no mid-inference cancellation (cancel is checked before inference; queue items remain cancellable between files; the completed-result-is-always-published invariant holds).
 
 Routing lives in `DictationApp._final_transcribe_pcm/_final_transcribe_file`: Qwen when enabled+ready, otherwise Parakeet; any Qwen exception logs and falls back to Parakeet. Toggling the setting off calls `QwenTranscriber.unload()` to free RAM. First enable downloads ~3.4 GB from Hugging Face.
 
