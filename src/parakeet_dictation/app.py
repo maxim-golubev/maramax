@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
+import time
 from pathlib import Path
 
 import rumps
+from AppKit import NSApplicationActivateIgnoringOtherApps, NSWorkspace
 from PyObjCTools import AppHelper
 
+from .autopaste import PasteError, accessibility_trusted, send_paste_keystroke
 from .clipboard import ClipboardError, copy_text
 from .config import AppConfig
 from .export import ExportError, export_results
@@ -14,16 +18,18 @@ from .history import HistoryStore
 from .hotkeys import GlobalHotKeyManager, HotKeyError
 from .logger_config import setup_logging
 from .overlay import OverlayController
-from .paths import resource_path
+from .paths import app_support_dir, resource_path
 from .queue import TranscriptionQueue
-from .transcription import AudioRecorder, InputDevice, ParakeetTranscriber, TranscriptionError
+from .transcription import AudioRecorder, ParakeetTranscriber, TranscriptionError
+
+_SETTING_LABELS = {
+    "auto_start_recording": "Record Immediately on Option+Space",
+    "auto_copy_to_clipboard": "Auto-Copy Result",
+    "paste_to_active_app": "Paste Into Active App",
+    "live_preview": "Live Preview While Speaking",
+}
 
 logger = setup_logging()
-_log_env = os.getenv("PARAKEET_LOG", "").lower()
-if _log_env in ("debug", "info", "warning", "error", "critical"):
-    import logging as _logging
-
-    logger.setLevel(getattr(_logging, _log_env.upper()))
 
 
 class DictationApp(rumps.App):
@@ -36,7 +42,8 @@ class DictationApp(rumps.App):
             template=True,
             quit_button=None,
         )
-        self.config = config or AppConfig()
+        self._settings_path = app_support_dir() / "settings.json"
+        self.config = config or AppConfig.load(self._settings_path)
         self.transcriber = ParakeetTranscriber()
         self.recorder = AudioRecorder()
         self.history_store = HistoryStore(history_limit=self.config.history_limit)
@@ -55,6 +62,16 @@ class DictationApp(rumps.App):
         self._state_lock = threading.Lock()
         self.hotkey_manager: GlobalHotKeyManager | None = None
         self._hotkey_error_message: str | None = None
+        self._previous_app = None
+        self._live_thread: threading.Thread | None = None
+        self._live_stop_event = threading.Event()
+
+        self._settings_items = {
+            name: rumps.MenuItem(label, callback=self._on_setting_toggled)
+            for name, label in _SETTING_LABELS.items()
+        }
+        for name, item in self._settings_items.items():
+            item.state = 1 if getattr(self.config, name) else 0
 
         self.status_item = rumps.MenuItem("Status: Loading speech model\u2026")
         self.menu = [
@@ -64,6 +81,7 @@ class DictationApp(rumps.App):
             rumps.MenuItem("Copy Last Transcript"),
             rumps.MenuItem("Open Media Files\u2026"),
             rumps.MenuItem("Clear History"),
+            ("Settings", list(self._settings_items.values())),
             None,
             self.status_item,
             rumps.MenuItem("Quit"),
@@ -73,7 +91,8 @@ class DictationApp(rumps.App):
         self.overlay_controller.set_history_text(self.history_store.render())
         self.overlay_controller.set_current_text(
             "Use Option+Space to open the overlay.\n\n"
-            "If auto-start is enabled, recording begins immediately and Cmd+R stops it."
+            "If auto-start is enabled, recording begins immediately; "
+            "press Option+Space again (or Cmd+R) to stop."
         )
 
         self._start_model_watchdog()
@@ -107,6 +126,10 @@ class DictationApp(rumps.App):
             self._push_status(self._hotkey_error_message)
 
     def handle_overlay_hotkey(self) -> None:
+        if self.recording_active:
+            # Option+Space acts as a toggle: press again to finish dictating.
+            self.stop_recording_requested(auto_copy=True, hide_after=True)
+            return
         if self.overlay_visible:
             AppHelper.callAfter(self.overlay_controller.focus)
             return
@@ -123,7 +146,13 @@ class DictationApp(rumps.App):
     def show_history_overlay(self) -> None:
         self._show_overlay_on_main("history")
 
+    def _capture_previous_app(self) -> None:
+        front_app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        if front_app is not None and front_app.processIdentifier() != os.getpid():
+            self._previous_app = front_app
+
     def _show_overlay_on_main(self, mode: str) -> None:
+        self._capture_previous_app()
         self._overlay_session += 1
         self.overlay_visible = True
         if mode == "result":
@@ -134,6 +163,7 @@ class DictationApp(rumps.App):
     def _show_overlay_and_start_on_main(self) -> None:
         self.current_transcript = ""
         self._reset_deferred_flags()
+        self._capture_previous_app()
         self._overlay_session += 1
         self.overlay_visible = True
         self.overlay_controller.set_current_text("")
@@ -203,6 +233,8 @@ class DictationApp(rumps.App):
             AppHelper.callAfter(self.overlay_controller.prepare_for_recording)
         self.recording_active = True
         self._push_status("Recording\u2026", recording=True)
+        if self.config.live_preview:
+            self._start_live_preview()
 
     def stop_recording_requested(self, auto_copy: bool | None = None, hide_after: bool = False) -> None:
         if not self.recording_active:
@@ -218,6 +250,7 @@ class DictationApp(rumps.App):
         self.recording_active = False
         self.is_transcribing = True
         self._cancel_event.clear()
+        self._live_stop_event.set()
         pcm_bytes = self.recorder.stop()
         self._push_status("Transcribing\u2026", recording=False)
         AppHelper.callAfter(self.overlay_controller.set_transcribing, True)
@@ -233,6 +266,9 @@ class DictationApp(rumps.App):
             raise TranscriptionError("Cancelled")
 
     def _transcribe_recording_worker(self, pcm_bytes: bytes, auto_copy: bool | None, session: int) -> None:
+        # The live preview stream must finish before the offline pass: it
+        # holds the shared encoder in streaming (local attention) mode.
+        self._finish_live_preview()
         try:
             text = self.transcriber.transcribe_pcm(
                 pcm_bytes,
@@ -411,6 +447,9 @@ class DictationApp(rumps.App):
     def _process_queue_worker(self, output_config, session: int) -> None:
         items = self.queue.items()
         pending = [item for item in items if item.status == "pending"]
+        # Export only items processed in this run; "done" items from earlier
+        # runs were already exported and must not be duplicated.
+        run_ids = {item.id for item in pending}
 
         try:
             for index, item in enumerate(pending, start=1):
@@ -461,7 +500,10 @@ class DictationApp(rumps.App):
                 self._refresh_queue_on_main()
 
             # Export results
-            completed_items = [i for i in self.queue.items() if i.status == "done" and i.result_text]
+            completed_items = [
+                i for i in self.queue.items()
+                if i.id in run_ids and i.status == "done" and i.result_text
+            ]
             if completed_items and not self._queue_cancel_event.is_set():
                 try:
                     summary = export_results(completed_items, output_config)
@@ -483,7 +525,7 @@ class DictationApp(rumps.App):
                 else:
                     self._push_status("Queue cancelled", recording=False, revert_after=5)
             else:
-                failed_items = [i for i in self.queue.items() if i.status == "failed"]
+                failed_items = [i for i in self.queue.items() if i.id in run_ids and i.status == "failed"]
                 if failed_items:
                     self._push_status("All items failed", recording=False, revert_after=5)
                 else:
@@ -516,14 +558,18 @@ class DictationApp(rumps.App):
 
         with self._state_lock:
             force_copy = self._force_copy_after_transcription
+        copied = False
         if auto_copy or force_copy:
-            self._copy_text_with_feedback(
+            copied = self._copy_text_with_feedback(
                 text,
                 success_status="Copied transcript to clipboard",
                 failure_status="Transcript ready, but clipboard copy failed",
             )
         else:
             self._push_status("Transcript ready", recording=False, revert_after=5)
+
+        if copied and self.config.paste_to_active_app and source_kind == "microphone":
+            AppHelper.callAfter(self._paste_into_previous_app_on_main, session)
 
     def copy_current_transcript(self) -> None:
         text = self.current_transcript.strip()
@@ -582,6 +628,91 @@ class DictationApp(rumps.App):
         self._flash_copy_feedback_on_main()
         self._push_status(success_status, recording=recording, revert_after=5)
         return True
+
+    def _start_live_preview(self) -> None:
+        session = self._overlay_session
+        self._live_stop_event = threading.Event()
+        self._live_thread = threading.Thread(
+            target=self._live_preview_worker,
+            args=(session, self._live_stop_event),
+            daemon=True,
+        )
+        self._live_thread.start()
+
+    def _live_preview_worker(self, session: int, stop_event: threading.Event) -> None:
+        try:
+            self.transcriber.stream_drafts(
+                frames_provider=lambda: self.recorder.frames,
+                stop_event=stop_event,
+                on_draft=lambda text: self._set_current_text_on_main(text, session),
+                rate=self.recorder.rate,
+            )
+        except Exception as exc:
+            logger.warning(f"Live preview unavailable: {exc}")
+
+    def _finish_live_preview(self) -> None:
+        thread = self._live_thread
+        if thread is None:
+            return
+        self._live_stop_event.set()
+        thread.join(timeout=10.0)
+        if thread.is_alive():
+            logger.warning("Live preview thread did not stop in time")
+        self._live_thread = None
+
+    def _paste_into_previous_app_on_main(self, session: int) -> None:
+        if session != self._overlay_session:
+            return
+        if not accessibility_trusted():
+            self._push_status(
+                "Auto-paste needs Accessibility permission", recording=False, revert_after=8,
+            )
+            self._open_accessibility_settings()
+            return
+
+        previous_app = self._previous_app
+        self.overlay_visible = False
+        self.overlay_controller.hide()
+        if previous_app is not None:
+            previous_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+
+        def _send_after_focus_returns():
+            time.sleep(0.3)
+            try:
+                send_paste_keystroke()
+            except PasteError as exc:
+                logger.error(f"Auto-paste failed: {exc}")
+                self._push_status("Auto-paste failed", recording=False, revert_after=5)
+
+        threading.Thread(target=_send_after_focus_returns, daemon=True).start()
+
+    def _on_setting_toggled(self, sender) -> None:
+        for name, item in self._settings_items.items():
+            if item is sender:
+                value = not getattr(self.config, name)
+                setattr(self.config, name, value)
+                item.state = 1 if value else 0
+                self._save_settings()
+                if name == "paste_to_active_app" and value and not accessibility_trusted():
+                    self._push_status(
+                        "Grant Accessibility access to enable auto-paste",
+                        recording=None,
+                        revert_after=8,
+                    )
+                    self._open_accessibility_settings()
+                return
+
+    def _save_settings(self) -> None:
+        try:
+            self.config.save(self._settings_path)
+        except OSError as exc:
+            logger.error(f"Failed to save settings: {exc}")
+
+    def _open_accessibility_settings(self) -> None:
+        subprocess.Popen([
+            "open",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        ])
 
     def _reset_deferred_flags(self) -> None:
         with self._state_lock:

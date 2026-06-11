@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import wave
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -28,7 +29,7 @@ class TranscriptionError(RuntimeError):
 
 
 class InputDevice(NamedTuple):
-    index: int
+    device_index: int
     name: str
     is_default: bool
 
@@ -80,7 +81,7 @@ class AudioRecorder:
                 continue
             if info.get("maxInputChannels", 0) > 0:
                 devices.append(InputDevice(
-                    index=i,
+                    device_index=i,
                     name=info["name"],
                     is_default=(i == default_index),
                 ))
@@ -262,13 +263,13 @@ class ParakeetTranscriber:
             self.ready_event.set()
 
     def _warm_model(self) -> None:
+        assert self.model is not None
         silence = np.zeros(int(0.3 * 16000), dtype=np.int16).tobytes()
         temp_path = self._write_wav_file(silence, channels=1, sample_width=2, rate=16000)
         try:
-            result = self.model.transcribe(temp_path)
-            del result
+            self.model.transcribe(temp_path)
             gc.collect()
-            mx.metal.clear_cache()
+            mx.clear_cache()
         finally:
             try:
                 os.unlink(temp_path)
@@ -291,7 +292,7 @@ class ParakeetTranscriber:
         channels: int,
         sample_width: int,
         rate: int,
-        progress_callback: callable | None = None,
+        progress_callback: Callable | None = None,
     ) -> str:
         if not pcm_bytes:
             return ""
@@ -309,7 +310,7 @@ class ParakeetTranscriber:
     def transcribe_file(
         self,
         file_path: str | Path,
-        progress_callback: callable | None = None,
+        progress_callback: Callable | None = None,
     ) -> str:
         self.wait_until_ready()
         normalized_path = self._normalize_media(file_path)
@@ -321,11 +322,60 @@ class ParakeetTranscriber:
             except OSError:
                 pass
 
+    def stream_drafts(
+        self,
+        frames_provider: Callable[[], list[bytes]],
+        stop_event: threading.Event,
+        on_draft: Callable[[str], None],
+        rate: int = 16000,
+    ) -> None:
+        """Feed PCM chunks from an in-progress recording into streaming
+        inference, emitting draft text after each ~1s of new audio.
+
+        Drafts use local attention with limited context, so they are less
+        accurate than the offline pass — callers must replace them with the
+        final transcribe_pcm result. Must not run concurrently with other
+        inference: the stream switches the shared encoder's attention mode
+        until it finishes.
+        """
+        self.wait_until_ready()
+        assert self.model is not None
+        min_chunk_bytes = rate * 2  # ~1s of 16-bit mono PCM
+        consumed = 0
+        try:
+            with self.model.transcribe_stream(context_size=(256, 256)) as stream:
+                while not stop_event.is_set():
+                    frames = frames_provider()
+                    available = len(frames)
+                    pending = b"".join(frames[consumed:available])
+                    if len(pending) < min_chunk_bytes:
+                        time.sleep(0.05)
+                        continue
+                    consumed = available
+                    samples = np.frombuffer(pending, dtype=np.int16).astype(np.float32) / 32768.0
+                    stream.add_audio(mx.array(samples))
+                    text = (stream.result.text or "").strip()
+                    if text:
+                        on_draft(text)
+        finally:
+            gc.collect()
+            mx.clear_cache()
+
     def _transcribe_path(
         self,
         file_path: str | Path,
-        progress_callback: callable | None = None,
+        progress_callback: Callable | None = None,
     ) -> str:
+        assert self.model is not None
+        # Zero-length audio (e.g. a corrupt or silent media file) crashes the
+        # encoder with a Metal allocation error — treat it as "no speech".
+        try:
+            with wave.open(str(file_path), "rb") as wav_file:
+                if wav_file.getnframes() == 0:
+                    return ""
+        except (wave.Error, OSError):
+            pass
+
         kwargs: dict = {}
         kwargs["chunk_duration"] = 120.0
         kwargs["overlap_duration"] = 15.0
@@ -335,7 +385,7 @@ class ParakeetTranscriber:
         text = (getattr(result, "text", "") or "").strip()
         del result
         gc.collect()
-        mx.metal.clear_cache()
+        mx.clear_cache()
         return text
 
     def _write_wav_file(self, frames: bytes, channels: int, sample_width: int, rate: int) -> str:

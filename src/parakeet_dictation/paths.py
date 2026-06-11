@@ -16,6 +16,10 @@ RUNTIME_BIN_CANDIDATES = (
 )
 
 
+def app_support_dir() -> Path:
+    return Path.home() / "Library" / "Application Support" / "Maramax"
+
+
 def resource_path(*parts: str) -> Path:
     bundle_root = os.getenv("RESOURCEPATH")
     candidates = []
