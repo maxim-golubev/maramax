@@ -20,6 +20,26 @@ def app_support_dir() -> Path:
     return Path.home() / "Library" / "Application Support" / "Maramax"
 
 
+def ensure_ssl_certs() -> None:
+    """Point OpenSSL at certifi's CA bundle when the default is unusable.
+
+    The py2app bundle has no system cert path baked in, so
+    ssl.create_default_context() raises FileNotFoundError — which breaks
+    Hugging Face Hub lookups and model loading.
+    """
+    current = os.environ.get("SSL_CERT_FILE")
+    if current and Path(current).exists():
+        return
+    try:
+        import certifi
+
+        cert_path = certifi.where()
+    except Exception:
+        return
+    if Path(cert_path).exists():
+        os.environ["SSL_CERT_FILE"] = cert_path
+
+
 def resource_path(*parts: str) -> Path:
     bundle_root = os.getenv("RESOURCEPATH")
     candidates = []
