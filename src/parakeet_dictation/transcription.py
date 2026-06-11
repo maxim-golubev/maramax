@@ -54,6 +54,8 @@ class AudioRecorder:
         # Set when frames contain actual signal (Bluetooth mics deliver
         # pure-zero frames for 1-2s while switching into headset mode).
         self.signal_event = threading.Event()
+        # Incremented per start(); lets watchers detect they span recordings.
+        self.start_generation = 0
         self._recording_thread: threading.Thread | None = None
         self._stream = None
         self._state_lock = threading.Lock()
@@ -71,6 +73,10 @@ class AudioRecorder:
         return self._selected_device_name
 
     def _reinit_audio(self) -> None:
+        # Callers must hold _audio_lock. Close any live stream first:
+        # Pa_Terminate() frees open streams behind the back of whoever
+        # later calls close() on them (malloc abort / double free).
+        self._close_stream()
         try:
             self.audio.terminate()
         except Exception:
@@ -168,6 +174,7 @@ class AudioRecorder:
             self.frames = []
             self.recording = True
             self.last_error = None
+            self.start_generation += 1
 
         self.first_frame_event = threading.Event()
         self.signal_event = threading.Event()
@@ -285,22 +292,24 @@ class AudioRecorder:
             self._close_stream()
 
     def _close_stream(self) -> None:
+        # stop+close stay inside the lock: if another thread terminates the
+        # audio session while we're between the two calls, PortAudio frees
+        # the stream under us and close() aborts the process.
         with self._stream_lock:
             stream = self._stream
             self._stream = None
+            if stream is None:
+                return
 
-        if stream is None:
-            return
+            try:
+                stream.stop_stream()
+            except Exception:
+                pass
 
-        try:
-            stream.stop_stream()
-        except Exception:
-            pass
-
-        try:
-            stream.close()
-        except Exception:
-            pass
+            try:
+                stream.close()
+            except Exception:
+                pass
 
 
 class ParakeetTranscriber:
@@ -465,10 +474,17 @@ class QwenTranscriber:
         self._load_lock = threading.Lock()
         self._loading = False
         self._discard_when_loaded = False
+        self._active_inferences = 0
+        self._deferred_close = None
 
     def start_loading(self) -> None:
         with self._load_lock:
-            if self.model is not None or self._loading:
+            if self.model is not None:
+                return
+            if self._loading:
+                # Re-enabled while a load is still in flight (off→on toggle):
+                # keep the result this time instead of discarding it.
+                self._discard_when_loaded = False
                 return
             self._loading = True
             self._discard_when_loaded = False
@@ -506,61 +522,96 @@ class QwenTranscriber:
     def is_ready(self) -> bool:
         return self.model is not None
 
+    def _acquire_model(self):
+        """Take an in-use reference so unload() can't close the model out
+        from under a running inference."""
+        with self._load_lock:
+            model = self.model
+            if model is None:
+                raise TranscriptionError("High-accuracy model not loaded")
+            self._active_inferences += 1
+            return model
+
+    def _release_model(self) -> None:
+        close_target = None
+        with self._load_lock:
+            self._active_inferences -= 1
+            if self._active_inferences == 0 and self._deferred_close is not None:
+                close_target = self._deferred_close
+                self._deferred_close = None
+        if close_target is not None:
+            try:
+                close_target.close()
+            except Exception:
+                pass
+            gc.collect()
+            mx.clear_cache()
+
     def unload(self) -> None:
+        close_target = None
         with self._load_lock:
             if self._loading:
                 self._discard_when_loaded = True
             model = self.model
             self.model = None
-        if model is not None:
+            if model is not None:
+                if self._active_inferences > 0:
+                    # An inference is running on this model right now —
+                    # closing it would crash mid-Metal-graph. Defer to the
+                    # last _release_model().
+                    self._deferred_close = model
+                else:
+                    close_target = model
+        if close_target is not None:
             try:
-                model.close()
+                close_target.close()
             except Exception:
                 pass
         gc.collect()
         mx.clear_cache()
 
     def transcribe_pcm(self, pcm_bytes: bytes, channels: int, sample_width: int, rate: int) -> str:
-        model = self.model
-        if model is None:
-            raise TranscriptionError("High-accuracy model not loaded")
         if not pcm_bytes:
             return ""
         if sample_width != 2 or rate != 16000:
             raise TranscriptionError("High-accuracy model expects 16-bit 16kHz PCM")
 
-        samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        if channels > 1:
-            samples = samples.reshape(-1, channels).mean(axis=1)
-        result = model.transcribe(samples, language="en")
-        text = (result.text or "").strip()
-        gc.collect()
-        mx.clear_cache()
-        return text
-
-    def transcribe_file(self, file_path: str | Path) -> str:
-        model = self.model
-        if model is None:
-            raise TranscriptionError("High-accuracy model not loaded")
-
-        normalized_path = normalize_media(file_path)
+        model = self._acquire_model()
         try:
-            try:
-                with wave.open(normalized_path, "rb") as wav_file:
-                    if wav_file.getnframes() == 0:
-                        return ""
-            except (wave.Error, OSError):
-                pass
-            result = model.transcribe(normalized_path, language="en")
+            samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            if channels > 1:
+                samples = samples.reshape(-1, channels).mean(axis=1)
+            result = model.transcribe(samples, language="en")
             text = (result.text or "").strip()
             gc.collect()
             mx.clear_cache()
             return text
         finally:
+            self._release_model()
+
+    def transcribe_file(self, file_path: str | Path) -> str:
+        model = self._acquire_model()
+        try:
+            normalized_path = normalize_media(file_path)
             try:
-                os.unlink(normalized_path)
-            except OSError:
-                pass
+                try:
+                    with wave.open(normalized_path, "rb") as wav_file:
+                        if wav_file.getnframes() == 0:
+                            return ""
+                except (wave.Error, OSError):
+                    pass
+                result = model.transcribe(normalized_path, language="en")
+                text = (result.text or "").strip()
+                gc.collect()
+                mx.clear_cache()
+                return text
+            finally:
+                try:
+                    os.unlink(normalized_path)
+                except OSError:
+                    pass
+        finally:
+            self._release_model()
 
 
 def write_wav_file(frames: bytes, channels: int, sample_width: int, rate: int) -> str:
