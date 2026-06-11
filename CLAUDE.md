@@ -45,7 +45,7 @@ src/parakeet_dictation/
   main.py            Entry point. Parses --version, inits DictationApp, installs signal handlers.
   app.py             Core controller (DictationApp). Owns all state, coordinates components, Settings menu.
   overlay.py         Native NSPanel overlay: drop zone, device selector, text view, queue tab, controls.
-  transcription.py   AudioRecorder (PyAudio callback streaming) + ParakeetTranscriber (model loading, chunked inference, streaming drafts, FFmpeg normalization).
+  transcription.py   AudioRecorder (PyAudio callback streaming) + ParakeetTranscriber (model loading, chunked inference, streaming drafts) + QwenTranscriber (high-accuracy final passes) + shared FFmpeg/WAV helpers.
   queue.py           TranscriptionQueue (thread-safe item list), QueueItem dataclass, OutputMode/OutputConfig for save options.
   export.py          export_results() writes completed queue items to clipboard, individual files, or single file.
   hotkeys.py         GlobalHotKeyManager. Registers Option+Space via Carbon API ctypes bindings.
@@ -96,6 +96,24 @@ When transcription completes, two deferred flags may trigger post-completion act
 - `_force_copy_after_transcription`: copy result to clipboard after completion.
 Applied in `_finalize_deferred_overlay_actions()`.
 
+### Model Strategy (Two Engines)
+
+Two ASR models share the MLX/Metal runtime:
+
+- **Parakeet TDT 0.6B v2** (always loaded, ~1.2 GB): live streaming drafts, transcription while the high-accuracy model loads, and fallback on any failure. Pinned to v2 — v3 regresses English WER.
+- **Qwen3-ASR 1.7B** (`mlx-community/Qwen3-ASR-1.7B-bf16`, ~3.4 GB, loaded in background when the `high_accuracy` setting is on — default): final passes for mic dictation, single files, and queue items. Best English WER available on MLX (5.76 vs Parakeet's 6.05 on Open ASR). No streaming, no mid-inference cancellation (cancel is checked before inference; queue items remain cancellable between files; the completed-result-is-always-published invariant holds).
+
+Routing lives in `DictationApp._final_transcribe_pcm/_final_transcribe_file`: Qwen when enabled+ready, otherwise Parakeet; any Qwen exception logs and falls back to Parakeet. Toggling the setting off calls `QwenTranscriber.unload()` to free RAM. First enable downloads ~3.4 GB from Hugging Face.
+
+### Recording Start Latency
+
+The first words of a dictation must not be lost; capture starts as early as possible:
+- `AudioRecorder.warm_up()` runs at launch in a background thread (first CoreAudio open after process start is slow; `cleanup()` joins this thread — opening PortAudio during interpreter teardown segfaults).
+- `start()` reuses the existing PyAudio session (rebuild only on open failure) — rebuilding each start cost ~100-200ms of speech.
+- `_show_overlay_and_start_on_main` starts the mic **before** any overlay/window work.
+- Status shows "Starting mic…" and flips to "Recording…" only when the first audio frames actually arrive (`first_frame_event`).
+- `_audio_lock` serializes PyAudio session use (open/enumerate/reinit/terminate); device enumeration runs off the main thread to avoid beachballs during model load.
+
 ### Live Preview (Streaming Drafts)
 
 While recording, `_live_preview_worker` feeds new PCM from `recorder.frames` into `ParakeetTranscriber.stream_drafts()` (parakeet-mlx `transcribe_stream`, ~1s batches), pushing growing draft text into the overlay. Drafts use local attention with limited context and are **less accurate** than the offline pass.
@@ -144,7 +162,8 @@ Custom exceptions: `TranscriptionError`, `HotKeyError`, `ClipboardError`, `Expor
 | Constant | Location | Value |
 |---|---|---|
 | Audio format | transcription.py | 16-bit PCM, mono, 16kHz, 512-frame chunks |
-| Model ID | transcription.py | `mlx-community/parakeet-tdt-0.6b-v2` (pinned: v3 regresses English WER) |
+| Model ID (drafts/fallback) | transcription.py | `mlx-community/parakeet-tdt-0.6b-v2` (pinned: v3 regresses English WER) |
+| Model ID (high accuracy) | transcription.py | `mlx-community/Qwen3-ASR-1.7B-bf16` |
 | Chunk duration | transcription.py | 120s with 15s overlap |
 | Live draft batch | transcription.py | ~1s of PCM per `stream_drafts` step, context (256, 256) |
 | Settings file | config.py | `~/Library/Application Support/Maramax/settings.json` |
@@ -184,7 +203,7 @@ The standalone .app is built with py2app. MLX is a namespace package with C exte
 
 ## Dependencies
 
-Runtime: `parakeet-mlx>=0.5.2,<0.6`, `numpy<2.3`, `pyaudio~=0.2.14`, `rumps~=0.4.0`, `pyperclip~=1.9.0`, `python-dotenv~=1.1.1`, `pyobjc-framework-cocoa~=11.1`.
+Runtime: `parakeet-mlx>=0.5.2,<0.6`, `qwen3-asr-mlx>=0.1.1,<0.2`, `numpy<2.3`, `pyaudio~=0.2.14`, `rumps~=0.4.0`, `pyperclip~=1.9.0`, `python-dotenv~=1.1.1`, `pyobjc-framework-cocoa~=11.1`.
 
 Dev: `pytest`, `ruff`, `mypy`, `py2app`, `build`.
 

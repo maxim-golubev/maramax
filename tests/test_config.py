@@ -9,6 +9,7 @@ def test_defaults_when_file_missing(tmp_path):
     assert config.auto_copy_to_clipboard is True
     assert config.paste_to_active_app is False
     assert config.live_preview is True
+    assert config.high_accuracy is True
     assert config.history_limit == 100
 
 

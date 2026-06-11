@@ -5,7 +5,7 @@ from setuptools import setup
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_NAME = "Maramax"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 OPTIONS = {
     "argv_emulation": False,
@@ -14,6 +14,11 @@ OPTIONS = {
     "packages": [
         "parakeet_dictation",
         "parakeet_mlx",
+        "qwen3_asr_mlx",
+        "tokenizers",
+        "_soundfile_data",
+        "cffi",
+        "pycparser",
         "rumps",
         "pyperclip",
         "dotenv",
@@ -27,6 +32,9 @@ OPTIONS = {
         "numpy",
         "wave",
         "ctypes",
+        "soundfile",
+        "_soundfile",
+        "_cffi_backend",
     ],
     "excludes": [
         "mlx",

@@ -10,6 +10,7 @@ _PERSISTED_FIELDS = (
     "auto_copy_to_clipboard",
     "paste_to_active_app",
     "live_preview",
+    "high_accuracy",
     "history_limit",
 )
 
@@ -28,6 +29,7 @@ class AppConfig:
     auto_copy_to_clipboard: bool = True
     paste_to_active_app: bool = False
     live_preview: bool = True
+    high_accuracy: bool = True
     history_limit: int = 100
     shortcuts: ShortcutConfig = field(default_factory=ShortcutConfig)
 
