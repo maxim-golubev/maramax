@@ -4,10 +4,11 @@ import os
 import signal
 
 from .logger_config import setup_logging
-from .paths import ensure_runtime_path
+from .paths import ensure_runtime_path, ensure_ssl_certs
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 ensure_runtime_path()
+ensure_ssl_certs()
 
 logger = setup_logging()
 

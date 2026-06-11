@@ -22,6 +22,16 @@ OPTIONS = {
         "rumps",
         "pyperclip",
         "dotenv",
+        # huggingface_hub 1.x networking stack (httpx); incomplete bundling
+        # makes from_pretrained silently fall back to local-path resolution.
+        "huggingface_hub",
+        "httpx",
+        "httpcore",
+        "anyio",
+        "h11",
+        "idna",
+        "certifi",
+        "hf_xet",
     ],
     "includes": [
         "AppKit",
