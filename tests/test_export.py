@@ -66,6 +66,21 @@ def test_export_individual_chosen_dir(tmp_path):
     assert str(out_dir) in summary
 
 
+def test_export_oserror_wrapped_as_export_error(tmp_path):
+    item = _make_item(filename="audio.mp3", path="/original/audio.mp3", text="transcribed")
+    # A file where the output directory should be -> mkdir raises OSError
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("file in the way")
+    config = OutputConfig(
+        mode=OutputMode.INDIVIDUAL_CHOSEN_DIR,
+        output_path=str(blocker / "sub"),
+    )
+    import pytest
+    from parakeet_dictation.export import ExportError
+    with pytest.raises(ExportError):
+        export_results([item], config)
+
+
 def test_export_individual_handles_existing_file(tmp_path):
     source = tmp_path / "audio.mp3"
     source.touch()

@@ -204,6 +204,7 @@ class OverlayController(NSObject):
         self._copy_feedback_visible = False
         self._queue_items = []
         self._queue_processing = False
+        self._selected_queue_item_id = None
         self._build_window()
         self._refresh_text_view()
         self._sync_copy_button()
@@ -624,6 +625,16 @@ class OverlayController(NSObject):
 
         self.queue_text_view.setString_("\n".join(lines))
 
+        # Re-select the last-acted-on item by identity: setString_ resets the
+        # cursor, so without this, repeated Move/Remove presses act on
+        # whatever line the cursor lands on instead of the same item.
+        if self._selected_queue_item_id is not None:
+            for i, item in enumerate(self._queue_items):
+                if item.id == self._selected_queue_item_id:
+                    offset = sum(len(line) + 1 for line in lines[:i]) + 2
+                    self.queue_text_view.setSelectedRange_(NSMakeRange(offset, 0))
+                    break
+
     @objc.python_method
     def _get_selected_queue_index(self) -> int | None:
         if not self._queue_items:
@@ -964,6 +975,7 @@ class OverlayController(NSObject):
         idx = self._get_selected_queue_index()
         if idx is not None and idx > 0:
             item = self._queue_items[idx]
+            self._selected_queue_item_id = item.id
             self.delegate.queue_move_item(item.id, idx - 1)
 
     def queueMoveDown_(self, sender):
@@ -971,6 +983,7 @@ class OverlayController(NSObject):
         idx = self._get_selected_queue_index()
         if idx is not None and idx < len(self._queue_items) - 1:
             item = self._queue_items[idx]
+            self._selected_queue_item_id = item.id
             self.delegate.queue_move_item(item.id, idx + 1)
 
     def queueRemove_(self, sender):
@@ -978,10 +991,12 @@ class OverlayController(NSObject):
         idx = self._get_selected_queue_index()
         if idx is not None:
             item = self._queue_items[idx]
+            self._selected_queue_item_id = None
             self.delegate.queue_remove_item(item.id)
 
     def queueClear_(self, sender):
         del sender
+        self._selected_queue_item_id = None
         self.delegate.queue_clear_requested()
 
     def queueStart_(self, sender):

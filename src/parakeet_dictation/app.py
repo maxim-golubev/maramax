@@ -148,8 +148,10 @@ class DictationApp(rumps.App):
             self.show_overlay()
 
     def show_overlay(self) -> None:
-        self.current_transcript = ""
-        self._reset_deferred_flags()
+        # Keep the last transcript visible/copyable; only a new recording
+        # clears it (start_recording).
+        if not (self.recording_active or self.is_transcribing):
+            self._reset_deferred_flags()
         self._show_overlay_on_main("result")
 
     def show_history_overlay(self) -> None:
@@ -162,14 +164,26 @@ class DictationApp(rumps.App):
 
     def _show_overlay_on_main(self, mode: str) -> None:
         self._capture_previous_app()
-        self._overlay_session += 1
+        # Only invalidate worker sessions when no operation owns the display;
+        # bumping mid-recording/transcription would silently discard live
+        # drafts and the final result.
+        if not (self.recording_active or self.is_transcribing):
+            self._overlay_session += 1
+        else:
+            # The user explicitly re-opened the overlay — don't hide it when
+            # the in-flight operation finishes.
+            with self._state_lock:
+                self._hide_after_transcription = False
         self.overlay_visible = True
-        if mode == "result":
-            self.overlay_controller.set_current_text("")
         self._refresh_input_devices()
         self.overlay_controller.show_mode(mode)
 
     def _show_overlay_and_start_on_main(self) -> None:
+        # A queued duplicate (rapid double Option+Space) must not bump the
+        # session out from under the recording the first press started.
+        if self.recording_active or self.is_transcribing:
+            self.overlay_controller.focus()
+            return
         self.current_transcript = ""
         self._reset_deferred_flags()
         self._capture_previous_app()
@@ -245,20 +259,37 @@ class DictationApp(rumps.App):
         self._push_status("Starting mic\u2026", recording=True)
         threading.Thread(
             target=self._announce_recording_when_live,
-            args=(self._overlay_session,),
+            args=(
+                self._overlay_session,
+                self.recorder.start_generation,
+                self.recorder.signal_event,
+                self.recorder.first_frame_event,
+            ),
             daemon=True,
         ).start()
         if self.config.live_preview:
             self._start_live_preview()
         return True
 
-    def _announce_recording_when_live(self, session: int) -> None:
+    def _announce_recording_when_live(
+        self,
+        session: int,
+        generation: int,
+        signal_event: threading.Event,
+        first_frame_event: threading.Event,
+    ) -> None:
         # Wait for actual signal, not just frames: Bluetooth mics deliver
-        # silent frames for 1-2s while switching into headset mode.
-        if not self.recorder.signal_event.wait(timeout=5.0):
-            if not self.recorder.first_frame_event.is_set():
+        # silent frames for 1-2s while switching into headset mode. The
+        # events and generation are captured at start so a stale announcer
+        # can never vouch for a *different* recording's microphone.
+        if not signal_event.wait(timeout=5.0):
+            if not first_frame_event.is_set():
                 return
-        if self.recording_active and session == self._overlay_session:
+        if (
+            self.recording_active
+            and session == self._overlay_session
+            and generation == self.recorder.start_generation
+        ):
             self._push_status("Recording\u2026", recording=True)
 
     def stop_recording_requested(self, auto_copy: bool | None = None, hide_after: bool = False) -> None:
@@ -325,12 +356,18 @@ class DictationApp(rumps.App):
         return self.transcriber.transcribe_file(path, progress_callback=progress_callback)
 
     def _transcribe_recording_worker(self, pcm_bytes: bytes, auto_copy: bool | None, session: int) -> None:
-        # The live preview stream must finish before the offline pass: it
-        # holds the shared encoder in streaming (local attention) mode.
-        self._finish_live_preview()
         try:
+            # The live preview stream must finish before the offline pass: it
+            # holds the shared encoder in streaming (local attention) mode.
+            if not self._finish_live_preview():
+                raise TranscriptionError(
+                    "Transcription engine stalled — please try again"
+                )
             text = self._final_transcribe_pcm(pcm_bytes)
             if not text:
+                # Clear any leftover live draft: it is display-only and must
+                # not outlive a final pass that found no speech.
+                self._set_current_text_on_main("", session)
                 if self._cancel_event.is_set():
                     self._push_status("Cancelled", recording=False, revert_after=5)
                 else:
@@ -609,8 +646,11 @@ class DictationApp(rumps.App):
 
         with self._state_lock:
             force_copy = self._force_copy_after_transcription
+        # Auto-paste works via Cmd+V, so it requires the clipboard copy
+        # regardless of the auto-copy setting.
+        should_paste = self.config.paste_to_active_app and source_kind == "microphone"
         copied = False
-        if auto_copy or force_copy:
+        if auto_copy or force_copy or should_paste:
             copied = self._copy_text_with_feedback(
                 text,
                 success_status="Copied transcript to clipboard",
@@ -619,11 +659,15 @@ class DictationApp(rumps.App):
         else:
             self._push_status("Transcript ready", recording=False, revert_after=5)
 
-        if copied and self.config.paste_to_active_app and source_kind == "microphone":
+        if copied and should_paste:
             AppHelper.callAfter(self._paste_into_previous_app_on_main, session)
 
     def copy_current_transcript(self) -> None:
         text = self.current_transcript.strip()
+        if not text:
+            # Fall back to whatever the overlay is showing (e.g. the live
+            # draft during a recording) — the user is looking right at it.
+            text = (self.overlay_controller.current_text or "").strip()
         if not text:
             self._push_status("No transcript to copy", recording=self.recording_active)
             return
@@ -686,6 +730,12 @@ class DictationApp(rumps.App):
         return True
 
     def _start_live_preview(self) -> None:
+        existing = self._live_thread
+        if existing is not None and existing.is_alive():
+            # A wedged previous preview still holds the streaming encoder —
+            # never start a second stream on the same model.
+            logger.warning("Previous live preview still running; preview disabled this recording")
+            return
         session = self._overlay_session
         self._live_stop_event = threading.Event()
         self._live_thread = threading.Thread(
@@ -706,15 +756,20 @@ class DictationApp(rumps.App):
         except Exception as exc:
             logger.warning(f"Live preview unavailable: {exc}")
 
-    def _finish_live_preview(self) -> None:
+    def _finish_live_preview(self) -> bool:
+        """True when the streaming pass has fully released the encoder.
+        On False the offline pass MUST NOT run (the encoder is still in
+        streaming attention mode and would produce garbage)."""
         thread = self._live_thread
         if thread is None:
-            return
+            return True
         self._live_stop_event.set()
-        thread.join(timeout=10.0)
+        thread.join(timeout=30.0)
         if thread.is_alive():
-            logger.warning("Live preview thread did not stop in time")
+            logger.error("Live preview thread wedged; refusing offline pass")
+            return False
         self._live_thread = None
+        return True
 
     def _paste_into_previous_app_on_main(self, session: int) -> None:
         if session != self._overlay_session:
@@ -729,11 +784,28 @@ class DictationApp(rumps.App):
         previous_app = self._previous_app
         self.overlay_visible = False
         self.overlay_controller.hide()
-        if previous_app is not None:
-            previous_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+        if previous_app is None or previous_app.isTerminated():
+            self._push_status(
+                "Copied — auto-paste skipped (previous app closed)",
+                recording=False,
+                revert_after=5,
+            )
+            return
+        previous_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
 
         def _send_after_focus_returns():
             time.sleep(0.3)
+            # Never blind-fire Cmd+V: only paste if the app we re-activated
+            # actually ended up frontmost (the user may have switched away).
+            front = NSWorkspace.sharedWorkspace().frontmostApplication()
+            if front is None or front.processIdentifier() != previous_app.processIdentifier():
+                logger.warning("Auto-paste skipped: frontmost app changed")
+                self._push_status(
+                    "Copied — auto-paste skipped (focus changed)",
+                    recording=False,
+                    revert_after=5,
+                )
+                return
             try:
                 send_paste_keystroke()
             except PasteError as exc:
@@ -793,7 +865,8 @@ class DictationApp(rumps.App):
             self._hide_after_transcription = False
             self._force_copy_after_transcription = False
         if hide_after:
-            self.overlay_visible = False
+            # _hide_overlay_on_main owns the flag flip; setting it here would
+            # desync state when the session-guarded hide is skipped.
             AppHelper.callAfter(self._hide_overlay_on_main, session)
 
     def _push_status(self, message: str, recording: bool | None = None, revert_after: float = 0) -> None:

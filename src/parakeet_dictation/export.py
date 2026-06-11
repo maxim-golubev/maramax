@@ -15,20 +15,27 @@ def export_results(items: list[QueueItem], config: OutputConfig) -> str:
     if not completed:
         raise ExportError("No completed transcriptions to export")
 
-    if config.mode == OutputMode.CLIPBOARD:
-        return _export_clipboard(completed)
-    elif config.mode == OutputMode.INDIVIDUAL_SAME_DIR:
-        return _export_individual(completed, target_dir=None)
-    elif config.mode == OutputMode.INDIVIDUAL_CHOSEN_DIR:
-        if not config.output_path:
-            raise ExportError("No output directory specified")
-        return _export_individual(completed, target_dir=config.output_path)
-    elif config.mode == OutputMode.SINGLE_FILE:
-        if not config.output_path:
-            raise ExportError("No output file specified")
-        return _export_single_file(completed, config.output_path)
-    else:
-        raise ExportError(f"Unknown output mode: {config.mode}")
+    try:
+        if config.mode == OutputMode.CLIPBOARD:
+            return _export_clipboard(completed)
+        elif config.mode == OutputMode.INDIVIDUAL_SAME_DIR:
+            return _export_individual(completed, target_dir=None)
+        elif config.mode == OutputMode.INDIVIDUAL_CHOSEN_DIR:
+            if not config.output_path:
+                raise ExportError("No output directory specified")
+            return _export_individual(completed, target_dir=config.output_path)
+        elif config.mode == OutputMode.SINGLE_FILE:
+            if not config.output_path:
+                raise ExportError("No output file specified")
+            return _export_single_file(completed, config.output_path)
+        else:
+            raise ExportError(f"Unknown output mode: {config.mode}")
+    except ExportError:
+        raise
+    except OSError as exc:
+        # mkdir/exists on a vanished output volume raises bare OSError;
+        # callers only handle ExportError.
+        raise ExportError(f"Export failed: {exc}") from exc
 
 
 def _export_clipboard(items: list[QueueItem]) -> str:
