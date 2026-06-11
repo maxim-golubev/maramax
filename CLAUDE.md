@@ -109,7 +109,7 @@ Routing lives in `DictationApp._final_transcribe_pcm/_final_transcribe_file`: Qw
 
 The first words of a dictation must not be lost; capture starts as early as possible:
 - `AudioRecorder.warm_up()` runs at launch in a background thread (first CoreAudio open after process start is slow; `cleanup()` joins this thread — opening PortAudio during interpreter teardown segfaults).
-- `start()` reuses the existing PyAudio session (rebuild only on open failure) — rebuilding each start cost ~100-200ms of speech.
+- `start()` rebuilds the PyAudio session each time (~85ms): PortAudio snapshots the device list at init, so a reused session records from a stale default after AirPods reconnect. The honest "Recording…" indicator makes the rebuild cost invisible.
 - `_show_overlay_and_start_on_main` starts the mic **before** any overlay/window work.
 - Status shows "Starting mic…" and flips to "Recording…" only when non-silent audio actually arrives (`signal_event`; Bluetooth mics deliver pure-zero frames for 1-2s while switching into headset mode — speech during that window is unrecoverable, so the indicator must not show early). Warm-up targets the built-in mic so launch never flips Bluetooth audio out of high-quality mode.
 - `_audio_lock` serializes PyAudio session use (open/enumerate/reinit/terminate); device enumeration runs off the main thread to avoid beachballs during model load.
