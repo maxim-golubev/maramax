@@ -172,23 +172,22 @@ class AudioRecorder:
         self.first_frame_event = threading.Event()
         self.signal_event = threading.Event()
 
-        # Open on the existing audio session — rebuilding it on every start
-        # costs ~100ms of lost speech. Rebuild only if the open fails
-        # (e.g. the device list changed since init).
+        # Rebuild the audio session at each start (~85ms): PortAudio
+        # snapshots the device list at init, so a reused session silently
+        # records from a stale default device after AirPods reconnect.
+        # No speech is lost — the "Recording…" indicator only shows once
+        # audio actually flows (signal_event).
         with self._audio_lock:
             try:
+                self._reinit_audio()
                 self._open_stream()
-            except Exception:
-                try:
-                    self._reinit_audio()
-                    self._open_stream()
-                except Exception as exc:
-                    logger.error(f"Microphone start failed: {exc}")
-                    with self._state_lock:
-                        self.recording = False
-                        self.last_error = exc
-                    self._close_stream()
-                    return False
+            except Exception as exc:
+                logger.error(f"Microphone start failed: {exc}")
+                with self._state_lock:
+                    self.recording = False
+                    self.last_error = exc
+                self._close_stream()
+                return False
 
         thread = threading.Thread(target=self._record_loop, daemon=True)
         with self._state_lock:
