@@ -29,7 +29,7 @@ class AppConfig:
     auto_copy_to_clipboard: bool = True
     paste_to_active_app: bool = False
     live_preview: bool = True
-    high_accuracy: bool = True
+    high_accuracy: bool = False
     history_limit: int = 100
     shortcuts: ShortcutConfig = field(default_factory=ShortcutConfig)
 
