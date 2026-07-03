@@ -46,8 +46,13 @@ class DictationApp(rumps.App):
         self._settings_path = app_support_dir() / "settings.json"
         self.config = config or AppConfig.load(self._settings_path)
         self.transcriber = ParakeetTranscriber()
-        self.qwen = QwenTranscriber()
+        self.qwen = QwenTranscriber(on_load_failed=self._on_qwen_load_failed)
         self.recorder = AudioRecorder()
+        # A leftover in-progress capture means a previous session crashed or
+        # hung mid-recording — keep it recoverable.
+        self._recovery_available = self.recorder.preserve_recovery()
+        if self._recovery_available:
+            logger.info("Found unsaved recording from a previous session")
         self.history_store = HistoryStore(history_limit=self.config.history_limit)
         self.queue = TranscriptionQueue()
         self.current_transcript = ""
@@ -81,6 +86,7 @@ class DictationApp(rumps.App):
             rumps.MenuItem("Show History"),
             rumps.MenuItem("Toggle Recording"),
             rumps.MenuItem("Copy Last Transcript"),
+            rumps.MenuItem("Recover Last Recording"),
             rumps.MenuItem("Open Media Files\u2026"),
             rumps.MenuItem("Clear History"),
             ("Settings", list(self._settings_items.values())),
@@ -120,9 +126,14 @@ class DictationApp(rumps.App):
 
         if self._hotkey_error_message:
             self._push_status(self._hotkey_error_message, recording=False)
-            return
-
-        self._push_status("Ready", recording=False)
+        else:
+            self._push_status("Ready", recording=False)
+        if self._recovery_available:
+            self._push_status(
+                "Unsaved recording found — use Recover Last Recording",
+                recording=False,
+                revert_after=12,
+            )
 
     def _register_global_hotkeys(self) -> None:
         try:
@@ -285,12 +296,19 @@ class DictationApp(rumps.App):
         if not signal_event.wait(timeout=5.0):
             if not first_frame_event.is_set():
                 return
+        # The guards are re-checked on the main thread: checking here and
+        # then pushing could land "Recording\u2026" (and the hot-mic dot) after
+        # stop already pushed "Transcribing\u2026" if the user stops at the same
+        # moment the first signal arrives.
+        AppHelper.callAfter(self._apply_recording_announcement, session, generation)
+
+    def _apply_recording_announcement(self, session: int, generation: int) -> None:
         if (
             self.recording_active
             and session == self._overlay_session
             and generation == self.recorder.start_generation
         ):
-            self._push_status("Recording\u2026", recording=True)
+            self._apply_status_on_main("Recording\u2026", recording=True)
 
     def stop_recording_requested(self, auto_copy: bool | None = None, hide_after: bool = False) -> None:
         if not self.recording_active:
@@ -307,12 +325,16 @@ class DictationApp(rumps.App):
         self.is_transcribing = True
         self._cancel_event.clear()
         self._live_stop_event.set()
-        pcm_bytes = self.recorder.stop()
         self._push_status("Transcribing\u2026", recording=False)
         AppHelper.callAfter(self.overlay_controller.set_transcribing, True)
+        # recorder.stop() joins the recording thread and touches PortAudio \u2014
+        # either can block for seconds (or wedge outright on Bluetooth route
+        # changes), so it must never run on the main thread. The worker owns
+        # the stop; the few ms of extra audio captured before it runs are
+        # harmless trailing silence.
         threading.Thread(
             target=self._transcribe_recording_worker,
-            args=(pcm_bytes, auto_copy, session),
+            args=(auto_copy, session),
             daemon=True,
         ).start()
 
@@ -328,15 +350,18 @@ class DictationApp(rumps.App):
     # Qwen failure. Qwen has no progress callback, so cancellation is
     # checked before inference; a completed result is always published.
 
+    def _qwen_transcribe_recorder_pcm(self, pcm_bytes: bytes) -> str:
+        return self.qwen.transcribe_pcm(
+            pcm_bytes,
+            channels=self.recorder.channels,
+            sample_width=self.recorder.sample_width(),
+            rate=self.recorder.rate,
+        )
+
     def _final_transcribe_pcm(self, pcm_bytes: bytes) -> str:
         if self.config.high_accuracy and self.qwen.is_ready() and not self._cancel_event.is_set():
             try:
-                return self.qwen.transcribe_pcm(
-                    pcm_bytes,
-                    channels=self.recorder.channels,
-                    sample_width=self.recorder.sample_width(),
-                    rate=self.recorder.rate,
-                )
+                return self._qwen_transcribe_recorder_pcm(pcm_bytes)
             except Exception as exc:
                 logger.error(f"High-accuracy transcription failed, falling back: {exc}")
         return self.transcriber.transcribe_pcm(
@@ -355,15 +380,21 @@ class DictationApp(rumps.App):
                 logger.error(f"High-accuracy transcription failed, falling back: {exc}")
         return self.transcriber.transcribe_file(path, progress_callback=progress_callback)
 
-    def _transcribe_recording_worker(self, pcm_bytes: bytes, auto_copy: bool | None, session: int) -> None:
+    def _transcribe_recording_worker(self, auto_copy: bool | None, session: int) -> None:
         try:
+            pcm_bytes = self.recorder.stop()
             # The live preview stream must finish before the offline pass: it
             # holds the shared encoder in streaming (local attention) mode.
-            if not self._finish_live_preview():
-                raise TranscriptionError(
-                    "Transcription engine stalled — please try again"
-                )
-            text = self._final_transcribe_pcm(pcm_bytes)
+            if self._finish_live_preview():
+                text = self._final_transcribe_pcm(pcm_bytes)
+            elif self.qwen.is_ready() and not self._cancel_event.is_set():
+                # The Parakeet encoder is stuck in streaming mode, but Qwen
+                # is an independent model — rescue the dictation with it.
+                logger.warning("Live preview wedged; using high-accuracy model for final pass")
+                text = self._qwen_transcribe_recorder_pcm(pcm_bytes)
+            else:
+                raise TranscriptionError("Transcription engine stalled")
+
             if not text:
                 # Clear any leftover live draft: it is display-only and must
                 # not outlive a final pass that found no speech.
@@ -372,6 +403,11 @@ class DictationApp(rumps.App):
                     self._push_status("Cancelled", recording=False, revert_after=5)
                 else:
                     self._push_status("No speech detected", recording=False, revert_after=5)
+                if pcm_bytes:
+                    # Empty pcm means another stop() (e.g. quit cleanup) took
+                    # the frames — the spill file may be the only copy left,
+                    # so it must not be discarded.
+                    self.recorder.discard_recovery()
                 return
 
             # Transcription succeeded — always publish the result even if
@@ -385,15 +421,30 @@ class DictationApp(rumps.App):
                 auto_copy=self.config.auto_copy_to_clipboard if auto_copy is None else auto_copy,
                 session=session,
             )
+            self.recorder.discard_recovery()
         except TranscriptionError as exc:
             if self._cancel_event.is_set():
+                # An accidental cancel stays recoverable — but a quick
+                # cancelled capture must not clobber a longer recording
+                # still awaiting recovery.
+                self.recorder.preserve_recovery(only_if_larger=True)
                 self._push_status("Cancelled", recording=False, revert_after=5)
             else:
+                preserved = self.recorder.preserve_recovery()
                 logger.error(str(exc))
-                self._push_status(str(exc), recording=False, revert_after=5)
+                message = (
+                    f"{exc} — recording saved (Recover Last Recording)" if preserved else str(exc)
+                )
+                self._push_status(message, recording=False, revert_after=8)
         except Exception as exc:
+            preserved = self.recorder.preserve_recovery()
             logger.error(f"Unexpected transcription error: {exc}")
-            self._push_status("Transcription failed unexpectedly", recording=False, revert_after=5)
+            message = (
+                "Transcription failed — recording saved (Recover Last Recording)"
+                if preserved
+                else "Transcription failed unexpectedly"
+            )
+            self._push_status(message, recording=False, revert_after=8)
         finally:
             self.is_transcribing = False
             AppHelper.callAfter(self.overlay_controller.set_transcribing, False)
@@ -447,6 +498,11 @@ class DictationApp(rumps.App):
             self._push_status(f"{filename}: {pct}%", recording=False)
 
         try:
+            # A wedged live-preview thread leaves the shared Parakeet encoder
+            # in streaming mode — running the offline pass then would produce
+            # garbage. The source file stays on disk, so fail instead.
+            if not self._finish_live_preview():
+                raise TranscriptionError("Transcription engine stalled — restart the app")
             text = self._final_transcribe_file(path, _progress, self._cancel_event)
             if not text:
                 if self._cancel_event.is_set():
@@ -480,6 +536,104 @@ class DictationApp(rumps.App):
             AppHelper.callAfter(self.overlay_controller.set_transcribing, False)
             AppHelper.callAfter(self._restore_base_status)
             self._finalize_deferred_overlay_actions()
+
+    # -- Recording recovery --
+
+    def recover_last_recording(self) -> None:
+        """Transcribe the crash/failure-preserved capture from disk."""
+        if not self.transcriber.is_ready():
+            self._push_status("Model is still loading, please wait", recording=False)
+            return
+
+        if self.recording_active or self.is_transcribing:
+            self._push_status(
+                "Finish the current operation first", recording=self.recording_active,
+            )
+            return
+
+        if not self.recorder.has_recoverable_recording():
+            self._push_status("No recording to recover", recording=False, revert_after=5)
+            return
+
+        self._reset_deferred_flags()
+        self.current_transcript = ""
+        self.is_transcribing = True
+        self._cancel_event.clear()
+        self._capture_previous_app()
+        self._overlay_session += 1
+        session = self._overlay_session
+        self.overlay_visible = True
+
+        AppHelper.callAfter(self._prepare_file_transcription_on_main)
+        self._push_status("Transcribing recovered recording…", recording=False)
+        threading.Thread(
+            target=self._recover_worker,
+            args=(session,),
+            daemon=True,
+        ).start()
+
+    def _recover_worker(self, session: int) -> None:
+        try:
+            # Loaded here, not on the menu-click (main) thread: an hour of
+            # PCM is ~115 MB.
+            pcm_bytes = self.recorder.load_recoverable_recording()
+            if not pcm_bytes:
+                self._push_status("No recording to recover", recording=False, revert_after=5)
+                return
+            # Same wedged-encoder guard as live dictation, with the same
+            # Qwen rescue; on failure the file is kept for a retry.
+            if self._finish_live_preview():
+                text = self._final_transcribe_pcm(pcm_bytes)
+            elif self.qwen.is_ready() and not self._cancel_event.is_set():
+                logger.warning("Live preview wedged; using high-accuracy model for recovery")
+                text = self._qwen_transcribe_recorder_pcm(pcm_bytes)
+            else:
+                raise TranscriptionError("Transcription engine stalled")
+
+            if not text:
+                if self._cancel_event.is_set():
+                    self._push_status("Cancelled", recording=False, revert_after=5)
+                else:
+                    self._push_status(
+                        "No speech in recovered recording", recording=False, revert_after=5,
+                    )
+                return
+
+            self._publish_transcript(
+                text=text,
+                source_kind="microphone",
+                source_label="Recovered Recording",
+                auto_copy=self.config.auto_copy_to_clipboard,
+                session=session,
+            )
+            self.recorder.discard_recoverable_recording()
+        except TranscriptionError as exc:
+            # Keep the file: recovery can be retried.
+            if self._cancel_event.is_set():
+                self._push_status("Cancelled", recording=False, revert_after=5)
+            else:
+                logger.error(str(exc))
+                self._push_status(str(exc), recording=False, revert_after=5)
+        except Exception as exc:
+            logger.error(f"Unexpected recovery error: {exc}")
+            self._push_status("Recovery failed unexpectedly", recording=False, revert_after=5)
+        finally:
+            self.is_transcribing = False
+            AppHelper.callAfter(self.overlay_controller.set_transcribing, False)
+            AppHelper.callAfter(self._restore_base_status)
+            self._finalize_deferred_overlay_actions()
+
+    def _on_qwen_load_failed(self, message: str) -> None:
+        del message
+        if not self.config.high_accuracy:
+            # The user already toggled the setting off while the load was in
+            # flight — don't warn about a model they no longer want.
+            return
+        self._push_status(
+            "High-accuracy model failed to load — using standard model",
+            recording=None,
+            revert_after=8,
+        )
 
     # -- Queue delegate methods --
 
@@ -542,6 +696,15 @@ class DictationApp(rumps.App):
         run_ids = {item.id for item in pending}
 
         try:
+            # Same guard as single-file transcription: a wedged live preview
+            # leaves the shared encoder in streaming mode.
+            if not self._finish_live_preview():
+                self._push_status(
+                    "Transcription engine stalled — restart the app",
+                    recording=False,
+                    revert_after=8,
+                )
+                return
             for index, item in enumerate(pending, start=1):
                 if self._queue_cancel_event.is_set():
                     self.queue.set_status(item.id, "cancelled")
@@ -687,6 +850,10 @@ class DictationApp(rumps.App):
         # off the main thread so the overlay never beachballs.
         def _enumerate():
             devices = self.recorder.list_input_devices()
+            if devices is None:
+                # Audio session busy — keep the current popup rather than
+                # showing a false "no input devices found".
+                return
             selected = self.recorder.get_selected_device_name()
             AppHelper.callAfter(self.overlay_controller.update_input_devices, devices, selected)
 
@@ -876,7 +1043,10 @@ class DictationApp(rumps.App):
         self._status_token += 1
         if revert_after == 0:
             self._base_status = message
-        self.title = None
+        # Menu-bar dot while the mic session is live, so a hot mic is
+        # visible even with the overlay hidden.
+        if recording is not None:
+            self.title = " ●" if recording else None
         self.status_item.title = f"Status: {message}"
         self.overlay_controller.set_status(message)
         if recording is not None:
@@ -931,6 +1101,11 @@ class DictationApp(rumps.App):
     def menu_copy_last(self, sender):
         del sender
         self.copy_current_transcript()
+
+    @rumps.clicked("Recover Last Recording")
+    def menu_recover_last(self, sender):
+        del sender
+        self.recover_last_recording()
 
     @rumps.clicked("Open Media Files\u2026")
     def menu_open_files(self, sender):

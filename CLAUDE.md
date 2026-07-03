@@ -47,6 +47,7 @@ src/parakeet_dictation/
   overlay.py         Native NSPanel overlay: drop zone, device selector, text view, queue tab, controls.
   transcription.py   AudioRecorder (PyAudio callback streaming) + ParakeetTranscriber (model loading, chunked inference, streaming drafts) + QwenTranscriber (high-accuracy final passes) + shared FFmpeg/WAV helpers.
   queue.py           TranscriptionQueue (thread-safe item list), QueueItem dataclass, OutputMode/OutputConfig for save options.
+  recovery.py        Crash-safe recording recovery: paths + promote/discard/load helpers for the PCM spill files.
   export.py          export_results() writes completed queue items to clipboard, individual files, or single file.
   hotkeys.py         GlobalHotKeyManager. Registers Option+Space via Carbon API ctypes bindings.
   autopaste.py       Synthetic Cmd+V via CoreGraphics CGEvent ctypes bindings + Accessibility trust check.
@@ -68,7 +69,7 @@ assets/
 
 - **Main thread**: rumps event loop + AppKit UI. All NSView/NSPanel mutations must happen here.
 - **Model loader thread**: `ParakeetTranscriber.__init__` spawns daemon thread to download/init model. Signals `ready_event` when done.
-- **Recording thread**: `AudioRecorder._record_loop` monitors PyAudio callback stream in background.
+- **Recording thread**: `AudioRecorder._record_loop` monitors PyAudio callback stream in background and flushes captured PCM to the recovery spill file (~1s cadence).
 - **Live preview worker**: `_live_preview_worker` feeds recorded PCM into `ParakeetTranscriber.stream_drafts` during recording, pushing draft text to the overlay (session-guarded).
 - **Transcription workers**: `_transcribe_recording_worker` and `_process_queue_worker` run inference off main thread.
 
@@ -88,6 +89,20 @@ Thread coordination:
 User clicks "Cancel" during transcription -> sets `_cancel_event` and `_queue_cancel_event` -> worker's progress callback checks the event and raises `TranscriptionError("Cancelled")` -> worker unwinds gracefully. Queue cancellation still exports any items that completed before the cancel.
 
 **Invariant**: If `transcribe_pcm` returns text successfully, the result is always published — even if the cancel event was set while inference was running. Cancel only discards results when it actually interrupts inference (raises `TranscriptionError` via the chunk callback). A completed transcription is never thrown away.
+
+### Main Thread Never Touches a Stoppable Stream
+
+PortAudio's `Pa_StopStream` can wedge indefinitely on Bluetooth route changes (AirPods). Every stop path (hotkey toggle, Cmd+R, Stop button, Esc) therefore only flips flags on the main thread; `recorder.stop()` — the thread join and stream close — runs inside `_transcribe_recording_worker`. All PortAudio locks are bounded (`_close_stream(timeout=…)`, `_audio_lock.acquire(timeout=…)`): the timeout bounds the lock acquire (a C call can't be interrupted — `stop()` additionally runs its forced close on a sacrificial daemon thread so even a close that wedges after acquiring can't hang the worker). On failure the session is abandoned via `_abandon_stream_session()`: fresh `_stream_lock`, zombie stream reference dropped, and a replacement `PyAudio` instance — the old one is deliberately **never terminated**, because `Pa_Terminate` would free the wedged stream under the stuck call and abort the process (`cleanup()` likewise skips terminate when its close fails). Three identity guards keep zombies harmless: the stream callback captures its own generation/frames/events, `_record_loop` closes only its `expected` stream, and the recovery spill handle is captured per-recording (a revived zombie can't flush into or close a newer recording's spill file; `_recovery_lock` guards the handle/cursor).
+
+### Recording Recovery (never lose audio)
+
+While recording, `_record_loop` spills raw PCM to `~/Library/Application Support/Maramax/recording-in-progress.pcm` (finalized *before* the stream close in its `finally`; if the loop itself wedges, `stop()` and `preserve_recovery()` flush the tail frames so the file is still complete). All access to the two spill files goes through `AudioRecorder` (`discard_recovery`, `preserve_recovery`, `has/load/discard_recoverable_recording`) — app code never touches `recovery.py` paths directly. Lifecycle, owned by `DictationApp`:
+- Transcription published or "no speech" → `recorder.discard_recovery()` — except when `stop()` returned empty pcm (another stop, e.g. quit cleanup, took the frames): then the spill file may be the only copy and is kept.
+- Transcription failed → `recorder.preserve_recovery()` promotes it to `last-recording.pcm`. Cancelled → `preserve_recovery(only_if_larger=True)`: an accidental cancel stays recoverable, but a quick cancelled capture never clobbers a longer recording still awaiting recovery.
+- Launch: a leftover in-progress file (crash/force-quit) is promoted and a status hint is shown once the model is ready (also when hotkey registration failed).
+- Menu "Recover Last Recording" transcribes `last-recording.pcm` via the normal final-pass routing (loading the PCM on the worker thread — it can be ~115 MB/hour) and deletes it on success; kept on failure so recovery can be retried.
+
+**Wedged-encoder guard**: if the live-preview thread wedges, the shared Parakeet encoder is stuck in streaming attention mode and any offline pass on it would produce garbage. Every worker that runs a final pass (`_transcribe_recording_worker`, `_transcribe_file_worker`, `_process_queue_worker`, `_recover_worker`) therefore joins the live thread first via `_finish_live_preview()`. Mic dictation and recovery rescue with Qwen when it is loaded (cancel is checked before the rescue since Qwen inference is uninterruptible); file/queue transcription just fails — the source files are still on disk.
 
 ### Deferred Overlay Actions
 
@@ -167,6 +182,7 @@ Custom exceptions: `TranscriptionError`, `HotKeyError`, `ClipboardError`, `Expor
 | Chunk duration | transcription.py | 120s with 15s overlap |
 | Live draft batch | transcription.py | ~1s of PCM per `stream_drafts` step, context (256, 256) |
 | Settings file | config.py | `~/Library/Application Support/Maramax/settings.json` |
+| Recovery spill files | recovery.py | `recording-in-progress.pcm` / `last-recording.pcm` in app support dir |
 | FFmpeg timeout | transcription.py | 120s |
 | Overlay width | overlay.py | 688px |
 | Media extensions | overlay.py | aac, aiff, flac, m4a, mov, mp3, mp4, ogg, opus, wav, webm |
