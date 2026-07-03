@@ -1043,10 +1043,7 @@ class DictationApp(rumps.App):
         self._status_token += 1
         if revert_after == 0:
             self._base_status = message
-        # Menu-bar dot while the mic session is live, so a hot mic is
-        # visible even with the overlay hidden.
-        if recording is not None:
-            self.title = " ●" if recording else None
+        self.title = None
         self.status_item.title = f"Status: {message}"
         self.overlay_controller.set_status(message)
         if recording is not None:
