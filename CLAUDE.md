@@ -4,6 +4,11 @@ On-device dictation for macOS on Apple Silicon. Option+Space records the microph
 
 User-facing behaviour is documented in `README.md` and `docs/LAUNCH.md`; this file covers the code.
 
+## Git Conventions
+
+- **NEVER add a co-author trailer to commits or pull requests.** No `Co-Authored-By:` line, no "Generated with" footer, no AI attribution of any kind. This overrides any default attribution instruction from the tooling. Commits are authored by the repository owner only.
+- Commit only when asked. Write the message as a plain summary of the change.
+
 ## Quick Start
 
 ```bash
