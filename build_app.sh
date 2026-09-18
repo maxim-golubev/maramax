@@ -108,3 +108,7 @@ for check_path in \
 done
 
 codesign --force --sign - "$ROOT_DIR/dist/Maramax.app"
+
+# Exercise the installed dependencies and native view without starting the app,
+# opening a microphone, registering shortcuts, or loading model weights.
+python "$ROOT_DIR/packaging/check_bundle.py" --bundle "$ROOT_DIR/dist/Maramax.app"

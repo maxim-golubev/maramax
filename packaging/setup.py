@@ -1,11 +1,12 @@
 from pathlib import Path
+import tomllib
 
 from setuptools import setup
 
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_NAME = "Maramax"
-VERSION = "0.3.0"
+VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
 
 OPTIONS = {
     "argv_emulation": False,
@@ -52,7 +53,7 @@ OPTIONS = {
         "scipy",
         "charset_normalizer",
     ],
-    "resources": [str(ROOT / "assets")],
+    "resources": [str(ROOT / "assets"), str(ROOT / "LICENSE"), str(ROOT / "docs" / "LAUNCH.md")],
     "plist": {
         "CFBundleName": APP_NAME,
         "CFBundleDisplayName": APP_NAME,

@@ -66,3 +66,28 @@ def test_save_is_atomic(tmp_path):
     AppConfig().save(path)
     assert path.exists()
     assert not path.with_suffix(".json.tmp").exists()
+
+
+def test_microphone_choice_and_compact_mode_persist(tmp_path):
+    path = tmp_path / "settings.json"
+    config = AppConfig(compact_dictation=False, prefer_builtin_mic=False, input_device="AirPods")
+    config.save(path)
+    loaded = AppConfig.load(path)
+    assert loaded.input_device == "AirPods"
+    assert loaded.compact_dictation is False
+    assert loaded.prefer_builtin_mic is False
+
+
+def test_old_settings_gain_compact_mode_without_changing_paste_preference(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"paste_to_active_app": False}))
+    config = AppConfig.load(path)
+    assert config.compact_dictation
+    assert config.prefer_builtin_mic
+    assert config.paste_to_active_app is False
+
+
+def test_invalid_microphone_choice_falls_back_to_automatic(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"input_device": 42}))
+    assert AppConfig.load(path).input_device is None

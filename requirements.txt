@@ -1,7 +1,8 @@
 parakeet-mlx>=0.5.2,<0.6
+qwen3-asr-mlx>=0.1.1,<0.2
 numpy<2.3
 pyaudio~=0.2.14
-rumps~=0.4.0
+rumps~=0.4.1
 pyperclip~=1.9.0
 python-dotenv~=1.1.1
 pyobjc-framework-Cocoa~=11.1

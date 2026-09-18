@@ -1,3 +1,5 @@
+"""Resource, support-directory, PATH, and TLS certificate resolution for dev and bundle runs."""
+
 from __future__ import annotations
 
 import os

@@ -1,7 +1,11 @@
+"""Console and rotating-file logging for the shared maramax logger."""
+
 from __future__ import annotations
 
 import logging
 import os
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -47,10 +51,19 @@ class ColoredFormatter(logging.Formatter):
         return f"{timestamp} - {level} - {level_color}{message}{self.RESET}"
 
 
-def setup_logging() -> logging.Logger:
+def setup_logging(log_path: Path | None = None) -> logging.Logger:
     global _LOGGER_CONFIGURED
 
     logger = logging.getLogger(_LOGGER_NAME)
+
+    if log_path is not None and not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8")
+            file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            logger.addHandler(file_handler)
+        except OSError:
+            logger.warning("Could not open diagnostic log")
 
     if _LOGGER_CONFIGURED:
         return logger
@@ -63,7 +76,6 @@ def setup_logging() -> logging.Logger:
     handler = logging.StreamHandler()
     handler.setFormatter(ColoredFormatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S"))
 
-    logger.handlers.clear()
     logger.addHandler(handler)
     _LOGGER_CONFIGURED = True
     return logger

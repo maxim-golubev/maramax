@@ -1,0 +1,283 @@
+{
+  "bundle": "releases/Maramax-0.4.0/Maramax.app",
+  "python": "3.12.4",
+  "imports": {
+    "parakeet_dictation.app": "lib/python3.12/parakeet_dictation/app.py",
+    "parakeet_dictation.recorder": "lib/python3.12/parakeet_dictation/recorder.py",
+    "parakeet_dictation.recordings_window": "lib/python3.12/parakeet_dictation/recordings_window.py",
+    "mlx.core": "lib/python3.12/mlx/core.cpython-312-darwin.so",
+    "parakeet_mlx": "lib/python3.12/parakeet_mlx/__init__.py",
+    "parakeet_dictation.preferences": "lib/python3.12/parakeet_dictation/preferences.py",
+    "parakeet_dictation.instance": "lib/python3.12/parakeet_dictation/instance.py",
+    "qwen3_asr_mlx": "lib/python3.12/qwen3_asr_mlx/__init__.py",
+    "pyaudio": "lib/python312.zip/pyaudio/__init__.pyc",
+    "soundfile": "lib/python312.zip/soundfile.pyc",
+    "scipy": "lib/python3.12/scipy/__init__.py",
+    "numpy": "lib/python3.12/numpy/__init__.py",
+    "tokenizers": "lib/python3.12/tokenizers/__init__.py",
+    "huggingface_hub": "lib/python3.12/huggingface_hub/__init__.py",
+    "httpx": "lib/python3.12/httpx/__init__.py",
+    "certifi": "lib/python3.12/certifi/__init__.py",
+    "AppKit": "lib/python312.zip/AppKit/__init__.pyc"
+  },
+  "component_check_seconds": 0.426,
+  "checks": [
+    "isolated bundled imports",
+    "TLS certificates",
+    "hidden passive panel",
+    "hidden settings, transcript, and recovery windows",
+    "audio archive round trip and deletion"
+  ],
+  "microphone_opened": false,
+  "audio_played": false,
+  "recognition": {
+    "model": "mlx-community/parakeet-tdt-0.6b-v2",
+    "audio_seconds": 6.6878125,
+    "load_and_warm_seconds": 2.04,
+    "runs": [
+      {
+        "seconds": 0.206,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.209,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.204,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.202,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.204,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.198,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.199,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.201,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.205,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.208,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.202,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.205,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.206,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.204,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.212,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.212,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.206,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.199,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.203,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.203,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.207,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.197,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.197,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.196,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.196,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.197,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.202,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.203,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.198,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      },
+      {
+        "seconds": 0.202,
+        "text": "The meeting is scheduled for Thursday at 3:30. Please bring the updated project notes and send a short summary afterwards.",
+        "mlx_active_bytes": 1277343940,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1547370496
+      }
+    ],
+    "median_seconds": 0.203,
+    "max_seconds": 0.212,
+    "scope": "PCM to transcript; excludes capture, UI, clipboard, and insertion"
+  }
+}
