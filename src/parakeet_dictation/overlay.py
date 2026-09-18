@@ -1,3 +1,5 @@
+"""Full transcript window: result, history, and file-queue tabs with drag-and-drop."""
+
 from __future__ import annotations
 
 import threading
@@ -466,7 +468,7 @@ class OverlayController(NSObject):
 
         show_text_area = self._should_show_text_area()
         show_drop_hint = self._should_show_drop_hint()
-        show_device = not show_text_area
+        show_device = False
 
         if show_text_area:
             height = self.EXPANDED_HEIGHT
@@ -814,6 +816,12 @@ class OverlayController(NSObject):
         self._update_layout()
 
     @objc.python_method
+    def show_active_microphone(self, name: str):
+        self.device_popup.removeAllItems()
+        self.device_popup.addItemWithTitle_(name)
+        self.device_popup.setEnabled_(False)
+
+    @objc.python_method
     def update_input_devices(self, devices, selected_name: str | None):
         self.device_popup.removeAllItems()
 
@@ -824,6 +832,9 @@ class OverlayController(NSObject):
 
         self.device_popup.setEnabled_(not self.is_recording)
 
+        automatic = "Automatic — prefer Mac microphone" if self.config.prefer_builtin_mic else "Automatic — system default"
+        self.device_popup.addItemWithTitle_(automatic)
+
         for d in devices:
             self.device_popup.addItemWithTitle_(d.name)
 
@@ -833,12 +844,12 @@ class OverlayController(NSObject):
                 self.device_popup.selectItemAtIndex_(idx)
                 return
 
-        # No explicit selection -- pick the system default
-        for i, d in enumerate(devices):
-            if d.is_default:
-                self.device_popup.selectItemAtIndex_(i)
-                return
-
+        if selected_name is not None:
+            # Keep the missing lock visible; recording will report the
+            # disconnection instead of silently changing microphones.
+            self.device_popup.addItemWithTitle_(f"Unavailable: {selected_name}")
+            self.device_popup.selectItemWithTitle_(f"Unavailable: {selected_name}")
+            return
         self.device_popup.selectItemAtIndex_(0)
 
     @objc.python_method
@@ -927,7 +938,10 @@ class OverlayController(NSObject):
         self._focus_panel()
 
     def deviceSelected_(self, sender):
-        self.delegate.handle_device_selected(sender.titleOfSelectedItem())
+        if sender.indexOfSelectedItem() == 0:
+            self.delegate.handle_device_selected(None)
+        elif not sender.titleOfSelectedItem().startswith("Unavailable: "):
+            self.delegate.handle_device_selected(sender.titleOfSelectedItem())
 
     def toggleRecording_(self, sender):
         del sender

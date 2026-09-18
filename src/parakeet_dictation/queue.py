@@ -1,3 +1,5 @@
+"""Thread-safe queue of media files awaiting batch transcription."""
+
 from __future__ import annotations
 
 import copy

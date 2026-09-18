@@ -1,3 +1,5 @@
+"""Write completed queue transcripts to the clipboard or to text files."""
+
 from __future__ import annotations
 
 from pathlib import Path

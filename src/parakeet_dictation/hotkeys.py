@@ -1,3 +1,5 @@
+"""Global shortcuts through the Carbon hot-key API via ctypes."""
+
 from __future__ import annotations
 
 import ctypes
@@ -25,7 +27,9 @@ kEventParamDirectObject = 0x2D2D2D2D
 typeEventHotKeyID = 0x686B6964
 
 optionKey = 1 << 11
+cmdKey = 1 << 8
 kVK_Space = 0x31
+kVK_ANSI_R = 0x0F
 
 
 class HotKeyError(RuntimeError):
@@ -102,6 +106,8 @@ class GlobalHotKeyManager:
         self._target = self._carbon.GetApplicationEventTarget()
         self._event_handler_ref = EventHandlerRef()
         self._hotkey_refs: list[EventHotKeyRef] = []
+        self._recording_ref: EventHotKeyRef | None = None
+        self._stop_handler = None
         self._callback = self._handler_proc(self._handle_event)
         self._signature = _four_char_code("MRMX")
         self._install_event_handler()
@@ -109,7 +115,7 @@ class GlobalHotKeyManager:
     def register_default_overlay_shortcut(self) -> None:
         self.register(HotKeySpec(key_code=kVK_Space, modifiers=optionKey, identifier=1))
 
-    def register(self, spec: HotKeySpec) -> None:
+    def register(self, spec: HotKeySpec) -> EventHotKeyRef:
         hotkey_id = EventHotKeyID(self._signature, spec.identifier)
         hotkey_ref = EventHotKeyRef()
         status = self._carbon.RegisterEventHotKey(
@@ -123,8 +129,21 @@ class GlobalHotKeyManager:
         if status != noErr:
             raise HotKeyError(f"RegisterEventHotKey failed with OSStatus {status}")
         self._hotkey_refs.append(hotkey_ref)
+        return hotkey_ref
+
+    def set_recording_shortcut(self, handler=None) -> None:
+        """Cmd+R belongs to other apps except during our own recording."""
+        self._stop_handler = handler
+        if handler is not None and self._recording_ref is None:
+            self._recording_ref = self.register(HotKeySpec(kVK_ANSI_R, cmdKey, 2))
+        elif handler is None and self._recording_ref is not None:
+            self._carbon.UnregisterEventHotKey(self._recording_ref)
+            self._hotkey_refs.remove(self._recording_ref)
+            self._recording_ref = None
 
     def cleanup(self) -> None:
+        self._stop_handler = None
+        self._recording_ref = None
         while self._hotkey_refs:
             hotkey_ref = self._hotkey_refs.pop()
             self._carbon.UnregisterEventHotKey(hotkey_ref)
@@ -159,6 +178,9 @@ class GlobalHotKeyManager:
             ctypes.byref(hotkey_id),
         )
         if status == noErr and hotkey_id.signature == self._signature:
-            AppHelper.callAfter(self._handler)
+            if hotkey_id.id == 1:
+                AppHelper.callAfter(self._handler)
+            elif hotkey_id.id == 2 and self._stop_handler is not None:
+                AppHelper.callAfter(self._stop_handler)
             return noErr
         return eventNotHandledErr

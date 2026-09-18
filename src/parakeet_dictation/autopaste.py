@@ -1,3 +1,5 @@
+"""Synthetic Cmd+V through CoreGraphics; requires macOS Accessibility trust."""
+
 from __future__ import annotations
 
 import ctypes
@@ -44,10 +46,18 @@ def accessibility_trusted() -> bool:
 
 def send_paste_keystroke() -> None:
     """Post a synthetic Cmd+V to the frontmost application."""
-    for key_down in (True, False):
-        event = _core_graphics.CGEventCreateKeyboardEvent(None, kVK_ANSI_V, key_down)
-        if not event:
-            raise PasteError("Could not create keyboard event")
-        _core_graphics.CGEventSetFlags(event, kCGEventFlagMaskCommand)
-        _core_graphics.CGEventPost(kCGHIDEventTap, event)
-        _core_foundation.CFRelease(event)
+    events = []
+    try:
+        # Allocate both events before posting either: allocation failure for
+        # key-up must not leave a lone key-down in the destination app.
+        for key_down in (True, False):
+            event = _core_graphics.CGEventCreateKeyboardEvent(None, kVK_ANSI_V, key_down)
+            if not event:
+                raise PasteError("Could not create keyboard event")
+            events.append(event)
+            _core_graphics.CGEventSetFlags(event, kCGEventFlagMaskCommand)
+        for event in events:
+            _core_graphics.CGEventPost(kCGHIDEventTap, event)
+    finally:
+        for event in events:
+            _core_foundation.CFRelease(event)

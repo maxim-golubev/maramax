@@ -1,8 +1,12 @@
+"""User settings persisted atomically to settings.json with type-validated loading."""
+
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .corrections import normalize_rules
 
 # Settings the user can change at runtime; everything else stays code-defined.
 _PERSISTED_FIELDS = (
@@ -12,6 +16,11 @@ _PERSISTED_FIELDS = (
     "live_preview",
     "high_accuracy",
     "history_limit",
+    "compact_dictation",
+    "prefer_builtin_mic",
+    "input_device",
+    "use_corrections",
+    "replacements",
 )
 
 
@@ -31,6 +40,11 @@ class AppConfig:
     live_preview: bool = True
     high_accuracy: bool = False
     history_limit: int = 100
+    compact_dictation: bool = True
+    prefer_builtin_mic: bool = True
+    input_device: str | None = None
+    use_corrections: bool = True
+    replacements: list[dict[str, str]] = field(default_factory=list)
     shortcuts: ShortcutConfig = field(default_factory=ShortcutConfig)
 
     @classmethod
@@ -51,6 +65,13 @@ class AppConfig:
                 continue
             default = getattr(config, name)
             value = payload[name]
+            if name == "replacements":
+                config.replacements = normalize_rules(value)
+                continue
+            if name == "input_device":
+                if value is None or (isinstance(value, str) and value.strip()):
+                    config.input_device = value
+                continue
             if isinstance(default, bool):
                 if isinstance(value, bool):
                     setattr(config, name, value)

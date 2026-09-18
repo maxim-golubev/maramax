@@ -1,228 +1,198 @@
 # Maramax
 
-On-device speech-to-text macOS menu bar app. Transcribes via global hotkey (Option+Space), never sends audio off-machine. Built on NVIDIA Parakeet ASR running locally through MLX on Apple Silicon.
+On-device dictation for macOS on Apple Silicon. Option+Space records the microphone, NVIDIA Parakeet (via MLX) transcribes locally, and the result lands on the clipboard with optional auto-paste. Audio never leaves the machine. The Python package is still named `parakeet_dictation`; the product, bundle, and support directory are `Maramax`.
+
+User-facing behaviour is documented in `README.md` and `docs/LAUNCH.md`; this file covers the code.
 
 ## Quick Start
 
 ```bash
 brew install portaudio ffmpeg
-uv venv -p 3.12 && uv sync
+uv sync --extra dev
 ./run.sh
 ```
 
-Build standalone .app:
+Build the standalone app, then install and release:
+
 ```bash
-uv sync --extra dev
-bash build_app.sh
+bash build_app.sh                               # dist/Maramax.app + bundle check (no mic, no UI)
 cp -R dist/Maramax.app /Applications/
+.venv/bin/python packaging/create_release.py    # releases/Maramax-<version>/ + ZIP + SHA-256
 ```
 
-First launch downloads the Parakeet model (~400 MB). After that, starts in seconds.
+First launch downloads the Parakeet weights (~1.2 GB in memory once loaded). The optional Qwen3-ASR engine (~4.1 GB download) is off by default and loads only when enabled in Settings.
 
-## Running Tests
+## Checks
 
 ```bash
-pytest                # all tests
-pytest tests/ -v      # verbose
+.venv/bin/python -m pytest -q          # 132 tests, ~4s; synthetic PCM, fake audio backend, no model weights
+.venv/bin/python -m ruff check src/ tests/
+.venv/bin/python -m mypy src/
+.venv/bin/python packaging/check_bundle.py [--audio speech.wav --repeats 10 --output report.json]
 ```
 
-Tests use `tmp_path`, monkeypatching, and no heavy mocking (no PyAudio/PyObjC/model mocks). Coverage focuses on utilities: paths, clipboard, hotkey encoding, history store persistence/migration, queue operations, and export logic.
-
-Linting/type checking (dev extras required):
-```bash
-ruff check src/ tests/
-mypy src/
-```
+Tests never open a microphone, play sound, show a window, or download weights. `tests/test_isolated_recorder.py` spawns the real audio-helper subprocess with a fake PyAudio. `tests/test_startup.py` constructs the native app in a separate process. Keep new tests in that style: `tmp_path`, monkeypatching, no heavy mocking frameworks.
 
 ## Architecture
 
-Python menu bar app (`rumps`) with a native AppKit overlay (`PyObjC`). Audio capture via `PyAudio`, global hotkeys via Carbon API (ctypes), transcription via `parakeet-mlx` on MLX.
+Python menu-bar app (`rumps`) with native AppKit panels (`PyObjC`). Audio capture runs through PyAudio inside a disposable helper process. Global hotkeys use the Carbon API through ctypes. Recognition runs on MLX.
 
 ### Module Map
 
 ```
 src/parakeet_dictation/
-  main.py            Entry point. Parses --version, inits DictationApp, installs signal handlers.
-  app.py             Core controller (DictationApp). Owns all state, coordinates components, Settings menu.
-  overlay.py         Native NSPanel overlay: drop zone, device selector, text view, queue tab, controls.
-  transcription.py   AudioRecorder (PyAudio callback streaming) + ParakeetTranscriber (model loading, chunked inference, streaming drafts) + QwenTranscriber (high-accuracy final passes) + shared FFmpeg/WAV helpers.
-  queue.py           TranscriptionQueue (thread-safe item list), QueueItem dataclass, OutputMode/OutputConfig for save options.
-  recovery.py        Crash-safe recording recovery: paths + promote/discard/load helpers for the PCM spill files.
-  export.py          export_results() writes completed queue items to clipboard, individual files, or single file.
-  hotkeys.py         GlobalHotKeyManager. Registers Option+Space via Carbon API ctypes bindings.
-  autopaste.py       Synthetic Cmd+V via CoreGraphics CGEvent ctypes bindings + Accessibility trust check.
-  history.py         HistoryStore. Thread-safe JSON persistence in ~/Library/Application Support/Maramax/. Auto-migrates legacy ParakeetDictation data.
-  clipboard.py       copy_text() wrapper around pyperclip with ClipboardError.
-  config.py          AppConfig (mutable, persisted to settings.json with type-validated load) and frozen ShortcutConfig.
-  paths.py           resource_path() resolves assets in dev vs bundle. app_support_dir(). ensure_runtime_path() prepends homebrew/bundle bins to PATH.
-  logger_config.py   Colored console logging. Reads LOG_LEVEL env var, supports NO_COLOR.
+  main.py              Entry point. --version, --audio-worker dispatch, running-app + flock instance guard, signal handlers.
+  app.py               DictationApp (rumps.App). Owns all state, session counters, engine routing, every worker thread, menu callbacks.
+
+  isolated_recorder.py IsolatedAudioRecorder: the recorder the app uses. Spawns the audio helper, streams PCM over stdout JSON,
+                       bounds start/stop with timeouts, spills PCM to the recovery file as it arrives.
+  audio_worker.py      The helper process (`Maramax --audio-worker`). No GUI, no model. Wraps recorder.AudioRecorder.
+  recorder.py          In-process PyAudio recorder with all PortAudio wedge defenses (bounded locks, abandoned sessions, zombie guards).
+  capture.py           CaptureMeter / CaptureSnapshot: per-recording level, peak, first-frame delay, and a health state.
+
+  transcription.py     ParakeetTranscriber (background load, offline chunked pass, streaming drafts) and QwenTranscriber
+                       (refcounted load/unload, no cancellation). cached_model_source() avoids network freshness checks.
+  corrections.py       Explicit word replacements: single pass, longest phrase first, word boundaries, case-insensitive.
+
+  recordings.py        RecordingStore: every capture archived as WAV + JSON metadata, pruned at 20 files / 512 MB, newest always kept.
+  recovery.py          Raw PCM spill files (recording-in-progress.pcm / last-recording.pcm) for crash recovery.
+  history.py           HistoryStore: history.json (readable by 0.3.0) plus history-originals.json for pre-replacement text.
+  config.py            AppConfig persisted to settings.json (atomic write, type-validated load). Frozen ShortcutConfig.
+  queue.py / export.py TranscriptionQueue + export_results() for batch media-file transcription.
+
+  indicator.py         DictationIndicator: the compact, non-activating dictation bar (status, mic name, timer, level meter).
+  overlay.py           OverlayController: full window with Result / History / Queue tabs, drag-and-drop, output-mode dialog.
+  preferences.py       PreferencesController: Settings panel with General / Microphone / Words tabs.
+  recordings_window.py RecordingsController: playback, WAV export, Transcribe Again.
+
+  hotkeys.py           GlobalHotKeyManager. Option+Space always; Cmd+R registered only while a compact recording is active.
+  autopaste.py         accessibility_trusted() + send_paste_keystroke() (CGEvent Cmd+V, both events allocated before posting).
+  clipboard.py         copy_text() and contains_text() (fail-closed check before auto-paste).
+  instance.py          InstanceLock: flock on app.lock; never unlinked.
+  paths.py             resource_path(), app_support_dir(), ensure_runtime_path(), ensure_ssl_certs().
+  logger_config.py     Colored console logging + 2 MB rotating file log (2 backups). LOG_LEVEL / NO_COLOR.
 
 packaging/
-  setup.py           py2app config. LSUIElement=True (no dock icon). Excludes mlx/scipy stubs.
-  maramax_app.py     Bundle entry point. Adjusts sys.path for bundled vs dev mode.
+  setup.py             py2app config. Version read from pyproject.toml. LSUIElement=True. Excludes mlx/scipy stubs.
+  maramax_app.py       Bundle entry point; adjusts sys.path for bundle vs dev.
+  check_bundle.py      Post-build check run inside the bundle's Python: isolated imports, TLS, hidden panels, archive round trip,
+                       optional recognition timing against a cached model. Opens no audio device.
+  create_release.py    Verifies signature/version/source hashes, copies the app + LAUNCH.md into releases/, zips, writes SHA-256.
 
-assets/
-  menu_icon.png      Menu bar icon (44x44 RGBA PNG).
+docs/
+  LAUNCH.md            Copied into each release as START HERE.md.
+  validation.md        What was verified for 0.4.x and which live hardware checks remain.
+  validation/          Raw measurement JSON and source hashes for the validated builds.
 ```
 
 ### Threading Model
 
-- **Main thread**: rumps event loop + AppKit UI. All NSView/NSPanel mutations must happen here.
-- **Model loader thread**: `ParakeetTranscriber.__init__` spawns daemon thread to download/init model. Signals `ready_event` when done.
-- **Recording thread**: `AudioRecorder._record_loop` monitors PyAudio callback stream in background and flushes captured PCM to the recovery spill file (~1s cadence).
-- **Live preview worker**: `_live_preview_worker` feeds recorded PCM into `ParakeetTranscriber.stream_drafts` during recording, pushing draft text to the overlay (session-guarded).
-- **Transcription workers**: `_transcribe_recording_worker` and `_process_queue_worker` run inference off main thread.
+- **Main thread**: rumps event loop + AppKit. All NSView/NSPanel mutations happen here. Workers marshal UI updates with `AppHelper.callAfter`; delayed UI actions use `AppHelper.callLater`, never `threading.Timer`.
+- **Model loader threads**: `ParakeetTranscriber.__init__` starts one immediately; `QwenTranscriber.start_loading()` starts one only after Parakeet is ready and only when `high_accuracy` is on.
+- **Start worker** (`_start_recording_worker`): calls `recorder.start()`, which spawns the audio helper and waits up to 8 s for its `ready` event. The main thread shows "Connecting microphone…" meanwhile and can cancel via `cancel_start()`.
+- **Helper reader thread** (`IsolatedAudioRecorder._read`): parses helper stdout, appends PCM to `frames`, feeds the meter, writes the spill file.
+- **Capture monitor** (`_monitor_capture`): a 150 ms `callLater` loop on the main thread that updates the bar and status from `capture_snapshot().health`, and stops the recording on `missing`/`disconnected`.
+- **Live preview worker**: feeds new PCM into `ParakeetTranscriber.stream_drafts`. Runs only in the full window, never for the compact bar.
+- **Transcription workers**: `_transcribe_recording_worker`, `_transcribe_file_worker`, `_process_queue_worker`, `_recover_worker`.
 
-Thread coordination:
-- `threading.Lock` protects mutable state (`AudioRecorder._state_lock`, `_stream_lock`; `HistoryStore._lock`; `DictationApp._state_lock`).
-- `threading.Lock` also protects `TranscriptionQueue._lock` for queue item mutations.
-- `threading.Event` for signaling (`ParakeetTranscriber.ready_event`, `DictationApp._cancel_event`, `DictationApp._queue_cancel_event`, `DictationApp._live_stop_event`).
-- `AppHelper.callAfter()` marshals callbacks from worker threads to the main/AppKit thread.
-- `threading.Timer` for delayed UI actions (status revert, copy feedback).
+`_state_lock` guards compound state checks and the deferred overlay flags. Simple flags (`recording_active`, `is_transcribing`, `overlay_visible`, `current_transcript`) are written on the main thread or at worker completion and rely on the GIL for atomic reads.
 
 ### Session Tracking
 
-`DictationApp._overlay_session` is a monotonic counter incremented each time the overlay is shown. Workers receive the session value at spawn and check it before updating UI, preventing stale updates from cancelled/old operations.
+`_overlay_session` is bumped whenever a new operation takes ownership of the display (start of a recording, file transcription, recovery, or showing the overlay while idle). Every worker and every delayed callback captures the session at spawn and drops its result if the session moved on. `_show_overlay_on_main` deliberately does *not* bump the session while an operation is in flight, so expanding the compact bar keeps the live drafts, the final result, and the original auto-paste target.
 
-### Cancellation
+### The Main Thread Never Touches the Audio Driver
 
-User clicks "Cancel" during transcription -> sets `_cancel_event` and `_queue_cancel_event` -> worker's progress callback checks the event and raises `TranscriptionError("Cancelled")` -> worker unwinds gracefully. Queue cancellation still exports any items that completed before the cancel.
+PortAudio calls can wedge indefinitely on Bluetooth route changes. Two layers defend against that:
 
-**Invariant**: If `transcribe_pcm` returns text successfully, the result is always published — even if the cancel event was set while inference was running. Cancel only discards results when it actually interrupts inference (raises `TranscriptionError` via the chunk callback). A completed transcription is never thrown away.
+1. **Process isolation.** The app's recorder is `IsolatedAudioRecorder`; the real PyAudio session lives in a child process launched from the app's own executable with `--audio-worker`. Start waits at most 8 s, stop at most 3 s; on timeout the helper is killed (`reset_count` increments) and the PCM already received stays in memory and in the spill file. If the parent dies, the helper sees EOF on stdin and `os._exit`s.
+2. **In-process defenses** in `recorder.py` (still used inside the helper): bounded lock acquires, `_abandon_stream_session()` after a wedged close (fresh lock, zombie stream dropped, replacement PyAudio instance, old one never terminated because `Pa_Terminate` would free the wedged stream under the stuck call), per-recording identity guards so a revived zombie callback cannot write into a newer recording, and a hard stop after two abandoned sessions.
 
-### Main Thread Never Touches a Stoppable Stream
+Every stop path on the main thread only flips flags; `recorder.stop()` runs inside `_transcribe_recording_worker`.
 
-PortAudio's `Pa_StopStream` can wedge indefinitely on Bluetooth route changes (AirPods). Every stop path (hotkey toggle, Cmd+R, Stop button, Esc) therefore only flips flags on the main thread; `recorder.stop()` — the thread join and stream close — runs inside `_transcribe_recording_worker`. All PortAudio locks are bounded (`_close_stream(timeout=…)`, `_audio_lock.acquire(timeout=…)`): the timeout bounds the lock acquire (a C call can't be interrupted — `stop()` additionally runs its forced close on a sacrificial daemon thread so even a close that wedges after acquiring can't hang the worker). On failure the session is abandoned via `_abandon_stream_session()`: fresh `_stream_lock`, zombie stream reference dropped, and a replacement `PyAudio` instance — the old one is deliberately **never terminated**, because `Pa_Terminate` would free the wedged stream under the stuck call and abort the process (`cleanup()` likewise skips terminate when its close fails). Three identity guards keep zombies harmless: the stream callback captures its own generation/frames/events, `_record_loop` closes only its `expected` stream, and the recovery spill handle is captured per-recording (a revived zombie can't flush into or close a newer recording's spill file; `_recovery_lock` guards the handle/cursor).
+### Recording Pipeline (never lose audio)
 
-### Recording Recovery (never lose audio)
+Order inside `_transcribe_recording_worker`:
 
-While recording, `_record_loop` spills raw PCM to `~/Library/Application Support/Maramax/recording-in-progress.pcm` (finalized *before* the stream close in its `finally`; if the loop itself wedges, `stop()` and `preserve_recovery()` flush the tail frames so the file is still complete). All access to the two spill files goes through `AudioRecorder` (`discard_recovery`, `preserve_recovery`, `has/load/discard_recoverable_recording`) — app code never touches `recovery.py` paths directly. Lifecycle, owned by `DictationApp`:
-- Transcription published or "no speech" → `recorder.discard_recovery()` — except when `stop()` returned empty pcm (another stop, e.g. quit cleanup, took the frames): then the spill file may be the only copy and is kept.
-- Transcription failed → `recorder.preserve_recovery()` promotes it to `last-recording.pcm`. Cancelled → `preserve_recovery(only_if_larger=True)`: an accidental cancel stays recoverable, but a quick cancelled capture never clobbers a longer recording still awaiting recovery.
-- Launch: a leftover in-progress file (crash/force-quit) is promoted and a status hint is shown once the model is ready (also when hotkey registration failed).
-- Menu "Recover Last Recording" transcribes `last-recording.pcm` via the normal final-pass routing (loading the PCM on the worker thread — it can be ~115 MB/hour) and deletes it on success; kept on failure so recovery can be retried.
+1. `recorder.stop()` returns the PCM. `_capture_at_stop` (taken on the main thread) supplies diagnostics.
+2. **Archive first**: `RecordingStore.save()` writes the WAV + metadata before any inference, including silent and empty captures. A model returning no text never decides audio retention.
+3. Digital silence (`not any(pcm)`) skips inference and reports a capture problem.
+4. `_finish_live_preview()` joins the preview thread (30 s). If it wedged, the shared Parakeet encoder is stuck in streaming attention mode, so the offline pass must not run; Qwen rescues the dictation if loaded, otherwise the worker fails and the audio is kept.
+5. `_final_transcribe_pcm()` routes to Qwen when enabled and ready, else Parakeet; any Qwen failure falls back to Parakeet.
+6. **Completed results are always published**, even if cancel was requested mid-inference. Cancel only discards work when it actually interrupted inference through the chunk callback.
+7. `finally`: the recording's metadata is updated with outcome, transcript, raw transcript, message, and timings (`stop_seconds`, `recognition_seconds`, `stop_to_result_seconds`, `audio_worker_resets`, `active_threads`).
 
-**Wedged-encoder guard**: if the live-preview thread wedges, the shared Parakeet encoder is stuck in streaming attention mode and any offline pass on it would produce garbage. Every worker that runs a final pass (`_transcribe_recording_worker`, `_transcribe_file_worker`, `_process_queue_worker`, `_recover_worker`) therefore joins the live thread first via `_finish_live_preview()`. Mic dictation and recovery rescue with Qwen when it is loaded (cancel is checked before the rescue since Qwen inference is uninterruptible); file/queue transcription just fails — the source files are still on disk.
+Recovery spill: the in-progress PCM file is discarded once the archive exists, otherwise promoted to `last-recording.pcm`. On launch a leftover in-progress file is promoted and a status hint shown. **Recover Last Recording** prefers the newest archived recording that is not `done`, then the legacy spill file. **Transcribe Again** in the Recordings window calls the same path with an explicit id.
 
-### Deferred Overlay Actions
+### Compact Bar vs Full Window
 
-When transcription completes, two deferred flags may trigger post-completion actions:
-- `_hide_after_transcription`: close overlay after transcription finishes.
-- `_force_copy_after_transcription`: copy result to clipboard after completion.
-Applied in `_finalize_deferred_overlay_actions()`.
-
-### Model Strategy (Two Engines)
-
-Two ASR models share the MLX/Metal runtime:
-
-- **Parakeet TDT 0.6B v2** (always loaded, ~1.2 GB): live streaming drafts, transcription while the high-accuracy model loads, and fallback on any failure. Pinned to v2 — v3 regresses English WER.
-- **Qwen3-ASR 1.7B** (`mlx-community/Qwen3-ASR-1.7B-bf16`, ~4 GB, loaded in background when the `high_accuracy` setting is on — **default off**: the ~5% relative WER gain reads as ~1 corrected word per 7-10 short messages, while costing ~1.5s per 10s of audio at stop vs Parakeet's ~0.3s; it shines on long files and formatting): final passes for mic dictation, single files, and queue items. Best English WER available on MLX (5.76 vs Parakeet's 6.05 on Open ASR). No streaming, no mid-inference cancellation (cancel is checked before inference; queue items remain cancellable between files; the completed-result-is-always-published invariant holds).
-
-Routing lives in `DictationApp._final_transcribe_pcm/_final_transcribe_file`: Qwen when enabled+ready, otherwise Parakeet; any Qwen exception logs and falls back to Parakeet. Toggling the setting off calls `QwenTranscriber.unload()` to free RAM. First enable downloads ~3.4 GB from Hugging Face.
-
-### Recording Start Latency
-
-The first words of a dictation must not be lost; capture starts as early as possible:
-- `AudioRecorder.warm_up()` runs at launch in a background thread (first CoreAudio open after process start is slow; `cleanup()` joins this thread — opening PortAudio during interpreter teardown segfaults).
-- `start()` rebuilds the PyAudio session each time (~85ms): PortAudio snapshots the device list at init, so a reused session records from a stale default after AirPods reconnect. The honest "Recording…" indicator makes the rebuild cost invisible.
-- `_show_overlay_and_start_on_main` starts the mic **before** any overlay/window work.
-- Status shows "Starting mic…" and flips to "Recording…" only when non-silent audio actually arrives (`signal_event`; Bluetooth mics deliver pure-zero frames for 1-2s while switching into headset mode — speech during that window is unrecoverable, so the indicator must not show early). Warm-up targets the built-in mic so launch never flips Bluetooth audio out of high-quality mode.
-- `_audio_lock` serializes PyAudio session use (open/enumerate/reinit/terminate); device enumeration runs off the main thread to avoid beachballs during model load.
-
-### Live Preview (Streaming Drafts)
-
-While recording, `_live_preview_worker` feeds new PCM from `recorder.frames` into `ParakeetTranscriber.stream_drafts()` (parakeet-mlx `transcribe_stream`, ~1s batches), pushing growing draft text into the overlay. Drafts use local attention with limited context and are **less accurate** than the offline pass.
-
-**Invariant**: the final transcription always comes from the offline `transcribe_pcm` pass over the full recording — drafts are display-only and are replaced on completion. The stream holds the shared encoder in streaming attention mode, so `_transcribe_recording_worker` joins the live thread (`_finish_live_preview`) before starting the offline pass. Option+Space acts as a toggle: pressing it during recording stops and finishes the dictation.
-
-### Settings
-
-`AppConfig` persists user-changeable fields (`auto_start_recording`, `auto_copy_to_clipboard`, `paste_to_active_app`, `live_preview`, `history_limit`) to `~/Library/Application Support/Maramax/settings.json` (atomic write). The menu bar Settings submenu toggles them; every toggle saves immediately. `AppConfig.load()` falls back to defaults for missing/corrupt/mistyped values.
+`config.compact_dictation` (default on) makes Option+Space show `DictationIndicator`, a `NSStatusWindowLevel` non-activating panel, so the target app keeps focus. In a compact session: no live preview, Cmd+R is registered as a global stop shortcut for the duration and released afterwards, auto-paste fires immediately without re-activating anything and is skipped if the frontmost app changed. The arrow button expands to the full overlay; `_compact_session` is cleared but the session and paste target are preserved. With compact mode off, the full overlay opens, live preview runs, and auto-paste re-activates the previous app and waits 0.3 s before re-checking focus.
 
 ### Auto-Paste
 
-When `paste_to_active_app` is enabled, a successful mic transcription copy is followed by: hide overlay → re-activate the previously frontmost app (captured in `_capture_previous_app` before the overlay was shown) → post a synthetic Cmd+V via CGEvent (`autopaste.py`, ctypes CoreGraphics). Requires the Accessibility permission (`AXIsProcessTrusted`); enabling the setting without it opens System Settings and shows a status hint. Zero-length audio is guarded in `_transcribe_path` (it would crash the Metal encoder).
+Requires `paste_to_active_app` and a microphone transcript. Always copies first (even with auto-copy off), then on the main thread: Accessibility trust check (opens System Settings if missing), focus check, `contains_text()` clipboard check (fail closed), then `send_paste_keystroke()`. Both CGEvents are allocated before either is posted so a lone key-down can never be sent.
 
-### Transcription Queue
+### Word Replacements
 
-File transcription uses a queue-based workflow. Dropping/picking files adds them to a `TranscriptionQueue` and switches the overlay to the Queue tab. Users can reorder (up/down buttons), remove, or clear items before starting. Clicking "Start" presents an `NSAlert` dialog asking for output mode:
+`config.replacements` is a list of `{heard, replacement}` rules (max 100, validated by `corrections.normalize_rules`). `apply_replacements` builds one alternation regex ordered longest-first with `(?<!\w)…(?!\w)` boundaries and `re.IGNORECASE`, so replacements never cascade. Applied to microphone and recovery transcripts only, never to imported media. The raw text is kept in `history-originals.json` and in the recording metadata.
 
-- **Copy to Clipboard**: concatenates all results, copies once at the end.
-- **Save as Individual Files (same directory)**: writes `filename.txt` next to each source file.
-- **Save as Individual Files (choose directory)**: same naming, user picks target folder.
-- **Save as Single File**: all transcripts concatenated into one file at a user-chosen path.
+### Model Strategy
 
-History entries are always created regardless of output mode. The queue worker (`_process_queue_worker`) processes items sequentially and uses `_queue_cancel_event` for cancellation. If cancelled mid-queue, any already-completed items are still exported.
+- **Parakeet TDT 0.6B v2** (`mlx-community/parakeet-tdt-0.6b-v2`, pinned: v3 regresses English WER). Always loaded. Offline pass uses 120 s chunks with 15 s overlap; streaming drafts use `transcribe_stream(context_size=(256, 256))` on ~1 s batches. `cached_model_source()` loads a complete Hugging Face cache snapshot as a local directory so startup makes zero HTTP requests.
+- **Qwen3-ASR 1.7B** (`mlx-community/Qwen3-ASR-1.7B-bf16`). Opt-in via Settings. Background load after Parakeet is ready; toggling off calls `unload()`, which defers `close()` while an inference is running (`_active_inferences`). No progress callback, so cancel is checked before inference.
 
-The overlay's third segmented control tab ("Queue") shows a monospaced text list of items with status indicators and a count badge (e.g., "Queue (3)"). Selection for move/remove is cursor-position based in the text view. During processing, the queue list stays visible with live status updates per item, alongside a Cancel button — the overlay does not collapse to the minimal transcribing layout.
+After every inference and warm-up: `del result`, `gc.collect()`, `mx.clear_cache()` to release Metal buffers.
 
-### MLX Memory Management
+### Microphone Selection
 
-MLX uses a Metal buffer cache that holds GPU allocations between inference calls. Without cleanup, memory grows unboundedly across transcriptions. After each inference in `_transcribe_path`, the result is explicitly deleted, `gc.collect()` breaks cyclic references, and `mx.metal.clear_cache()` releases cached Metal buffers back to the OS. Model weights (referenced by `self.model`) survive the cache clear. Same cleanup runs after model warm-up.
+Automatic mode with `prefer_builtin_mic` (default on) picks the Mac's built-in microphone by name so AirPods stay an output device; otherwise the system default. An explicit `input_device` name is resolved strictly: if it is missing, start fails with "Selected microphone disconnected" rather than silently recording from another input. Device enumeration runs in the helper process and only when the Settings Microphone tab is visible.
 
-### Thread Safety Rationale
+### Settings
 
-Simple boolean/string flags (`recording_active`, `is_transcribing`, `overlay_visible`, `current_transcript`) are read/written without locks. This is safe because: (1) Python's GIL makes single-attribute reads/writes atomic, (2) all UI event handlers run on the main thread (AppKit serializes them), and (3) worker threads only write these flags at completion, then marshal UI updates via `AppHelper.callAfter`. The `_state_lock` protects compound state checks (e.g., `hide_overlay` reading multiple flags atomically) and flag groups that must change together (deferred overlay flags).
+`AppConfig` persists: `auto_start_recording`, `auto_copy_to_clipboard`, `paste_to_active_app`, `live_preview`, `high_accuracy`, `history_limit`, `compact_dictation`, `prefer_builtin_mic`, `input_device`, `use_corrections`, `replacements`. The `_SETTING_LABELS` dict in `app.py` drives both the hidden rumps menu items (kept as the single toggle path) and the Settings panel checkboxes; `PreferencesController.toggleSetting_` forwards to `DictationApp._on_setting_toggled`.
 
 ### Error Handling
 
-Custom exceptions: `TranscriptionError`, `HotKeyError`, `ClipboardError`, `ExportError`. Pattern is graceful degradation — errors are logged, shown in status label, and the app continues. `AudioRecorder.last_error` and `ParakeetTranscriber.load_error` cache errors for deferred inspection.
-
-### History Persistence
-
-`HistoryStore` writes to `~/Library/Application Support/Maramax/history.json`. Uses atomic write (temp file + rename). Thread-locked. Auto-migrates from legacy `ParakeetDictation` directory. Limit configurable (default 100 entries).
+Custom exceptions: `TranscriptionError`, `HotKeyError`, `ClipboardError`, `ExportError`, `PasteError`. Errors are logged, shown in the status line (menu, overlay, and compact bar all mirror `_apply_status_on_main`), and the app continues. `revert_after` statuses use a token so a stale revert cannot overwrite a newer message.
 
 ## Key Constants
 
 | Constant | Location | Value |
 |---|---|---|
-| Audio format | transcription.py | 16-bit PCM, mono, 16kHz, 512-frame chunks |
-| Model ID (drafts/fallback) | transcription.py | `mlx-community/parakeet-tdt-0.6b-v2` (pinned: v3 regresses English WER) |
-| Model ID (high accuracy) | transcription.py | `mlx-community/Qwen3-ASR-1.7B-bf16` |
-| Chunk duration | transcription.py | 120s with 15s overlap |
-| Live draft batch | transcription.py | ~1s of PCM per `stream_drafts` step, context (256, 256) |
-| Settings file | config.py | `~/Library/Application Support/Maramax/settings.json` |
-| Recovery spill files | recovery.py | `recording-in-progress.pcm` / `last-recording.pcm` in app support dir |
-| FFmpeg timeout | transcription.py | 120s |
-| Overlay width | overlay.py | 688px |
-| Media extensions | overlay.py | aac, aiff, flac, m4a, mov, mp3, mp4, ogg, opus, wav, webm |
-| Queue panel height | overlay.py | 310px |
+| Audio format | recorder.py / audio_worker.py | 16-bit PCM, mono, 16 kHz, 512-frame chunks |
+| Helper start / stop timeout | isolated_recorder.py | 8 s / 3 s |
+| Capture health thresholds | capture.py | waiting < 5 s, disconnected > 3 s without frames, quiet > 10 s without signal |
+| Recording archive budget | recordings.py | 20 recordings / 512 MB, newest always kept |
+| Min recoverable spill | recovery.py | 16000 bytes (~0.5 s) |
+| Max replacement rules | corrections.py | 100 (heard ≤ 200 chars, replacement ≤ 2000) |
+| Model IDs | transcription.py | `mlx-community/parakeet-tdt-0.6b-v2`, `mlx-community/Qwen3-ASR-1.7B-bf16` |
+| Offline chunking | transcription.py | 120 s chunks, 15 s overlap |
+| FFmpeg timeout | transcription.py | 120 s |
+| Live preview join | app.py | 30 s |
+| Log rotation | logger_config.py | 2 MB, 2 backups |
 | Bundle ID | packaging/setup.py | `com.maramax.dictation` |
+
+## Local Data
+
+Everything lives under `~/Library/Application Support/Maramax/`: `settings.json`, `history.json`, `history-originals.json`, `recordings/*.wav|json`, `recording-in-progress.pcm`, `last-recording.pcm`, `app.lock`, `logs/maramax.log`. Legacy `ParakeetDictation/history.json` is copied over on first run. Model weights stay in the Hugging Face cache.
 
 ## Environment Variables
 
 | Variable | Purpose |
 |---|---|
-| `LOG_LEVEL` | Logging severity (default: INFO) |
-| `NO_COLOR` | Disable colored log output |
-| `TOKENIZERS_PARALLELISM` | Set to `false` in main.py to prevent numpy threading issues |
-| `RESOURCEPATH` | Set by py2app at runtime for bundle resource resolution |
-
-## Build & Deploy Workflow
-
-Full build-deploy-push cycle:
-```bash
-uv sync --extra dev
-bash build_app.sh
-cp -R dist/Maramax.app /Applications/
-rm -rf dist build
-git add -A && git commit -m "message" && git push origin main
-```
+| `LOG_LEVEL` | Logging severity (default INFO) |
+| `NO_COLOR` | Disable colored console output |
+| `TOKENIZERS_PARALLELISM` | Forced to `false` in main.py |
+| `SSL_CERT_FILE` | Set by `ensure_ssl_certs()` to certifi's bundle when the default is unusable |
+| `RESOURCEPATH` | Set by py2app; used for resource lookup and to find the helper executable |
 
 ## Build Notes
 
-The standalone .app is built with py2app. MLX is a namespace package with C extensions, which requires workarounds in `build_app.sh`:
-1. Strip mlx/scipy/charset_normalizer bytecode stubs from py2app's zip (they shadow real packages).
-2. Copy full mlx package to both `site-packages/` and `lib-dynload/` for C extension discovery.
-3. Copy scipy and charset_normalizer as full packages.
-4. Verify critical files exist in bundle before code signing.
+MLX is a namespace package with C extensions, so `build_app.sh` strips the mlx/scipy/charset_normalizer stubs from py2app's zip, copies the full packages into `site-packages` (and mlx into `lib-dynload`), verifies critical files, ad-hoc signs, and runs `check_bundle.py`. The helper process is the same bundle executable, so a bundle must be able to start itself with `--audio-worker`; `check_bundle.py` pings it. `create_release.py` refuses a stale bundle whose sources differ from the checkout.
+
+The app is ad-hoc signed for local use. Public distribution would need Developer ID signing and notarization.
 
 ## Dependencies
 
-Runtime: `parakeet-mlx>=0.5.2,<0.6`, `qwen3-asr-mlx>=0.1.1,<0.2`, `numpy<2.3`, `pyaudio~=0.2.14`, `rumps~=0.4.0`, `pyperclip~=1.9.0`, `python-dotenv~=1.1.1`, `pyobjc-framework-cocoa~=11.1`.
-
-Dev: `pytest`, `ruff`, `mypy`, `py2app`, `build`.
-
-System: `portaudio`, `ffmpeg` (via Homebrew).
-
-Requires Python 3.12 (pinned in pyproject.toml: `>=3.12,<3.13`). macOS 12+ on Apple Silicon recommended.
+Runtime: `parakeet-mlx>=0.5.2,<0.6`, `qwen3-asr-mlx>=0.1.1,<0.2`, `numpy<2.3`, `pyaudio~=0.2.14`, `rumps~=0.4.1`, `pyperclip~=1.9.0`, `python-dotenv~=1.1.1`, `pyobjc-framework-cocoa~=11.1`.
+Dev: `pytest`, `ruff`, `mypy`, `py2app`, `build`. System: `portaudio`, `ffmpeg` via Homebrew. Python pinned to 3.12.

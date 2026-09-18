@@ -1,6 +1,7 @@
 build
 build.bak.*
 dist
+releases/
 dist.bak.*
 .env
 __pycache__

@@ -1,0 +1,67 @@
+{
+  "bundle": "releases/Maramax-0.4.0/Maramax.app",
+  "python": "3.12.4",
+  "imports": {
+    "parakeet_dictation.app": "lib/python3.12/parakeet_dictation/app.py",
+    "parakeet_dictation.recorder": "lib/python3.12/parakeet_dictation/recorder.py",
+    "parakeet_dictation.recordings_window": "lib/python3.12/parakeet_dictation/recordings_window.py",
+    "mlx.core": "lib/python3.12/mlx/core.cpython-312-darwin.so",
+    "parakeet_mlx": "lib/python3.12/parakeet_mlx/__init__.py",
+    "parakeet_dictation.preferences": "lib/python3.12/parakeet_dictation/preferences.py",
+    "parakeet_dictation.instance": "lib/python3.12/parakeet_dictation/instance.py",
+    "qwen3_asr_mlx": "lib/python3.12/qwen3_asr_mlx/__init__.py",
+    "pyaudio": "lib/python312.zip/pyaudio/__init__.pyc",
+    "soundfile": "lib/python312.zip/soundfile.pyc",
+    "scipy": "lib/python3.12/scipy/__init__.py",
+    "numpy": "lib/python3.12/numpy/__init__.py",
+    "tokenizers": "lib/python3.12/tokenizers/__init__.py",
+    "huggingface_hub": "lib/python3.12/huggingface_hub/__init__.py",
+    "httpx": "lib/python3.12/httpx/__init__.py",
+    "certifi": "lib/python3.12/certifi/__init__.py",
+    "AppKit": "lib/python312.zip/AppKit/__init__.pyc"
+  },
+  "component_check_seconds": 0.429,
+  "checks": [
+    "isolated bundled imports",
+    "TLS certificates",
+    "hidden passive panel",
+    "hidden settings, transcript, and recovery windows",
+    "audio archive round trip and deletion"
+  ],
+  "microphone_opened": false,
+  "audio_played": false,
+  "recognition": {
+    "model": "mlx-community/parakeet-tdt-0.6b-v2",
+    "audio_seconds": 45.4225,
+    "load_and_warm_seconds": 1.692,
+    "runs": [
+      {
+        "seconds": 0.741,
+        "text": "Before we finish the meeting, I would like to review the plan for next week. On Monday, we will collect feedback from everyone who tested the new app. On Tuesday, we will fix the problems that caused people to lose their work. The most important thing is that recording starts reliably and that a failed transcription can be tried again. Once that is working, we can focus on making the interface smaller and easier to understand. I would also like to measure how long it takes from finishing a sentence to seeing the words appear. A faster result is useful, but it should still preserve names, numbers, and the meaning of what was said. Please write down any confusing behavior you notice, including which microphone was selected and whether the headphones had recently reconnected. We can review those notes together at the end of the week.",
+        "mlx_active_bytes": 1277294788,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1326858240
+      },
+      {
+        "seconds": 0.638,
+        "text": "Before we finish the meeting, I would like to review the plan for next week. On Monday, we will collect feedback from everyone who tested the new app. On Tuesday, we will fix the problems that caused people to lose their work. The most important thing is that recording starts reliably and that a failed transcription can be tried again. Once that is working, we can focus on making the interface smaller and easier to understand. I would also like to measure how long it takes from finishing a sentence to seeing the words appear. A faster result is useful, but it should still preserve names, numbers, and the meaning of what was said. Please write down any confusing behavior you notice, including which microphone was selected and whether the headphones had recently reconnected. We can review those notes together at the end of the week.",
+        "mlx_active_bytes": 1277294788,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1326858240
+      },
+      {
+        "seconds": 0.679,
+        "text": "Before we finish the meeting, I would like to review the plan for next week. On Monday, we will collect feedback from everyone who tested the new app. On Tuesday, we will fix the problems that caused people to lose their work. The most important thing is that recording starts reliably and that a failed transcription can be tried again. Once that is working, we can focus on making the interface smaller and easier to understand. I would also like to measure how long it takes from finishing a sentence to seeing the words appear. A faster result is useful, but it should still preserve names, numbers, and the meaning of what was said. Please write down any confusing behavior you notice, including which microphone was selected and whether the headphones had recently reconnected. We can review those notes together at the end of the week.",
+        "mlx_active_bytes": 1277294788,
+        "mlx_cache_bytes": 0,
+        "python_threads": 1,
+        "process_peak_rss_bytes": 1326858240
+      }
+    ],
+    "median_seconds": 0.679,
+    "max_seconds": 0.741,
+    "scope": "PCM to transcript; excludes capture, UI, clipboard, and insertion"
+  }
+}
