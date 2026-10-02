@@ -1,4 +1,4 @@
-"""Recorded audio is available to inspect and retry without recording again."""
+"""The Recordings window: play back, export, or re-transcribe saved dictation audio."""
 
 from __future__ import annotations
 
@@ -8,20 +8,28 @@ from datetime import datetime
 
 import objc
 from AppKit import (
-    NSApplication, NSBackingStoreBuffered, NSButton, NSFont, NSMakeRect, NSMenuItem, NSPanel,
+    NSApplication, NSBackingStoreBuffered, NSButton, NSColor, NSFont, NSMakeRect, NSMenuItem, NSPanel,
     NSPopUpButton, NSSavePanel, NSScrollView, NSSound, NSTextField, NSTextView,
     NSWindowStyleMaskClosable, NSWindowStyleMaskTitled,
 )
 from Foundation import NSObject
 from PyObjCTools import AppHelper
 
+from .main_thread import call_later
+from .recordings import MAX_ARCHIVE_BYTES, MAX_RECORDINGS, RecordingStatus
 
 _STATUS_LABELS = {
-    "done": "transcribed",
-    "saved": "not transcribed yet",
-    "failed": "no transcript",
-    "cancelled": "cancelled",
+    RecordingStatus.DONE: "transcribed",
+    RecordingStatus.SAVED: "not transcribed yet",
+    RecordingStatus.FAILED: "no transcript",
+    RecordingStatus.CANCELLED: "cancelled",
 }
+WIDTH = 640
+HEIGHT = 390
+MARGIN = 20
+ROW = 32
+RETENTION_NOTE = (f"Stored on this Mac · Up to {MAX_RECORDINGS} recordings / "
+                  f"{MAX_ARCHIVE_BYTES // (1024 * 1024)} MB; the newest is always kept")
 
 
 class RecordingsController(NSObject):
@@ -34,19 +42,22 @@ class RecordingsController(NSObject):
         self.records = []
         self.sound = None
         self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(0, 0, 640, 390), NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
+            NSMakeRect(0, 0, WIDTH, HEIGHT), NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
             NSBackingStoreBuffered, False,
         )
-        self.panel.setTitle_("Recordings & Recovery")
+        self.panel.setTitle_("Recordings")
         self.panel.setReleasedWhenClosed_(False)
+        # A menu-bar app has no Dock icon to bring a hidden panel back with.
+        self.panel.setHidesOnDeactivate_(False)
         self.panel.setDelegate_(self)
         content = self.panel.contentView()
-        self.picker = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(20, 337, 600, 30), False)
+        inner = WIDTH - 2 * MARGIN
+        self.picker = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, inner, ROW), False)
         self.picker.setTarget_(self)
         self.picker.setAction_("selectionChanged:")
-        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(20, 87, 600, 237))
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(MARGIN, 87, inner, 237))
         scroll.setHasVerticalScroller_(True)
-        self.text = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 600, 237))
+        self.text = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, inner, 237))
         self.text.setEditable_(False)
         self.text.setSelectable_(True)
         self.text.setRichText_(False)
@@ -54,19 +65,31 @@ class RecordingsController(NSObject):
         self.text.setTextContainerInset_((6, 8))
         self.text.textContainer().setWidthTracksTextView_(True)
         scroll.setDocumentView_(self.text)
-        self.play = self._button(NSMakeRect(20, 42, 85, 32), "Play", "playAudio:")
-        self.save = self._button(NSMakeRect(113, 42, 115, 32), "Save Audio…", "saveAudio:")
-        self.retry = self._button(NSMakeRect(465, 42, 155, 32), "Transcribe Again", "retry:")
-        self.note = NSTextField.labelWithString_("Stored on this Mac · Up to 20 recordings / 512 MB; newest is always kept")
-        self.note.setFrame_(NSMakeRect(20, 13, 600, 18))
+        self.play = self._button("Play", "playAudio:")
+        self.save = self._button("Save Audio…", "saveAudio:")
+        self.retry = self._button("Transcribe Again", "retry:")
+        self.note = NSTextField.labelWithString_(RETENTION_NOTE)
+        self.note.setFrame_(NSMakeRect(MARGIN, 13, inner, 18))
         self.note.setFont_(NSFont.systemFontOfSize_(11))
+        self.note.setTextColor_(NSColor.secondaryLabelColor())
+        # Visible edges, not frames, sit on the margins (see OverlayController._place).
+        self._place(self.picker, MARGIN, 335, inner)
+        self._place(self.play, MARGIN, 42, 85)
+        self._place(self.save, MARGIN + 85 + 8, 42, 115)
+        self._place(self.retry, WIDTH - MARGIN - 155, 42, 155)
         for view in (self.picker, scroll, self.play, self.save, self.retry, self.note):
             content.addSubview_(view)
         return self
 
+    @staticmethod
+    def _place(control, x, row_bottom, width):
+        natural = control.alignmentRectForFrame_(NSMakeRect(0, 0, width, ROW))
+        aligned = NSMakeRect(x, row_bottom + (ROW - natural.size.height) / 2, width, natural.size.height)
+        control.setFrame_(control.frameForAlignmentRect_(aligned))
+
     @objc.python_method
-    def _button(self, frame, title, action):
-        button = NSButton.alloc().initWithFrame_(frame)
+    def _button(self, title, action):
+        button = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 80, ROW))
         button.setTitle_(title)
         button.setTarget_(self)
         button.setAction_(action)
@@ -108,9 +131,8 @@ class RecordingsController(NSObject):
     @objc.python_method
     def _show_selected(self):
         record = self.selected()
-        busy = self.delegate.recording_active or self.delegate.is_transcribing
         for button in (self.play, self.retry):
-            button.setEnabled_(record is not None and not busy)
+            button.setEnabled_(record is not None and not self.delegate.is_busy)
         self.save.setEnabled_(record is not None)
         if record is None:
             self.text.setString_(
@@ -131,7 +153,8 @@ class RecordingsController(NSObject):
     @objc.python_method
     def show(self):
         self.refresh()
-        self.panel.center()
+        if not self.panel.isVisible():
+            self.panel.center()  # Only when it appears: it stays where the user moved it.
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         self.panel.makeKeyAndOrderFront_(None)
 
@@ -145,6 +168,7 @@ class RecordingsController(NSObject):
     def selectionChanged_(self, sender):
         del sender
         self.stop_playback()
+        self.note.setStringValue_(RETENTION_NOTE)
         self._show_selected()
 
     def playAudio_(self, sender):
@@ -153,14 +177,14 @@ class RecordingsController(NSObject):
             self.stop_playback()
             return
         record = self.selected()
-        if record is None or self.delegate.recording_active or self.delegate.is_transcribing:
+        if record is None or self.delegate.is_busy:
             return
         self.sound = NSSound.alloc().initWithContentsOfFile_byReference_(str(self.store.audio_path(record.id)), True)
         if self.sound is None or not self.sound.play():
             self.note.setStringValue_("Could not play recording. Try Save Audio instead.")
             return
         self.play.setTitle_("Stop")
-        AppHelper.callLater(0.25, self._check_playback, self.sound)
+        call_later(0.25, self._check_playback, self.sound)
 
     @objc.python_method
     def _check_playback(self, sound):
@@ -170,7 +194,7 @@ class RecordingsController(NSObject):
             self.sound = None
             self.play.setTitle_("Play")
         else:
-            AppHelper.callLater(0.25, self._check_playback, sound)
+            call_later(0.25, self._check_playback, sound)
 
     def saveAudio_(self, sender):
         del sender
@@ -199,7 +223,7 @@ class RecordingsController(NSObject):
         record = self.selected()
         if record is not None:
             self.stop_playback()
-            self.delegate.recover_last_recording(record.id)
+            self.delegate.transcribe_recording(record.id)
             self._show_selected()
 
     def windowWillClose_(self, notification):

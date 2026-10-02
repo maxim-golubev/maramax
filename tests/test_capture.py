@@ -84,6 +84,78 @@ def test_switching_inputs_pauses_the_disconnect_deadline():
     assert meter.snapshot().health == "disconnected"
 
 
+def test_replacement_for_a_stream_that_never_delivered_gets_its_own_wait():
+    now = [0.0]
+    meter = CaptureMeter(clock=lambda: now[0])
+    meter.mark_open()
+    now[0] = 4.5  # The helper gives up on the silent stream and reopens.
+    meter.set_reconnecting(True)
+    now[0] = 5.5
+    meter.set_reconnecting(False)
+    assert meter.snapshot().health == "waiting"  # Not "missing" before the new stream's first buffer.
+    now[0] = 6
+    meter.feed(b"\x10\x00" * 512)
+    assert meter.snapshot().health == "receiving"
+
+
+def test_a_reconnect_that_never_finishes_is_a_disconnection():
+    now = [0.0]
+    meter = CaptureMeter(clock=lambda: now[0])
+    meter.feed(b"\x10\x00" * 512)
+    now[0] = 2
+    meter.set_reconnecting(True)
+    now[0] = 9
+    assert meter.snapshot().health == "reconnecting"
+    now[0] = 10.5
+    assert meter.snapshot().health == "disconnected"
+
+
+def test_restart_measures_a_new_recording_on_an_open_device():
+    now = [0.0]
+    meter = CaptureMeter(clock=lambda: now[0])
+    meter.device_name = "AirPods"
+    meter.feed(b"\x10\x00" * 512, overflow=True)
+    now[0] = 30
+    meter.restart()
+    snapshot = meter.snapshot()
+    assert (snapshot.nonzero_samples, snapshot.callbacks, snapshot.overflow_count, snapshot.peak) == (0, 0, 0, 0)
+    assert snapshot.open_delay == 0 and snapshot.device_name == "AirPods"
+    assert snapshot.health == "waiting"
+
+
+def test_helper_repairs_a_route_before_the_app_gives_up_on_it():
+    from parakeet_dictation import audio_worker, capture
+
+    # If the app's deadlines were shorter, it would stop a recording the
+    # helper was about to rescue.
+    assert audio_worker.STALL_SECONDS < capture.STALLED_SECONDS
+    assert audio_worker.NO_AUDIO_SECONDS < capture.NO_FRAME_SECONDS
+    assert audio_worker.SILENT_ROUTE_SECONDS < capture.QUIET_SECONDS
+
+
+def test_route_failure_is_judged_on_what_the_current_stream_delivered():
+    from parakeet_dictation.audio_worker import route_failed
+
+    now = [0.0]
+    meter = CaptureMeter(clock=lambda: now[0])
+    assert not route_failed(meter.snapshot(), 3.9, 0, 0)
+    assert route_failed(meter.snapshot(), 4.1, 0, 0)       # Opened, never delivered.
+    meter.feed(bytes(1024))
+    now[0] = 2.5
+    meter.feed(bytes(1024))
+    assert not route_failed(meter.snapshot(), 2.5, 0, 0)   # Zeros while a headset connects.
+    now[0] = 6.5
+    meter.feed(bytes(1024))
+    assert route_failed(meter.snapshot(), 6.5, 0, 0)       # Still only zeros: the route is broken.
+    meter.feed(b"\x10\x00" * 512)
+    assert not route_failed(meter.snapshot(), 6.6, 0, 0)
+    now[0] = 8.2
+    assert route_failed(meter.snapshot(), 8.2, 0, 0)       # Buffers stopped.
+    replaced = meter.snapshot()
+    assert not route_failed(replaced, 1.6, replaced.callbacks, replaced.nonzero_samples)  # New stream, fair wait.
+    assert route_failed(replaced, 4.1, replaced.callbacks, replaced.nonzero_samples)
+
+
 def test_meter_moves_for_quiet_and_loud_microphones():
     quiet, loud = CaptureMeter(), CaptureMeter()
     quiet.feed(np.array([300, -300] * 256, dtype="<i2").tobytes())   # about -41 dBFS

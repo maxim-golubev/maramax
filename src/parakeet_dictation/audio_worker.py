@@ -1,23 +1,22 @@
-"""Disposable audio process. No GUI, speech model, or application state.
+"""The audio helper process: it owns the microphone on the app's behalf.
 
-The app starts this helper ahead of time so a recording only pays for the
-driver open, not for a process launch. It reads one JSON request per line on
-stdin (`record`, `list`, `ping`), a bare `stop` line ends a recording, and
-EOF means the app is gone.
+No GUI, speech model, or application state. The app starts it ahead of time
+so a recording pays only for the driver open, and replaces it whenever it
+stops answering. The messages are defined in helper_protocol.py.
 """
 
 from __future__ import annotations
 
 import base64
-import json
 import os
 import queue
 import sys
 import threading
 import time
-from pathlib import Path
 
-from .recorder import AudioRecorder
+from .capture import CaptureSnapshot
+from .helper_protocol import Event, Operation, event, parse
+from .recorder import AudioRecorder, lid_closed
 
 # Speech that is still in the driver (or in a Bluetooth link) when the user
 # presses stop would otherwise lose its last syllable.
@@ -33,15 +32,31 @@ NO_AUDIO_SECONDS = 4.0
 # is normal). Far beyond that the route is broken and worth rebuilding once.
 SILENT_ROUTE_SECONDS = 6.0
 MAX_REOPENS = 2
+POLL_SECONDS = 0.02
 
 _EOF = object()
 
 
-def send(message: dict) -> None:
-    print(json.dumps(message), flush=True)
+def send(kind: Event, **fields) -> None:
+    print(event(kind, **fields), flush=True)
 
 
-class Commands:
+def route_failed(snapshot: CaptureSnapshot, listening: float,
+                 callbacks_at_open: int, nonzero_at_open: int) -> bool:
+    """Whether the open input has failed and a replacement should be tried.
+
+    `listening` is the time since this stream was opened; the two counters
+    are what the meter read at that moment, so a replacement stream is
+    judged on what it delivers rather than on its predecessor's audio.
+    """
+    if snapshot.callbacks == callbacks_at_open:
+        return listening > NO_AUDIO_SECONDS
+    if snapshot.last_frame_age is not None and snapshot.last_frame_age > STALL_SECONDS:
+        return True
+    return snapshot.nonzero_samples == nonzero_at_open and listening > SILENT_ROUTE_SECONDS
+
+
+class RequestReader:
     """Lines from the app. EOF ends the helper even if a native call hangs."""
 
     def __init__(self) -> None:
@@ -65,9 +80,9 @@ class Commands:
             return None
 
 
-class Worker:
+class AudioHelper:
     def __init__(self) -> None:
-        self.commands = Commands()
+        self.requests = RequestReader()
         self.recorder: AudioRecorder | None = None
         # Set while a finished recording's stream is deliberately kept open.
         self._warm_key: tuple | None = None
@@ -76,156 +91,174 @@ class Worker:
     def run(self) -> None:
         try:
             while True:
-                line = self.commands.get(0.25 if self._warm_key is not None else None)
+                line = self.requests.get(0.25 if self._warm_key is not None else None)
                 if line is _EOF:
                     return
                 if line is None:
                     self._tend_warm_stream()
                     continue
-                try:
-                    request = json.loads(line)
-                except ValueError:
-                    continue  # A late "stop" for a recording that already ended.
-                if not isinstance(request, dict):
+                request = parse(line)
+                if request is None:
                     continue
                 operation = request.get("operation")
-                if operation == "ping":
+                if operation == Operation.PING:
                     from .isolated_recorder import worker_command
-                    send({"event": "pong", "command": worker_command()})
-                elif operation == "list":
+                    send(Event.PONG, command=worker_command())
+                elif operation == Operation.LIST:
                     self._list(request)
-                elif operation == "release":
-                    # The user turned off "keep microphone ready".
+                elif operation == Operation.RELEASE:
                     if self._warm_key is not None:
-                        self._release()
-                        send({"event": "idle"})
-                elif operation == "record":
+                        self._close_unasked()
+                elif operation == Operation.RECORD:
                     if self._record(request) is _EOF:
                         return
+                # A STOP that arrives after its recording ended needs no answer.
         finally:
             self._release()
-            sys.stdout.flush()
-            os._exit(0)
+            self._exit()
 
-    def _new_recorder(self, request: dict) -> AudioRecorder:
-        recorder = AudioRecorder(recovery_dir=Path("/dev/null"),
-                                 prefer_builtin=bool(request.get("prefer_builtin", True)))
-        # The main app owns durable recovery. Killing this helper must not
-        # leave duplicate temporary recordings behind.
-        recorder._open_recovery_file = lambda: None  # type: ignore[method-assign]
-        return recorder
+    @staticmethod
+    def _exit() -> None:
+        sys.stdout.flush()
+        os._exit(0)
 
     def _release(self) -> None:
         self._warm_key = None
         recorder, self.recorder = self.recorder, None
-        if recorder is not None:
-            recorder.cleanup()
+        if recorder is not None and not recorder.cleanup():
+            # A wedged close leaked its PortAudio session, so PortAudio stays
+            # initialized here with its device list frozen: every later
+            # recording in this process would look for devices in that stale
+            # list. The app starts a fresh helper when this one is gone.
+            self._exit()
+
+    def _close_unasked(self) -> None:
+        """Close the device without the app having asked for it just now, so
+        tell it first: a close can take a while, or wedge."""
+        send(Event.CLOSING)
+        self._release()
+        send(Event.IDLE)
+
+    @staticmethod
+    def _stream_is_delivering(recorder: AudioRecorder) -> bool:
+        age = recorder.capture_snapshot().last_frame_age
+        return recorder.stream_active() and age is not None and age < STALL_SECONDS
 
     def _tend_warm_stream(self) -> None:
         recorder = self.recorder
         if recorder is None or self._warm_key is None:
             return
         del recorder.frames[:]  # Audio heard while waiting is never kept.
-        age = recorder.capture_snapshot().last_frame_age
-        if time.monotonic() >= self._warm_until or age is None or age > STALL_SECONDS:
-            self._release()
-            send({"event": "idle"})
+        if not self._stream_is_delivering(recorder):
+            # The device went away while waiting. Closing a dead route is
+            # where PortAudio wedges; leaving is quicker and always works.
+            self._exit()
+        if time.monotonic() >= self._warm_until:
+            self._close_unasked()
 
     def _list(self, request: dict) -> None:
         self._release()
-        recorder = self._new_recorder(request)
+        recorder = AudioRecorder(prefer_builtin=bool(request.get("prefer_builtin", True)))
         try:
             devices = recorder.list_input_devices()
-            send({"event": "devices", "devices": [list(device) for device in devices or []],
-                  "automatic": recorder.automatic_device_name()})
+            send(Event.DEVICES, devices=[list(device) for device in devices or []],
+                 automatic=recorder.automatic_device_name())
         except Exception as exc:
-            send({"event": "error", "message": str(exc)})
+            send(Event.ERROR, message=str(exc))
         finally:
             recorder.cleanup()
 
+    @staticmethod
+    def _stream_key(request: dict) -> tuple:
+        """What decides which device a request opens. A kept-warm stream is
+        reused only for an identical key; the lid matters because closing it
+        switches the built-in microphone off."""
+        device = request.get("device")
+        prefer_builtin = bool(request.get("prefer_builtin", True))
+        return device, prefer_builtin, (lid_closed() if device is None and prefer_builtin else None)
+
     def _record(self, request: dict):
-        key = (request.get("device"), bool(request.get("prefer_builtin", True)))
+        key = self._stream_key(request)
         recorder = self.recorder
         warm = False
-        if recorder is not None and self._warm_key == key and recorder.stream_active():
-            age = recorder.capture_snapshot().last_frame_age
-            warm = age is not None and age < STALL_SECONDS and recorder.rearm()
+        if recorder is not None:
+            if not self._stream_is_delivering(recorder):
+                # Leave rather than close a dead route (see _tend_warm_stream);
+                # the app retries a request whose helper exits unanswered.
+                self._exit()
+            warm = self._warm_key == key and recorder.rearm()
+            if not warm:
+                self._release()
         self._warm_key = None
         if not warm:
-            self._release()
-            recorder = self.recorder = self._new_recorder(request)
-            recorder.set_device(key[0])
+            recorder = self.recorder = AudioRecorder(device_name=key[0], prefer_builtin=key[1])
             if not recorder.start():
-                send({"event": "error", "message": str(recorder.last_error)})
+                send(Event.ERROR, message=str(recorder.last_error))
                 self._release()
-                send({"event": "idle"})
+                send(Event.IDLE)
                 return None
         assert recorder is not None
-        overflow_base = recorder.capture_snapshot().overflow_count if warm else 0
-        send({"event": "ready", "device": recorder.capture_snapshot().device_name, "warm": bool(warm)})
+        send(Event.READY, device=recorder.capture_snapshot().device_name, warm=bool(warm))
 
         sent = 0
         reopens = 0
         opened = time.monotonic()
-        ended = None
+        callbacks_at_open = nonzero_at_open = 0
+        keep_warm = 0.0
         try:
             while True:
-                line = self.commands.get(0.02)
-                if line is _EOF or line == "stop":
-                    ended = line
+                line = self.requests.get(POLL_SECONDS)
+                if line is _EOF:
+                    return _EOF
+                stop = parse(line) if line is not None else None
+                if stop is not None and stop.get("operation") == Operation.STOP:
+                    seconds = stop.get("keep_warm", 0)
+                    keep_warm = float(seconds) if isinstance(seconds, (int, float)) else 0.0
                     break
-                sent = self._forward(recorder, sent, overflow_base)
-                if reopens < MAX_REOPENS and self._route_failed(recorder, opened):
-                    reopens += 1
-                    send({"event": "reconnecting"})
+                sent = self._forward(recorder, sent)
+                snapshot = recorder.capture_snapshot()
+                if reopens < MAX_REOPENS and route_failed(
+                        snapshot, time.monotonic() - opened, callbacks_at_open, nonzero_at_open):
+                    send(Event.RECONNECTING)
                     reopened = recorder.reopen()
+                    snapshot = recorder.capture_snapshot()
+                    send(Event.DEVICE, device=snapshot.device_name, reopened=bool(reopened))
+                    # One honest failure is enough: the app ends the recording
+                    # with what was captured instead of showing a dead one.
+                    reopens = reopens + 1 if reopened else MAX_REOPENS
                     opened = time.monotonic()
-                    send({"event": "device", "device": recorder.capture_snapshot().device_name,
-                          "reopened": bool(reopened)})
-            if ended is _EOF:
-                return _EOF
+                    callbacks_at_open, nonzero_at_open = snapshot.callbacks, snapshot.nonzero_samples
             deadline = time.monotonic() + TAIL_SECONDS
             while time.monotonic() < deadline:
-                time.sleep(0.02)
-                sent = self._forward(recorder, sent, overflow_base)
-            self._forward(recorder, sent, overflow_base)
-            keep_warm = float(request.get("keep_warm") or 0)
-            healthy = recorder.last_error is None and recorder.stream_active()
+                time.sleep(POLL_SECONDS)
+                sent = self._forward(recorder, sent)
+            self._forward(recorder, sent)
+            healthy = recorder.last_error is None and self._stream_is_delivering(recorder)
             # Everything captured is delivered before the device is closed:
             # the app can start recognition while the driver winds down.
-            send({"event": "done"})
+            send(Event.DONE)
             if keep_warm > 0 and healthy:
                 self._warm_key = key
                 self._warm_until = time.monotonic() + keep_warm
-                send({"event": "warm"})
+                send(Event.WARM)
             else:
                 self._release()
-                send({"event": "idle"})
+                send(Event.IDLE)
         except Exception as exc:
-            send({"event": "error", "message": str(exc)})
+            send(Event.ERROR, message=str(exc))
             self._release()
-            send({"event": "idle"})
+            send(Event.IDLE)
         return None
 
     @staticmethod
-    def _forward(recorder: AudioRecorder, sent: int, overflow_base: int) -> int:
+    def _forward(recorder: AudioRecorder, sent: int) -> int:
         frames = recorder.frames[sent:]
         if not frames:
             return sent
-        send({"event": "audio", "pcm": base64.b64encode(b"".join(frames)).decode("ascii"),
-              "overflows": recorder.capture_snapshot().overflow_count - overflow_base})
+        send(Event.AUDIO, pcm=base64.b64encode(b"".join(frames)).decode("ascii"),
+             overflows=recorder.capture_snapshot().overflow_count)
         return sent + len(frames)
-
-    @staticmethod
-    def _route_failed(recorder: AudioRecorder, opened: float) -> bool:
-        snapshot = recorder.capture_snapshot()
-        listening = time.monotonic() - opened
-        if snapshot.last_frame_age is None:
-            return listening > NO_AUDIO_SECONDS
-        if snapshot.last_frame_age > STALL_SECONDS and listening > STALL_SECONDS:
-            return True
-        return snapshot.nonzero_samples == 0 and listening > SILENT_ROUTE_SECONDS
 
 
 def main() -> None:
-    Worker().run()
+    AudioHelper().run()

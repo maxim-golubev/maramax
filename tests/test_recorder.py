@@ -45,12 +45,12 @@ class FakeAudio:
 
 
 @pytest.fixture
-def recorder(tmp_path, monkeypatch):
+def recorder(monkeypatch):
     monkeypatch.setattr(module.pyaudio, "PyAudio", FakeAudio)
     monkeypatch.setattr(FakeAudio, "opens", [])
     # The result must not depend on whether this Mac's lid happens to be shut.
     monkeypatch.setattr(module, "lid_closed", lambda: False)
-    instance = module.AudioRecorder(recovery_dir=tmp_path)
+    instance = module.AudioRecorder()
     yield instance
     instance.cleanup()
 
@@ -63,13 +63,13 @@ def test_automatic_prefers_mac_mic_without_changing_system_default(recorder):
 
 
 def test_explicit_airpods_choice_is_respected(recorder):
-    recorder.set_device("AirPods")
+    recorder.device_name = "AirPods"
     assert recorder.start()
     assert FakeAudio.opens[-1]["input_device_index"] == 1
 
 
 def test_missing_locked_mic_does_not_silently_switch(recorder):
-    recorder.set_device("Disconnected Headset")
+    recorder.device_name = "Disconnected Headset"
     assert recorder.start() is False
     assert "disconnected" in str(recorder.last_error)
     assert FakeAudio.opens == []
@@ -81,13 +81,12 @@ def test_system_default_remains_an_option(recorder):
     assert FakeAudio.opens[-1]["input_device_index"] == 1
 
 
-def test_stop_retains_complete_audio_for_recovery(recorder):
+def test_stop_returns_everything_the_stream_delivered(recorder):
     assert recorder.start()
     pcm = b"\x01\x02" * 16000
     recorder._stream.callback(pcm, 16000, {}, 0)
     assert recorder.stop() == pcm
-    assert recorder.preserve_recovery()
-    assert recorder.load_recoverable_recording() == pcm
+    assert recorder.capture_snapshot().open_delay is not None
 
 
 def test_zombie_callback_cannot_write_into_a_new_recording(recorder):
@@ -107,33 +106,29 @@ def test_repeated_driver_failures_require_restart_instead_of_leaking_forever(rec
     assert FakeAudio.opens == []
 
 
-def test_constructing_and_closing_recorder_does_not_initialize_audio(tmp_path, monkeypatch):
+def test_constructing_and_closing_recorder_does_not_initialize_audio(monkeypatch):
     def unexpected():
-        pytest.fail("No PortAudio initialization at app startup")
+        pytest.fail("No PortAudio initialization before a request")
 
     monkeypatch.setattr(module.pyaudio, "PyAudio", unexpected)
-    recorder = module.AudioRecorder(recovery_dir=tmp_path)
-    assert recorder.sample_width() == 2
-    recorder.cleanup()
+    recorder = module.AudioRecorder()
+    assert recorder.cleanup()
 
 
-def test_repeated_sessions_release_workers_streams_and_spill_handles(recorder):
+def test_repeated_sessions_release_workers_and_streams(recorder):
     previous_callback = None
     for index in range(50):
         assert recorder.start()
         stream = recorder._stream
         worker = recorder._recording_thread
-        handle = recorder._recovery_file
         pcm = (index + 1).to_bytes(2, "little") * 512
         if previous_callback is not None:
             previous_callback(b"\xff\x7f" * 512, 512, {}, 0)
         stream.callback(pcm, 512, {}, 0)
         assert recorder.stop() == pcm
         assert not worker.is_alive()
-        assert handle.closed
         assert not stream.active
         assert recorder._stream is None
-        assert recorder._recovery_file is None
         assert recorder.frames == []
         assert recorder.capture_snapshot().callbacks == 1
         assert recorder.abandoned_sessions == 0
@@ -154,12 +149,10 @@ def test_reopen_continues_the_same_recording_on_the_new_default(recorder, monkey
     first.callback(b"\x09\x00" * 512, 512, {}, 0)  # The retired stream is ignored.
     recorder._stream.callback(b"\x02\x00" * 8000, 512, {}, 0)
     assert recorder.stop() == b"\x01\x00" * 8000 + b"\x02\x00" * 8000
-    assert recorder.preserve_recovery()
-    assert recorder.load_recoverable_recording() == b"\x01\x00" * 8000 + b"\x02\x00" * 8000
 
 
 def test_reopen_refuses_to_replace_a_locked_microphone(recorder, monkeypatch):
-    recorder.set_device("AirPods")
+    recorder.device_name = "AirPods"
     assert recorder.start()
     recorder._stream.callback(b"\x01\x00" * 512, 512, {}, 0)
     monkeypatch.setattr(FakeAudio, "devices", ["MacBook Pro Microphone"])
@@ -181,10 +174,20 @@ def test_rearm_starts_a_fresh_recording_on_the_open_stream(recorder):
     stream.callback(b"\x01\x00" * 512, 512, {}, 0)
     assert recorder.rearm()
     assert recorder._stream is stream and len(FakeAudio.opens) == 1
+    assert recorder.capture_snapshot().nonzero_samples == 0  # Measured afresh, not carried over.
     stream.callback(b"\x02\x00" * 512, 512, {}, 0)
     assert recorder.stop() == b"\x02\x00" * 512
     assert recorder.rearm() is False
 
 
-def test_lid_state_is_readable_without_raising():
-    assert module.lid_closed() in (True, False)
+def test_wedged_close_reports_that_the_process_must_not_record_again(recorder):
+    assert recorder.start()
+    recorder._stream.callback(b"\x01\x00" * 512, 512, {}, 0)
+    recorder.abandoned_sessions = 1  # What a wedged Pa_StopStream leaves behind.
+    assert recorder.cleanup() is False
+    assert recorder.cleanup() is False
+
+
+def test_clean_shutdown_reports_portaudio_released(recorder):
+    assert recorder.start()
+    assert recorder.cleanup() is True

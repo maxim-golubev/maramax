@@ -1,8 +1,9 @@
-"""Full transcript window: result, history, and file-queue tabs with drag-and-drop."""
+"""The full transcript window: result, history, and file-queue tabs with drag-and-drop."""
 
 from __future__ import annotations
 
 import warnings
+from enum import StrEnum
 
 import objc
 from AppKit import (
@@ -14,6 +15,7 @@ from AppKit import (
     NSDragOperationCopy,
     NSEventModifierFlagCommand,
     NSFont,
+    NSLineBreakByTruncatingTail,
     NSMakeRect,
     NSOpenPanel,
     NSPanel,
@@ -32,9 +34,11 @@ from AppKit import (
     NSWindowStyleMaskBorderless,
 )
 from Foundation import NSMakeRange, NSObject
-from PyObjCTools import AppHelper
 
-from .queue import OutputConfig, OutputMode
+from .export import OutputConfig, OutputMode
+from .file_queue import QueueStatus
+from .hotkeys import STOP
+from .main_thread import call_later
 
 MEDIA_EXTENSIONS = [
     "aac", "aiff", "flac", "m4a", "mov", "mp3", "mp4", "ogg", "opus", "wav", "webm",
@@ -42,13 +46,8 @@ MEDIA_EXTENSIONS = [
 
 try:
     from UniformTypeIdentifiers import UTType
-
-    _ALLOWED_CONTENT_TYPES = [UTType.typeWithFilenameExtension_(ext) for ext in MEDIA_EXTENSIONS]
-    _ALLOWED_CONTENT_TYPES = [t for t in _ALLOWED_CONTENT_TYPES if t is not None]
-    _HAS_UTTYPE = bool(_ALLOWED_CONTENT_TYPES)
-except ImportError:
-    _HAS_UTTYPE = False
-    _ALLOWED_CONTENT_TYPES = []
+except ImportError:  # Older macOS: the panels fall back to file extensions.
+    UTType = None
 
 _COMMAND_ONLY_MASK = (
     NSEventModifierFlagCommand
@@ -57,13 +56,52 @@ _COMMAND_ONLY_MASK = (
     | (1 << 19)   # NSEventModifierFlagOption
 )
 
-_STATUS_LABELS = {
-    "pending": "",
-    "processing": "transcribing...",
-    "done": "done",
-    "failed": "failed",
-    "cancelled": "cancelled",
+_QUEUE_STATUS_TEXT = {
+    QueueStatus.PENDING: "",
+    QueueStatus.PROCESSING: "transcribing…",
+    QueueStatus.DONE: "done",
+    QueueStatus.FAILED: "failed",
+    QueueStatus.CANCELLED: "cancelled",
 }
+DROP_HINT = "Drop a file to transcribe. Switch to Queue to batch process multiple files."
+
+# One set of measurements for every state of the window. Positions are of
+# what the eye sees (alignment rectangles), not of control frames.
+WIDTH = 688
+MARGIN = 24
+CONTENT = WIDTH - 2 * MARGIN
+BOTTOM = 16          # below the lowest element
+ROW = 26             # visible height of a row of controls (the tallest is the tab control)
+CONTROL_FRAME_HEIGHT = 34  # push-button frames are taller than what they draw
+GAP = 10             # between a row of controls and a text area
+BUTTON_GAP = 12
+STATUS_BELOW_TOP = 40
+CLOSE_WIDTH = 76
+CANCEL_WIDTH = 108   # the same button, alone and centred, while something is running
+
+
+def _utf16_length(text: str) -> int:
+    """AppKit measures text in UTF-16 units; an emoji is two of them."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+class Mode(StrEnum):
+    RESULT = "result"
+    HISTORY = "history"
+    QUEUE = "queue"
+
+
+_SEGMENTS = (Mode.RESULT, Mode.HISTORY, Mode.QUEUE)
+
+
+def _media_content_types():
+    if UTType is None:
+        return []
+    return [t for t in (UTType.typeWithFilenameExtension_(ext) for ext in MEDIA_EXTENSIONS) if t is not None]
+
+
+def _is_media(path: str) -> bool:
+    return "." in path and path.rsplit(".", 1)[-1].lower() in MEDIA_EXTENSIONS
 
 
 class OverlayPanel(NSPanel):
@@ -98,13 +136,20 @@ class OverlayPanel(NSPanel):
     def performKeyEquivalent_(self, event):
         chars = (event.charactersIgnoringModifiers() or "").lower()
         flags = int(event.modifierFlags()) & _COMMAND_ONLY_MASK
+        delegate = self.controller.delegate
 
         if chars == "\x1b":
-            self.controller.handle_escape_key()
+            delegate.dismiss_requested()
             return True
 
         if flags == NSEventModifierFlagCommand and chars == "r":
-            self.controller.handle_toggle_recording_shortcut()
+            delegate.toggle_recording_requested()
+            return True
+
+        if flags == NSEventModifierFlagCommand and chars == "w":
+            # A borderless panel cannot answer the menu's Close Window, which
+            # would beep; closing here does what the Close button does.
+            delegate.dismiss_requested()
             return True
 
         if flags == NSEventModifierFlagCommand and chars == "c":
@@ -114,14 +159,14 @@ class OverlayPanel(NSPanel):
             if isinstance(responder, NSTextView) and responder.selectedRange().length > 0:
                 responder.copy_(None)
                 return True
-            self.controller.handle_copy_shortcut()
+            delegate.copy_current_transcript()
             return True
 
         return objc.super(OverlayPanel, self).performKeyEquivalent_(event)
 
     def cancelOperation_(self, sender):
         del sender
-        self.controller.handle_escape_key()
+        self.controller.delegate.dismiss_requested()
 
 
 class OverlayDropView(NSView):
@@ -136,20 +181,17 @@ class OverlayDropView(NSView):
         return self
 
     def viewDidChangeEffectiveAppearance(self):
-        self.controller.refresh_appearance()
+        self.controller.apply_appearance()
+
+    @objc.python_method
+    def _dragged_media(self, sender):
+        urls = sender.draggingPasteboard().readObjectsForClasses_options_([objc.lookUpClass("NSURL")], None) or []
+        return [url.path() for url in urls if url.path() and _is_media(url.path())]
 
     def draggingEntered_(self, sender):
-        pasteboard = sender.draggingPasteboard()
-        urls = pasteboard.readObjectsForClasses_options_(
-            [objc.lookUpClass("NSURL")], None,
-        ) or []
-        for url in urls:
-            path = url.path()
-            if path and "." in path:
-                ext = path.rsplit(".", 1)[-1].lower()
-                if ext in MEDIA_EXTENSIONS:
-                    self.controller.set_drop_state(True)
-                    return NSDragOperationCopy
+        if self._dragged_media(sender):
+            self.controller.set_drop_state(True)
+            return NSDragOperationCopy
         return 0
 
     def draggingExited_(self, sender):
@@ -161,66 +203,57 @@ class OverlayDropView(NSView):
         return True
 
     def performDragOperation_(self, sender):
-        pasteboard = sender.draggingPasteboard()
-        urls = pasteboard.readObjectsForClasses_options_([objc.lookUpClass("NSURL")], None) or []
+        paths = self._dragged_media(sender)
         self.controller.set_drop_state(False)
-
-        paths = []
-        for url in urls:
-            path = url.path()
-            if not path:
-                continue
-            ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-            if ext in MEDIA_EXTENSIONS:
-                paths.append(path)
-
         if not paths:
             return False
-
-        self.controller.handle_dropped_paths(paths)
+        self.controller.files_dropped(paths)
         return True
 
 
 class OverlayController(NSObject):
-    WINDOW_WIDTH = 688
-    TRANSCRIBING_HEIGHT = 80
+    TRANSCRIBING_HEIGHT = 88
     RECORDING_HEIGHT = 128
     IDLE_HEIGHT = 148
     EXPANDED_HEIGHT = 224
     QUEUE_HEIGHT = 310
 
-    def initWithDelegate_config_(self, delegate, config):
+    def initWithDelegate_(self, delegate):
         self = objc.super(OverlayController, self).init()
         if self is None:
             return None
 
         self.delegate = delegate
-        self.config = config
-        self.mode = "result"
+        self.mode = Mode.RESULT
         self.current_text = ""
         self.history_text = ""
+        # Shown in the Result tab until there is a transcript. It is
+        # guidance, not a transcript: Copy stays disabled for it.
+        self.intro_text = ""
         self.is_recording = False
         self.is_transcribing = False
+        self._status = ""
         self._copy_feedback_token = 0
         self._copy_feedback_visible = False
-        self._queue_items = []
+        self._queue_files = []
         self._queue_processing = False
-        self._selected_queue_item_id = None
+        self._selected_queue_file_id = None
+        self._rendering_queue = False
+        self._positioned = False
         self._build_window()
         self._refresh_text_view()
-        self._sync_copy_button()
+        self._apply_recording_state()
         self._update_layout()
-        self.set_recording(False)
-        self.set_status("Loading speech model\u2026")
         return self
+
+    # -- Construction --
 
     @objc.python_method
     def _build_window(self):
-        style_mask = NSWindowStyleMaskBorderless
-        frame = NSMakeRect(0, 0, self.WINDOW_WIDTH, self.IDLE_HEIGHT)
+        frame = NSMakeRect(0, 0, WIDTH, self.IDLE_HEIGHT)
         self.panel = OverlayPanel.alloc().initWithContentRect_styleMask_backing_defer_controller_(
             frame,
-            style_mask,
+            NSWindowStyleMaskBorderless,
             NSBackingStoreBuffered,
             False,
             self,
@@ -239,122 +272,86 @@ class OverlayController(NSObject):
             NSWindowCollectionBehaviorCanJoinAllSpaces
             | NSWindowCollectionBehaviorFullScreenAuxiliary
         )
-        self.panel.center()
 
         self.content_view = OverlayDropView.alloc().initWithFrame_controller_(frame, self)
         self.content_view.layer().setCornerRadius_(18.0)
         self.content_view.layer().setMasksToBounds_(True)
         self.content_view.layer().setBorderWidth_(1.0)
-        self._apply_appearance()
+        self.apply_appearance()
         self.panel.setContentView_(self.content_view)
 
-        self.status_label = self._make_label(NSMakeRect(124, 58, 440, 20), "", 13, True)
-        self.status_label.setAlignment_(NSTextAlignmentCenter)
+        self.status_label = self._make_label("", 13, True)
+        # One line: a long status is shortened with an ellipsis and shown
+        # in full as a tooltip, never wrapped out of its row.
+        self.status_label.setLineBreakMode_(NSLineBreakByTruncatingTail)
+        self.status_label.cell().setUsesSingleLineMode_(True)
+        # Microphone and elapsed time while recording without a live draft.
+        self.detail_label = self._make_label("", 11, False)
+        self.detail_label.setTextColor_(NSColor.secondaryLabelColor())
+        self.drop_label = self._make_label(DROP_HINT, 11, False)
+        self.drop_label.setTextColor_(NSColor.secondaryLabelColor())
 
-        self.mode_control = NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(24, 18, 186, 30))
-        self.mode_control.setSegmentCount_(3)
-        self.mode_control.setLabel_forSegment_("Result", 0)
-        self.mode_control.setLabel_forSegment_("History", 1)
-        self.mode_control.setLabel_forSegment_("Queue", 2)
+        self.mode_control = NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(0, 0, 200, 28))
+        self.mode_control.setSegmentCount_(len(_SEGMENTS))
+        for index, mode in enumerate(_SEGMENTS):
+            self.mode_control.setLabel_forSegment_(mode.title(), index)
         self.mode_control.setSelectedSegment_(0)
         self.mode_control.setTarget_(self)
         self.mode_control.setAction_("toggleMode:")
 
-        # Microphone and elapsed time while recording without a live draft.
-        self.detail_label = self._make_label(NSMakeRect(124, 36, 440, 16), "", 11, False)
-        self.detail_label.setAlignment_(NSTextAlignmentCenter)
-        self.detail_label.setTextColor_(NSColor.secondaryLabelColor())
+        self.record_button = self._make_button("", "toggleRecording:")
+        self.copy_button = self._make_button("Copy", "copyTranscript:")
+        self.files_button = self._make_button("Files…", "openFiles:")
+        self.close_button = self._make_button("Close", "closeOverlay:")
 
-        self.record_button = self._make_button(NSMakeRect(224, 16, 168, 34), "", "toggleRecording:")
-        self.copy_button = self._make_button(NSMakeRect(404, 16, 90, 34), "Copy", "copyTranscript:")
-        self.files_button = self._make_button(NSMakeRect(506, 16, 70, 34), "Files\u2026", "openFiles:")
-        self.close_button = self._make_button(NSMakeRect(588, 16, 76, 34), "Close", "closeOverlay:")
+        self.scroll_view, self.text_view = self._make_text_area(NSFont.systemFontOfSize_(13))
+        self.queue_scroll_view, self.queue_text_view = self._make_text_area(
+            NSFont.monospacedSystemFontOfSize_weight_(12, 0))
+        self.queue_text_view.setDelegate_(self)
 
-        self.scroll_view = NSScrollView.alloc().initWithFrame_(NSMakeRect(24, 16, 640, 124))
-        self.scroll_view.setHasVerticalScroller_(True)
-        self.scroll_view.setBorderType_(0)
-        self._round(self.scroll_view)
+        self.queue_add_button = self._make_button("Add…", "queueAddFiles:")
+        self.queue_up_button = self._make_button("▲", "queueMoveUp:")
+        self.queue_down_button = self._make_button("▼", "queueMoveDown:")
+        self.queue_remove_button = self._make_button("Remove", "queueRemove:")
+        self.queue_clear_button = self._make_button("Clear", "queueClear:")
+        self.queue_start_button = self._make_button("Start", "queueStart:")
+        self.queue_start_button.setBezelColor_(NSColor.systemGreenColor())
 
-        self.text_view = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 640, 124))
-        self.text_view.setEditable_(False)
-        self.text_view.setSelectable_(True)
-        self.text_view.setRichText_(False)
-        self.text_view.setFont_(NSFont.systemFontOfSize_(13))
-        self.text_view.setTextContainerInset_((6, 8))
-        self.text_view.textContainer().setWidthTracksTextView_(True)
-        self.scroll_view.setDocumentView_(self.text_view)
-
-        self.drop_label = self._make_label(
-            NSMakeRect(48, 12, 592, 16),
-            "Drop a file to transcribe. Switch to Queue to batch process multiple files.",
-            11,
-            False,
+        self._queue_buttons = (
+            self.queue_add_button, self.queue_up_button, self.queue_down_button,
+            self.queue_remove_button, self.queue_clear_button, self.queue_start_button,
         )
-        self.drop_label.setAlignment_(NSTextAlignmentCenter)
-        self.drop_label.setTextColor_(NSColor.secondaryLabelColor())
-
-        # -- Queue UI --
-        self.queue_scroll_view = NSScrollView.alloc().initWithFrame_(NSMakeRect(24, 52, 640, 160))
-        self.queue_scroll_view.setHasVerticalScroller_(True)
-        self.queue_scroll_view.setBorderType_(0)
-        self._round(self.queue_scroll_view)
-
-        self.queue_text_view = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 640, 160))
-        self.queue_text_view.setEditable_(False)
-        self.queue_text_view.setSelectable_(True)
-        self.queue_text_view.setRichText_(False)
-        self.queue_text_view.setTextContainerInset_((6, 8))
-        self.queue_text_view.setFont_(NSFont.monospacedSystemFontOfSize_weight_(12, 0))
-        self.queue_text_view.textContainer().setWidthTracksTextView_(True)
-        self.queue_scroll_view.setDocumentView_(self.queue_text_view)
-
-        self.queue_add_button = self._make_button(NSMakeRect(24, 16, 80, 34), "Add\u2026", "queueAddFiles:")
-        self.queue_up_button = self._make_button(NSMakeRect(116, 16, 34, 34), "\u25B2", "queueMoveUp:")
-        self.queue_down_button = self._make_button(NSMakeRect(158, 16, 34, 34), "\u25BC", "queueMoveDown:")
-        self.queue_remove_button = self._make_button(NSMakeRect(204, 16, 80, 34), "Remove", "queueRemove:")
-        self.queue_clear_button = self._make_button(NSMakeRect(296, 16, 70, 34), "Clear", "queueClear:")
-        self.queue_start_button = self._make_button(NSMakeRect(558, 16, 106, 34), "Start", "queueStart:")
-        self._set_button_tint(self.queue_start_button, NSColor.systemGreenColor())
-
-        # Initially hide queue views
-        self.queue_scroll_view.setHidden_(True)
-        self.queue_add_button.setHidden_(True)
-        self.queue_up_button.setHidden_(True)
-        self.queue_down_button.setHidden_(True)
-        self.queue_remove_button.setHidden_(True)
-        self.queue_clear_button.setHidden_(True)
-        self.queue_start_button.setHidden_(True)
-
-        for view in [
-            self.status_label,
-            self.detail_label,
-            self.mode_control,
-            self.record_button,
-            self.copy_button,
-            self.files_button,
-            self.close_button,
-            self.scroll_view,
-            self.drop_label,
-            self.queue_scroll_view,
-            self.queue_add_button,
-            self.queue_up_button,
-            self.queue_down_button,
-            self.queue_remove_button,
-            self.queue_clear_button,
-            self.queue_start_button,
-        ]:
+        self._transcript_buttons = (self.record_button, self.copy_button, self.files_button)
+        self._all_views = (
+            self.status_label, self.detail_label, self.drop_label, self.mode_control,
+            *self._transcript_buttons, self.close_button, self.scroll_view,
+            self.queue_scroll_view, *self._queue_buttons,
+        )
+        for view in self._all_views:
             self.content_view.addSubview_(view)
 
-    @staticmethod
-    def _round(view):
+    @objc.python_method
+    def _make_text_area(self, font):
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT, 100))
+        scroll.setHasVerticalScroller_(True)
+        scroll.setBorderType_(0)
         # Text areas share the panel's rounded language instead of meeting
         # it with square white corners.
-        view.setWantsLayer_(True)
-        view.layer().setCornerRadius_(8.0)
-        view.layer().setMasksToBounds_(True)
+        scroll.setWantsLayer_(True)
+        scroll.layer().setCornerRadius_(8.0)
+        scroll.layer().setMasksToBounds_(True)
+        text = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT, 100))
+        text.setEditable_(False)
+        text.setSelectable_(True)
+        text.setRichText_(False)
+        text.setFont_(font)
+        text.setTextContainerInset_((6, 8))
+        text.textContainer().setWidthTracksTextView_(True)
+        scroll.setDocumentView_(text)
+        return scroll, text
 
     @objc.python_method
-    def _apply_appearance(self):
+    def apply_appearance(self):
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
             self.content_view.layer().setBackgroundColor_(
@@ -365,325 +362,274 @@ class OverlayController(NSObject):
             )
 
     @objc.python_method
-    def refresh_appearance(self):
-        self._apply_appearance()
-
-    @objc.python_method
-    def _make_label(self, frame, text, font_size: float, bold: bool):
-        label = NSTextField.alloc().initWithFrame_(frame)
+    def _make_label(self, text, font_size: float, bold: bool):
+        label = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, CONTENT, 20))
         label.setStringValue_(text)
         label.setEditable_(False)
         label.setSelectable_(False)
         label.setBezeled_(False)
         label.setDrawsBackground_(False)
+        label.setAlignment_(NSTextAlignmentCenter)
         label.setFont_(NSFont.boldSystemFontOfSize_(font_size) if bold else NSFont.systemFontOfSize_(font_size))
         return label
 
     @objc.python_method
-    def _make_button(self, frame, title, action):
-        button = NSButton.alloc().initWithFrame_(frame)
+    def _make_button(self, title, action):
+        button = NSButton.alloc().initWithFrame_(NSMakeRect(0, 0, 80, CONTROL_FRAME_HEIGHT))
         button.setTitle_(title)
         button.setTarget_(self)
         button.setAction_(action)
         return button
+
+    # -- Layout --
+
+    @staticmethod
+    def _place(control, x, row_bottom, width):
+        """Put a control's visible edges at x and x+width, centred in a row.
+        AppKit draws buttons, popups, and segmented controls inset from
+        their frames by different amounts, so frames that line up do not
+        look lined up; alignment rectangles do."""
+        natural = control.alignmentRectForFrame_(NSMakeRect(0, 0, width, control.frame().size.height))
+        aligned = NSMakeRect(x, row_bottom + (ROW - natural.size.height) / 2, width, natural.size.height)
+        control.setFrame_(control.frameForAlignmentRect_(aligned))
+
+    @objc.python_method
+    def _place_text(self, view, bottom, height):
+        view.setFrame_(NSMakeRect(MARGIN, bottom, CONTENT, height))
+
+    @objc.python_method
+    def _show_only(self, *views):
+        for view in self._all_views:
+            view.setHidden_(view not in views)
+
+    @objc.python_method
+    def _resize_panel(self, height: int):
+        frame = self.panel.frame()
+        # Grow and shrink around the window's centre, wherever the user put it.
+        x = frame.origin.x + (frame.size.width - WIDTH) / 2
+        y = frame.origin.y + (frame.size.height - height) / 2
+        screen = self.panel.screen()
+        if screen:
+            visible = screen.visibleFrame()
+            x = max(visible.origin.x, min(x, visible.origin.x + visible.size.width - WIDTH))
+            y = max(visible.origin.y, min(y, visible.origin.y + visible.size.height - height))
+        self.panel.setFrame_display_animate_(NSMakeRect(x, y, WIDTH, height), True, False)
+        self.content_view.setFrame_(NSMakeRect(0, 0, WIDTH, height))
+
+    @objc.python_method
+    def _place_tabs_row(self, row_bottom):
+        """Tabs at the left, Close at the right; returns where the space
+        between them starts."""
+        tabs_width = self.mode_control.cell().cellSize().width
+        self._place(self.mode_control, MARGIN, row_bottom, tabs_width)
+        self._place(self.close_button, WIDTH - MARGIN - CLOSE_WIDTH, row_bottom, CLOSE_WIDTH)
+        return MARGIN + tabs_width + BUTTON_GAP
+
+    @objc.python_method
+    def _update_layout(self):
+        if self.is_transcribing and self._queue_processing:
+            self._layout_queue_run()
+        elif self.is_transcribing:
+            self._layout_transcribing()
+        elif self.mode == Mode.QUEUE:
+            self._layout_queue()
+        else:
+            self._layout_transcript()
+        self._sync_copy_button()
+
+    @objc.python_method
+    def _layout_transcribing(self):
+        height = self.TRANSCRIBING_HEIGHT
+        self._resize_panel(height)
+        self._place_text(self.status_label, height - STATUS_BELOW_TOP, 20)
+        self._place(self.close_button, (WIDTH - CANCEL_WIDTH) / 2, BOTTOM, CANCEL_WIDTH)
+        self._show_only(self.status_label, self.close_button)
+
+    @objc.python_method
+    def _layout_transcript(self):
+        show_text = self._shows_text_area()
+        show_drop_hint = not self.is_recording and not show_text
+        height = (self.EXPANDED_HEIGHT if show_text else
+                  self.IDLE_HEIGHT if show_drop_hint else self.RECORDING_HEIGHT)
+        self._resize_panel(height)
+        status_bottom = height - STATUS_BELOW_TOP
+        row_bottom = (status_bottom - 8 - ROW if show_text else
+                      BOTTOM + 16 + 6 if show_drop_hint else BOTTOM)
+
+        self._place_text(self.status_label, status_bottom, 20)
+        self._place_text(self.detail_label, status_bottom - 22, 16)
+        left = self._place_tabs_row(row_bottom)
+        close_left = WIDTH - MARGIN - CLOSE_WIDTH
+        files_left = close_left - BUTTON_GAP - 70
+        copy_left = files_left - BUTTON_GAP - 90
+        self._place(self.files_button, files_left, row_bottom, 70)
+        self._place(self.copy_button, copy_left, row_bottom, 90)
+        self._place(self.record_button, left, row_bottom, copy_left - BUTTON_GAP - left)
+        self._place_text(self.scroll_view, BOTTOM, row_bottom - GAP - BOTTOM)
+        self._place_text(self.drop_label, BOTTOM, 16)
+
+        visible = [self.status_label, self.mode_control, *self._transcript_buttons, self.close_button]
+        if show_text:
+            visible.append(self.scroll_view)
+        elif show_drop_hint:
+            visible.append(self.drop_label)
+        else:
+            visible.append(self.detail_label)
+        self._show_only(*visible)
+
+    @objc.python_method
+    def _layout_queue_run(self):
+        """While the queue is being transcribed: the list and a Cancel
+        button, because nothing else can be done."""
+        height = self.QUEUE_HEIGHT
+        self._resize_panel(height)
+        status_bottom = height - STATUS_BELOW_TOP
+        list_bottom = BOTTOM + ROW + GAP
+        self._place_text(self.status_label, status_bottom, 20)
+        self._place_text(self.queue_scroll_view, list_bottom, status_bottom - GAP - list_bottom)
+        self._place(self.close_button, (WIDTH - CANCEL_WIDTH) / 2, BOTTOM, CANCEL_WIDTH)
+        self._show_only(self.status_label, self.queue_scroll_view, self.close_button)
+
+    @objc.python_method
+    def _layout_queue(self):
+        height = self.QUEUE_HEIGHT
+        self._resize_panel(height)
+        status_bottom = height - STATUS_BELOW_TOP
+        row_bottom = status_bottom - 8 - ROW
+        list_bottom = BOTTOM + ROW + GAP
+        self._place_text(self.status_label, status_bottom, 20)
+        self._place_tabs_row(row_bottom)
+        self._place_text(self.queue_scroll_view, list_bottom, row_bottom - GAP - list_bottom)
+        x = MARGIN
+        for button, width in ((self.queue_add_button, 80), (self.queue_up_button, 36),
+                              (self.queue_down_button, 36), (self.queue_remove_button, 80),
+                              (self.queue_clear_button, 70)):
+            self._place(button, x, BOTTOM, width)
+            x += width + BUTTON_GAP
+        self._place(self.queue_start_button, WIDTH - MARGIN - 106, BOTTOM, 106)
+        self._show_only(self.status_label, self.mode_control, self.close_button,
+                        self.queue_scroll_view, *self._queue_buttons)
+        self._sync_queue_buttons()
+
+    # -- State shown --
 
     @objc.python_method
     def _has_transcript(self) -> bool:
         return bool(self.current_text.strip())
 
     @objc.python_method
-    def _should_show_text_area(self) -> bool:
-        if self.mode == "history":
+    def _shows_text_area(self) -> bool:
+        if self.mode == Mode.HISTORY:
             return True
-        if self.mode == "queue":
-            return False
         # While recording this shows the live draft as soon as it has text.
-        return self._has_transcript()
-
-    @objc.python_method
-    def _should_show_drop_hint(self) -> bool:
-        if self.mode == "queue":
-            return False
-        return not self.is_recording and not self._should_show_text_area()
+        return self._has_transcript() or (bool(self.intro_text) and not self.is_recording)
 
     @objc.python_method
     def _refresh_text_view(self):
-        if self.mode == "queue":
+        if self.mode == Mode.QUEUE:
             return
-        value = self.current_text if self.mode == "result" else self.history_text
-        self.text_view.setString_(value)
-
-    @objc.python_method
-    def _set_button_tint(self, button, color):
-        # A coloured bezel reads as the primary action; a text tint has no
-        # visible effect on a standard push button.
-        button.setBezelColor_(color)
+        self.text_view.setString_(self.history_text if self.mode == Mode.HISTORY
+                                  else self.current_text or self.intro_text)
 
     @objc.python_method
     def _sync_copy_button(self):
         enabled = self._has_transcript() and not self.is_recording
         self.copy_button.setEnabled_(enabled)
-        if self._copy_feedback_visible and enabled:
-            self.copy_button.setTitle_("Copied \u2713")
+        self.copy_button.setTitle_("Copied ✓" if self._copy_feedback_visible and enabled else "Copy")
+
+    @objc.python_method
+    def _apply_recording_state(self):
+        if self.is_recording:
+            self.record_button.setTitle_(f"Stop ({STOP.label})")
+            self.record_button.setBezelColor_(NSColor.systemRedColor())
         else:
-            self.copy_button.setTitle_("Copy")
-
-    @objc.python_method
-    def _resize_panel(self, height: int):
-        frame = self.panel.frame()
-        center_x = frame.origin.x + (frame.size.width / 2)
-        center_y = frame.origin.y + (frame.size.height / 2)
-        x = center_x - (self.WINDOW_WIDTH / 2)
-        y = center_y - (height / 2)
-
-        screen = self.panel.screen()
-        if screen:
-            visible = screen.visibleFrame()
-            x = max(visible.origin.x, min(x, visible.origin.x + visible.size.width - self.WINDOW_WIDTH))
-            y = max(visible.origin.y, min(y, visible.origin.y + visible.size.height - height))
-
-        new_frame = NSMakeRect(x, y, self.WINDOW_WIDTH, height)
-        self.panel.setFrame_display_animate_(new_frame, True, False)
-        self.content_view.setFrame_(NSMakeRect(0, 0, self.WINDOW_WIDTH, height))
-
-    @objc.python_method
-    def _hide_all_controls(self):
-        for v in [
-            self.detail_label, self.mode_control, self.record_button,
-            self.copy_button, self.files_button, self.close_button,
-            self.scroll_view, self.drop_label,
-            self.queue_scroll_view, self.queue_add_button, self.queue_up_button,
-            self.queue_down_button, self.queue_remove_button, self.queue_clear_button,
-            self.queue_start_button,
-        ]:
-            v.setHidden_(True)
-
-    @objc.python_method
-    def _update_layout(self):
-        if self.is_transcribing:
-            if self._queue_processing:
-                self._layout_queue_processing()
-            else:
-                self._resize_panel(self.TRANSCRIBING_HEIGHT)
-                self.status_label.setFrame_(NSMakeRect(24, 42, 640, 20))
-                self._hide_all_controls()
-                self.close_button.setFrame_(NSMakeRect(290, 8, 108, 34))
-                self.status_label.setHidden_(False)
-                self.close_button.setHidden_(False)
-            return
-
-        if self.mode == "queue":
-            self._layout_queue()
-            return
-
-        show_text_area = self._should_show_text_area()
-        show_drop_hint = self._should_show_drop_hint()
-
-        if show_text_area:
-            height = self.EXPANDED_HEIGHT
-        elif show_drop_hint:
-            height = self.IDLE_HEIGHT
-        else:
-            height = self.RECORDING_HEIGHT
-        self._resize_panel(height)
-
-        if show_text_area:
-            controls_y = height - 74
-            status_y = height - 40
-        elif show_drop_hint:
-            controls_y = 38
-            status_y = height - 40
-        else:
-            controls_y = 16
-            status_y = height - 40
-
-        self.status_label.setFrame_(NSMakeRect(124, status_y, 440, 20))
-        self.detail_label.setFrame_(NSMakeRect(124, status_y - 22, 440, 16))
-        self.detail_label.setHidden_(not self.is_recording or show_text_area)
-        self.mode_control.setFrame_(NSMakeRect(24, controls_y + 3, 186, 28))
-        self.mode_control.setHidden_(False)
-        self.record_button.setFrame_(NSMakeRect(224, controls_y, 168, 34))
-        self.record_button.setHidden_(False)
-        self.copy_button.setFrame_(NSMakeRect(404, controls_y, 90, 34))
-        self.copy_button.setHidden_(False)
-        self.files_button.setFrame_(NSMakeRect(506, controls_y, 70, 34))
-        self.files_button.setHidden_(False)
-        self.close_button.setFrame_(NSMakeRect(588, controls_y, 76, 34))
-        self.close_button.setHidden_(False)
-        self.status_label.setHidden_(False)
-
-        # Hide queue controls
-        self.queue_scroll_view.setHidden_(True)
-        self.queue_add_button.setHidden_(True)
-        self.queue_up_button.setHidden_(True)
-        self.queue_down_button.setHidden_(True)
-        self.queue_remove_button.setHidden_(True)
-        self.queue_clear_button.setHidden_(True)
-        self.queue_start_button.setHidden_(True)
-
-        if show_text_area:
-            self.scroll_view.setFrame_(NSMakeRect(24, 16, 640, controls_y - 26))
-            self.scroll_view.setHidden_(False)
-            self.drop_label.setHidden_(True)
-        else:
-            self.scroll_view.setHidden_(True)
-            self.drop_label.setHidden_(not show_drop_hint)
-            self.drop_label.setFrame_(NSMakeRect(48, 14, 592, 16))
-
-        self._sync_copy_button()
-
-    @objc.python_method
-    def _layout_queue_processing(self):
-        height = self.QUEUE_HEIGHT
-        self._resize_panel(height)
-
-        status_y = height - 40
-        list_bottom = 56
-        list_height = height - 40 - 34 - list_bottom
-
-        self.status_label.setFrame_(NSMakeRect(24, status_y, 640, 20))
-        self.status_label.setHidden_(False)
-
-        self._hide_all_controls()
-
-        # Show queue list and cancel button
-        self.queue_scroll_view.setFrame_(NSMakeRect(24, list_bottom, 640, list_height))
-        self.queue_scroll_view.setHidden_(False)
-        self.close_button.setFrame_(NSMakeRect(290, 14, 108, 34))
-        self.close_button.setHidden_(False)
-
-    @objc.python_method
-    def _layout_queue(self):
-        height = self.QUEUE_HEIGHT
-        self._resize_panel(height)
-
-        status_y = height - 40
-        controls_y = height - 74
-        list_bottom = 56
-        list_height = controls_y - 26 - list_bottom
-
-        self.status_label.setFrame_(NSMakeRect(124, status_y, 440, 20))
-        self.status_label.setHidden_(False)
-        self.mode_control.setFrame_(NSMakeRect(24, controls_y + 3, 186, 28))
-        self.mode_control.setHidden_(False)
-        self.close_button.setFrame_(NSMakeRect(588, controls_y, 76, 34))
-        self.close_button.setHidden_(False)
-
-        # Hide non-queue controls
-        self.detail_label.setHidden_(True)
-        self.record_button.setHidden_(True)
-        self.copy_button.setHidden_(True)
-        self.files_button.setHidden_(True)
-        self.scroll_view.setHidden_(True)
-        self.drop_label.setHidden_(True)
-
-        # Queue list
-        self.queue_scroll_view.setFrame_(NSMakeRect(24, list_bottom, 640, list_height))
-        self.queue_scroll_view.setHidden_(False)
-
-        # Bottom button row
-        btn_y = 14
-        self.queue_add_button.setFrame_(NSMakeRect(24, btn_y, 80, 34))
-        self.queue_up_button.setFrame_(NSMakeRect(116, btn_y, 34, 34))
-        self.queue_down_button.setFrame_(NSMakeRect(158, btn_y, 34, 34))
-        self.queue_remove_button.setFrame_(NSMakeRect(204, btn_y, 80, 34))
-        self.queue_clear_button.setFrame_(NSMakeRect(296, btn_y, 70, 34))
-        self.queue_start_button.setFrame_(NSMakeRect(558, btn_y, 106, 34))
-
-        self.queue_add_button.setHidden_(False)
-        self.queue_up_button.setHidden_(False)
-        self.queue_down_button.setHidden_(False)
-        self.queue_remove_button.setHidden_(False)
-        self.queue_clear_button.setHidden_(False)
-        self.queue_start_button.setHidden_(False)
-
-        self._sync_queue_buttons()
+            self.record_button.setTitle_(f"Dictate ({STOP.label})")
+            self.record_button.setBezelColor_(NSColor.controlAccentColor())
 
     @objc.python_method
     def _sync_queue_buttons(self):
-        has_items = bool(self._queue_items)
-        has_pending = any(i.status == "pending" for i in self._queue_items)
-        processing = self._queue_processing
+        has_items = bool(self._queue_files)
+        has_pending = any(i.status in (QueueStatus.PENDING, QueueStatus.CANCELLED) for i in self._queue_files)
+        selected = self._selected_queue_index() is not None
+        idle = not self._queue_processing
+        self.queue_start_button.setEnabled_(has_pending and idle)
+        self.queue_clear_button.setEnabled_(has_items and idle)
+        for button in (self.queue_remove_button, self.queue_up_button, self.queue_down_button):
+            button.setEnabled_(selected and idle)
+        self.queue_add_button.setEnabled_(idle)
+        self.queue_start_button.setTitle_("Start" if idle else "Running…")
+        self.queue_start_button.setBezelColor_(NSColor.systemGreenColor() if idle else None)
 
-        self.queue_start_button.setEnabled_(has_pending and not processing)
-        self.queue_clear_button.setEnabled_(has_items and not processing)
-        self.queue_remove_button.setEnabled_(has_items and not processing)
-        self.queue_up_button.setEnabled_(has_items and not processing)
-        self.queue_down_button.setEnabled_(has_items and not processing)
-        self.queue_add_button.setEnabled_(not processing)
+    # -- Queue list --
 
-        if processing:
-            self.queue_start_button.setTitle_("Running\u2026")
-            self._set_button_tint(self.queue_start_button, None)
-        else:
-            self.queue_start_button.setTitle_("Start")
-            self._set_button_tint(self.queue_start_button, NSColor.systemGreenColor())
+    @objc.python_method
+    def _queue_lines(self):
+        digits = len(str(len(self._queue_files)))
+        lines = []
+        for number, queued in enumerate(self._queue_files, start=1):
+            status = _QUEUE_STATUS_TEXT.get(queued.status, str(queued.status))
+            marker = f"  [{status}]" if status else ""
+            prefix = "▶ " if queued.status == QueueStatus.PROCESSING else "  "
+            lines.append(f"{prefix}{number:>{digits}}. {queued.filename}{marker}")
+        return lines
 
     @objc.python_method
     def _render_queue_list(self):
-        if not self._queue_items:
-            self.queue_text_view.setString_("No files in queue.\n\nDrop files here or click Add\u2026 to get started.")
-            return
-
-        lines = []
-        for i, item in enumerate(self._queue_items):
-            status = _STATUS_LABELS.get(item.status, item.status)
-            marker = f"  [{status}]" if status else ""
-            prefix = "\u25B6 " if item.status == "processing" else "  "
-            lines.append(f"{prefix}{i + 1}. {item.filename}{marker}")
-
-        self.queue_text_view.setString_("\n".join(lines))
-
-        # Re-select the last-acted-on item by identity: setString_ resets the
-        # cursor, so without this, repeated Move/Remove presses act on
-        # whatever line the cursor lands on instead of the same item.
-        if self._selected_queue_item_id is not None:
-            for i, item in enumerate(self._queue_items):
-                if item.id == self._selected_queue_item_id:
-                    offset = sum(len(line) + 1 for line in lines[:i]) + 2
-                    self.queue_text_view.setSelectedRange_(NSMakeRange(offset, 0))
-                    break
+        self._rendering_queue = True
+        try:
+            if not self._queue_files:
+                self.queue_text_view.setString_("No files in queue.\n\nDrop files here or click Add… to get started.")
+                self._selected_queue_file_id = None
+                return
+            lines = self._queue_lines()
+            self.queue_text_view.setString_("\n".join(lines))
+            # The chosen file is shown as a selected line, so Remove and the
+            # arrows act on something the user can see.
+            index = self._selected_queue_index()
+            if index is None:
+                self._selected_queue_file_id = None
+                self.queue_text_view.setSelectedRange_(NSMakeRange(0, 0))
+            else:
+                start = sum(_utf16_length(line) + 1 for line in lines[:index])
+                self.queue_text_view.setSelectedRange_(NSMakeRange(start, _utf16_length(lines[index])))
+        finally:
+            self._rendering_queue = False
 
     @objc.python_method
-    def _get_selected_queue_index(self) -> int | None:
-        if not self._queue_items:
-            return None
-
-        sel = self.queue_text_view.selectedRange()
-        if sel.length == 0 and sel.location == 0:
-            return None
-
-        text = self.queue_text_view.string()
-        if not text:
-            return None
-
-        # Find which line the cursor is on. Counting newlines strictly before
-        # the cursor keeps a cursor at end-of-line on that same line.
-        pos = min(sel.location, len(text))
-        line_num = text[:pos].count("\n")
-        if line_num < len(self._queue_items):
-            return line_num
+    def _selected_queue_index(self) -> int | None:
+        for index, item in enumerate(self._queue_files):
+            if item.id == self._selected_queue_file_id:
+                return index
         return None
 
-    @objc.python_method
-    def _update_queue_tab_label(self):
-        count = len(self._queue_items)
-        label = f"Queue ({count})" if count > 0 else "Queue"
-        self.mode_control.setLabel_forSegment_(label, 2)
+    def textViewDidChangeSelection_(self, notification):
+        """A click in the queue list chooses the file on that line. Dragging
+        out a selection (to copy names) or Select All chooses nothing."""
+        if self._rendering_queue or notification.object() is not self.queue_text_view or not self._queue_files:
+            return
+        selection = self.queue_text_view.selectedRange()
+        if selection.length:
+            return
+        # The location is in UTF-16 units, so the text is cut by AppKit, not
+        # by Python (where an emoji counts as one character).
+        line = str(self.queue_text_view.string().substringToIndex_(selection.location)).count("\n")
+        if line < len(self._queue_files):
+            self._selected_queue_file_id = self._queue_files[line].id
+            self._render_queue_list()
+            self._sync_queue_buttons()
 
     @objc.python_method
-    def set_queue_items(self, items):
-        self._queue_items = items
+    def set_queue_files(self, files):
+        self._queue_files = files
         self._render_queue_list()
-        self._update_queue_tab_label()
-        if self.mode == "queue":
-            self._sync_queue_buttons()
+        count = len(files)
+        self.mode_control.setLabel_forSegment_(f"Queue ({count})" if count else "Queue", _SEGMENTS.index(Mode.QUEUE))
+        self._update_layout()
 
     @objc.python_method
     def set_queue_processing(self, processing: bool):
         self._queue_processing = processing
-        if self.mode == "queue":
-            self._sync_queue_buttons()
+        self._update_layout()
 
     @objc.python_method
     def show_output_mode_dialog(self):
@@ -735,10 +681,9 @@ class OverlayController(NSObject):
 
         else:
             panel = NSSavePanel.savePanel()
-            if _HAS_UTTYPE:
-                txt_type = UTType.typeWithFilenameExtension_("txt")
-                if txt_type:
-                    panel.setAllowedContentTypes_([txt_type])
+            txt_type = UTType.typeWithFilenameExtension_("txt") if UTType is not None else None
+            if txt_type is not None:
+                panel.setAllowedContentTypes_([txt_type])
             else:
                 panel.setAllowedFileTypes_(["txt"])
             panel.setNameFieldStringValue_("transcript.txt")
@@ -751,12 +696,26 @@ class OverlayController(NSObject):
             )
 
     @objc.python_method
-    def _focus_panel(self):
-        app = NSApplication.sharedApplication()
-        if hasattr(app, "activate"):
-            app.activate()
+    def _choose_media_files(self):
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseDirectories_(False)
+        panel.setCanChooseFiles_(True)
+        panel.setAllowsMultipleSelection_(True)
+        content_types = _media_content_types()
+        if content_types:
+            panel.setAllowedContentTypes_(content_types)
         else:
-            app.activateIgnoringOtherApps_(True)
+            panel.setAllowedFileTypes_(MEDIA_EXTENSIONS)
+        panel.setLevel_(NSPopUpMenuWindowLevel)
+        return [url.path() for url in panel.URLs()] if panel.runModal() else []
+
+    # -- Showing and hiding --
+
+    @objc.python_method
+    def focus(self):
+        # Activation must not depend on the app that is in front agreeing to
+        # give way: the hotkey can arrive while any app is active.
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         self.panel.makeKeyAndOrderFront_(None)
         self.panel.makeMainWindow()
         self.panel.orderFrontRegardless()
@@ -776,25 +735,28 @@ class OverlayController(NSObject):
         self._sync_copy_button()
 
     @objc.python_method
-    def show_mode(self, mode: str):
-        self.mode = mode
-        segment = {"result": 0, "history": 1, "queue": 2}.get(mode, 0)
-        self.mode_control.setSelectedSegment_(segment)
-        self._refresh_text_view()
-        if mode == "queue":
-            self._render_queue_list()
-        self._update_layout()
-        self.panel.center()
-        self._focus_panel()
+    def show_mode(self, mode: Mode):
+        self._set_mode(mode)
+        self.mode_control.setSelectedSegment_(_SEGMENTS.index(mode))
+        if not self._positioned:
+            # Centred once; afterwards it reappears where the user left it.
+            self.panel.center()
+            self._positioned = True
+        self.focus()
 
     @objc.python_method
-    def focus(self):
-        self._focus_panel()
+    def _set_mode(self, mode: Mode):
+        self.mode = mode
+        self._refresh_text_view()
+        if mode == Mode.QUEUE:
+            self._render_queue_list()
+        self._update_layout()
 
     @objc.python_method
     def prepare_for_recording(self):
         self.detail_label.setStringValue_("")
-        self.mode = "result"
+        self.intro_text = ""
+        self.mode = Mode.RESULT
         self.mode_control.setSelectedSegment_(0)
         self.current_text = ""
         self._cancel_copy_feedback()
@@ -805,22 +767,20 @@ class OverlayController(NSObject):
     def hide(self):
         self.panel.orderOut_(None)
         self.current_text = ""
-        self.text_view.setString_("")
         self._cancel_copy_feedback()
-        self.status_label.setStringValue_("")
+        self._refresh_text_view()
         self._update_layout()
 
     @objc.python_method
     def set_status(self, text: str):
+        self._status = text
         self.status_label.setStringValue_(text)
+        self.status_label.setToolTip_(text)
 
     @objc.python_method
     def set_transcribing(self, is_transcribing: bool):
         self.is_transcribing = is_transcribing
-        if is_transcribing:
-            self.close_button.setTitle_("Cancel")
-        else:
-            self.close_button.setTitle_("Close")
+        self.close_button.setTitle_("Cancel" if is_transcribing else "Close")
         self._update_layout()
 
     @objc.python_method
@@ -834,14 +794,12 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def set_recording(self, is_recording: bool):
+        if is_recording == self.is_recording:
+            return
         self.is_recording = is_recording
         if is_recording:
             self._cancel_copy_feedback()
-            self.record_button.setTitle_(f"Stop ({self.config.shortcuts.toggle_recording})")
-            self._set_button_tint(self.record_button, NSColor.systemRedColor())
-        else:
-            self.record_button.setTitle_(f"Record ({self.config.shortcuts.toggle_recording})")
-            self._set_button_tint(self.record_button, NSColor.controlAccentColor())
+        self._apply_recording_state()
         self._update_layout()
 
     @objc.python_method
@@ -851,9 +809,15 @@ class OverlayController(NSObject):
             self._cancel_copy_feedback()
         self._refresh_text_view()
         self._update_layout()
-        if self.is_recording and text and self.mode == "result":
+        if self.is_recording and text and self.mode == Mode.RESULT:
             # Keep the tail of the live draft visible during long dictations.
             self.text_view.scrollRangeToVisible_(NSMakeRange(len(self.text_view.string()), 0))
+
+    @objc.python_method
+    def set_intro_text(self, text: str):
+        self.intro_text = text
+        self._refresh_text_view()
+        self._update_layout()
 
     @objc.python_method
     def set_history_text(self, text: str):
@@ -863,17 +827,14 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def set_drop_state(self, active: bool):
-        if active:
-            if self.mode == "queue":
-                self.drop_label.setStringValue_("Drop to add to queue.")
-            else:
-                self.drop_label.setStringValue_("Drop to transcribe.")
-            self.drop_label.setTextColor_(NSColor.systemBlueColor())
-        else:
-            self.drop_label.setStringValue_(
-                "Drop a file to transcribe. Switch to Queue to batch process multiple files."
-            )
-            self.drop_label.setTextColor_(NSColor.secondaryLabelColor())
+        if self.drop_label.isHidden():
+            # The hint label is only part of the empty Result layout; elsewhere
+            # the status line carries the feedback and gets its text back.
+            feedback = "Drop to add to the queue" if self.mode == Mode.QUEUE else "Drop to transcribe"
+            self.status_label.setStringValue_(feedback if active else self._status)
+            return
+        self.drop_label.setStringValue_("Drop to transcribe." if active else DROP_HINT)
+        self.drop_label.setTextColor_(NSColor.systemBlueColor() if active else NSColor.secondaryLabelColor())
 
     @objc.python_method
     def flash_copy_feedback(self):
@@ -881,38 +842,22 @@ class OverlayController(NSObject):
             return
 
         self._copy_feedback_token += 1
-        token = self._copy_feedback_token
         self._copy_feedback_visible = True
         self._sync_copy_button()
-        AppHelper.callLater(2.0, self._reset_copy_feedback, token)
+        call_later(2.0, self._reset_copy_feedback, self._copy_feedback_token)
 
     @objc.python_method
-    def handle_dropped_paths(self, paths):
-        if self.mode != "queue" and len(paths) == 1:
+    def files_dropped(self, paths):
+        if self.mode != Mode.QUEUE and len(paths) == 1:
             self.delegate.transcribe_file_directly(paths[0])
         else:
             self.delegate.queue_add_files(paths)
 
-    @objc.python_method
-    def handle_escape_key(self):
-        self.delegate.hide_overlay()
-
-    @objc.python_method
-    def handle_toggle_recording_shortcut(self):
-        self.delegate.toggle_recording_requested()
-
-    @objc.python_method
-    def handle_copy_shortcut(self):
-        self.delegate.copy_current_transcript()
+    # -- Actions --
 
     def toggleMode_(self, sender):
-        segment = sender.selectedSegment()
-        self.mode = {0: "result", 1: "history", 2: "queue"}.get(segment, "result")
-        self._refresh_text_view()
-        if self.mode == "queue":
-            self._render_queue_list()
-        self._update_layout()
-        self._focus_panel()
+        self._set_mode(_SEGMENTS[sender.selectedSegment()])
+        self.focus()
 
     def toggleRecording_(self, sender):
         del sender
@@ -924,64 +869,40 @@ class OverlayController(NSObject):
 
     def openFiles_(self, sender):
         del sender
-        panel = NSOpenPanel.openPanel()
-        panel.setCanChooseDirectories_(False)
-        panel.setCanChooseFiles_(True)
-        panel.setAllowsMultipleSelection_(True)
-        if _HAS_UTTYPE:
-            panel.setAllowedContentTypes_(_ALLOWED_CONTENT_TYPES)
-        else:
-            panel.setAllowedFileTypes_(MEDIA_EXTENSIONS)
-        panel.setLevel_(NSPopUpMenuWindowLevel)
-        if panel.runModal():
-            paths = [url.path() for url in panel.URLs()]
-            self.handle_dropped_paths(paths)
+        paths = self._choose_media_files()
+        if paths:
+            self.files_dropped(paths)
 
     def closeOverlay_(self, sender):
         del sender
-        self.delegate.hide_overlay()
+        self.delegate.dismiss_requested()
 
     def queueAddFiles_(self, sender):
         del sender
-        panel = NSOpenPanel.openPanel()
-        panel.setCanChooseDirectories_(False)
-        panel.setCanChooseFiles_(True)
-        panel.setAllowsMultipleSelection_(True)
-        if _HAS_UTTYPE:
-            panel.setAllowedContentTypes_(_ALLOWED_CONTENT_TYPES)
-        else:
-            panel.setAllowedFileTypes_(MEDIA_EXTENSIONS)
-        if panel.runModal():
-            paths = [url.path() for url in panel.URLs()]
+        paths = self._choose_media_files()
+        if paths:
             self.delegate.queue_add_files(paths)
 
     def queueMoveUp_(self, sender):
         del sender
-        idx = self._get_selected_queue_index()
-        if idx is not None and idx > 0:
-            item = self._queue_items[idx]
-            self._selected_queue_item_id = item.id
-            self.delegate.queue_move_item(item.id, idx - 1)
+        index = self._selected_queue_index()
+        if index is not None and index > 0:
+            self.delegate.queue_move_file(self._queue_files[index].id, index - 1)
 
     def queueMoveDown_(self, sender):
         del sender
-        idx = self._get_selected_queue_index()
-        if idx is not None and idx < len(self._queue_items) - 1:
-            item = self._queue_items[idx]
-            self._selected_queue_item_id = item.id
-            self.delegate.queue_move_item(item.id, idx + 1)
+        index = self._selected_queue_index()
+        if index is not None and index < len(self._queue_files) - 1:
+            self.delegate.queue_move_file(self._queue_files[index].id, index + 1)
 
     def queueRemove_(self, sender):
         del sender
-        idx = self._get_selected_queue_index()
-        if idx is not None:
-            item = self._queue_items[idx]
-            self._selected_queue_item_id = None
-            self.delegate.queue_remove_item(item.id)
+        index = self._selected_queue_index()
+        if index is not None:
+            self.delegate.queue_remove_file(self._queue_files[index].id)
 
     def queueClear_(self, sender):
         del sender
-        self._selected_queue_item_id = None
         self.delegate.queue_clear_requested()
 
     def queueStart_(self, sender):

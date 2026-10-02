@@ -1,4 +1,4 @@
-"""Transcript history persisted as JSON; replaced originals live in a sidecar file."""
+"""Transcript history, persisted as JSON."""
 
 from __future__ import annotations
 
@@ -6,13 +6,20 @@ import json
 import shutil
 import threading
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 
-from .logger_config import setup_logging
+from .atomic_file import set_aside, write_text_atomically
+from .logger_config import logger
 
-logger = setup_logging()
+
+class Source(StrEnum):
+    """Where a transcript came from; stored with each history entry."""
+    MICROPHONE = "microphone"
+    RECOVERY = "recovery"
+    FILE = "file"
 
 
 @dataclass
@@ -23,85 +30,77 @@ class HistoryEntry:
     source_label: str
     text: str
     raw_text: str = ""
+    # Keys written by a newer version, carried through so a save here does
+    # not erase them.
+    unrecognized: dict = field(default_factory=dict, repr=False)
+
+
+# What history.json stores per entry. raw_text lives in the sidecar so the
+# main file stays readable by 0.3.0, whose loader rejects unknown fields.
+_STORED_FIELDS = tuple(f.name for f in fields(HistoryEntry) if f.name not in ("raw_text", "unrecognized"))
+
+
+def adopt_legacy_history(support_dir: Path) -> None:
+    """Copy the transcript history of the app's earlier name, once."""
+    legacy = support_dir.parent / "ParakeetDictation" / "history.json"
+    current = support_dir / "history.json"
+    if current.exists() or not legacy.exists():
+        return
+    support_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(legacy, current)
 
 
 class HistoryStore:
-    def __init__(self, history_limit: int = 100, base_dir: Path | None = None):
+    def __init__(self, base_dir: Path, history_limit: int = 100):
         self.history_limit = history_limit
-        self.base_dir = base_dir or self._default_base_dir()
+        self.base_dir = base_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.path = self.base_dir / "history.json"
         self.originals_path = self.base_dir / "history-originals.json"
         self._lock = threading.Lock()
         self._entries = self._load()
 
-    @staticmethod
-    def _default_base_dir() -> Path:
-        support_dir = Path.home() / "Library" / "Application Support"
-        maramax_dir = support_dir / "Maramax"
-        legacy_dir = support_dir / "ParakeetDictation"
-        legacy_history = legacy_dir / "history.json"
-        maramax_history = maramax_dir / "history.json"
-
-        if maramax_history.exists() or not legacy_history.exists():
-            return maramax_dir
-
-        maramax_dir.mkdir(parents=True, exist_ok=True)
-        if not maramax_history.exists():
-            shutil.copy2(legacy_history, maramax_history)
-        return maramax_dir
-
     def _load(self) -> list[HistoryEntry]:
         if not self.path.exists():
             return []
-
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            if not isinstance(payload, list):
+                raise ValueError("history is not a list")
+        except (ValueError, OSError) as exc:
+            # The next save would otherwise overwrite every transcript.
+            set_aside(self.path, str(exc))
             return []
 
-        entries = []
         try:
             originals = json.loads(self.originals_path.read_text(encoding="utf-8"))
             if not isinstance(originals, dict):
                 originals = {}
-        except (OSError, ValueError, UnicodeDecodeError):
-            originals = {}
-        for item in payload if isinstance(payload, list) else []:
-            if not isinstance(item, dict):
-                continue
+        except (OSError, ValueError):
+            originals = {}  # Only the pre-replacement wording is lost.
 
-            try:
-                entry = HistoryEntry(**item)
-                if not all(isinstance(value, str) for value in asdict(entry).values()):
-                    continue
-                original = originals.get(entry.id)
-                if isinstance(original, str):
-                    entry.raw_text = original
-                entries.append(entry)
-            except TypeError:
-                continue
-
+        entries = []
+        for item in payload:
+            if not isinstance(item, dict) or not all(isinstance(item.get(name), str) for name in _STORED_FIELDS):
+                continue  # One malformed entry does not hide the rest.
+            entry = HistoryEntry(
+                **{name: item[name] for name in _STORED_FIELDS},
+                unrecognized={key: value for key, value in item.items() if key not in _STORED_FIELDS},
+            )
+            original = originals.get(entry.id)
+            if isinstance(original, str):
+                entry.raw_text = original
+            entries.append(entry)
         return entries[: self.history_limit]
 
     def _save(self) -> None:
         entries = self._entries[: self.history_limit]
-        # Keep history.json readable by 0.3.0, whose loader rejects unknown
-        # fields. Originals live in a bounded sidecar keyed by entry ID.
-        payload = []
-        originals = {}
-        for entry in entries:
-            item = asdict(entry)
-            item.pop("raw_text")
-            payload.append(item)
-            if entry.raw_text and entry.raw_text != entry.text:
-                originals[entry.id] = entry.raw_text
-        original_temp = self.originals_path.with_suffix(".json.tmp")
-        original_temp.write_text(json.dumps(originals, indent=2), encoding="utf-8")
-        original_temp.replace(self.originals_path)
-        temp_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
-        temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        temp_path.replace(self.path)
+        payload = [dict(entry.unrecognized) | {name: getattr(entry, name) for name in _STORED_FIELDS}
+                   for entry in entries]
+        originals = {entry.id: entry.raw_text for entry in entries
+                     if entry.raw_text and entry.raw_text != entry.text}
+        write_text_atomically(self.originals_path, json.dumps(originals, indent=2))
+        write_text_atomically(self.path, json.dumps(payload, indent=2))
 
     def list_entries(self) -> list[HistoryEntry]:
         with self._lock:
@@ -123,6 +122,8 @@ class HistoryStore:
             try:
                 self._save()
             except Exception as exc:
+                # The transcript is still published and copied; only its
+                # place in history is at risk, and the user is not blocked.
                 logger.error(f"Failed to save history: {exc}")
 
         return entry
@@ -134,23 +135,21 @@ class HistoryStore:
                 self._save()
                 return True
             except Exception as exc:
-                logger.error(f"Failed to save history: {exc}")
+                logger.error(f"Failed to clear history on disk: {exc}")
                 return False
 
-    def render(self) -> str:
+    def render(self) -> str | None:
+        """History as display text, or None when there is nothing yet."""
         entries = self.list_entries()
         if not entries:
-            return (
-                "No transcriptions yet.\n\n"
-                "Use Option+Space to dictate or drop audio/video files into the overlay."
-            )
+            return None
 
         blocks = []
         for entry in entries:
             try:
                 created_at = datetime.fromisoformat(entry.created_at).astimezone().strftime("%Y-%m-%d %H:%M")
-            except Exception:
-                created_at = str(entry.created_at)
+            except ValueError:
+                created_at = entry.created_at
             blocks.append(f"[{created_at}] {entry.source_kind.title()}: {entry.source_label}\n{entry.text.strip()}")
             if entry.raw_text and entry.raw_text != entry.text:
                 blocks[-1] += f"\n\nBefore word replacements:\n{entry.raw_text.strip()}"

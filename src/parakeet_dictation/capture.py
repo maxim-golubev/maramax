@@ -1,4 +1,4 @@
-"""Audio health measurements. No device or model is opened by this module."""
+"""Health measurements of a recording's audio stream. No device or model is opened here."""
 
 from __future__ import annotations
 
@@ -6,12 +6,33 @@ import math
 import threading
 import time
 from dataclasses import asdict, dataclass
+from enum import StrEnum
 
 import numpy as np
+
+from .audio_format import FULL_SCALE, SAMPLE_RATE
 
 # Below this peak (about -54 dBFS) a capture holds no usable speech: it is the
 # noise floor of a muted or gated microphone, not a quiet talker.
 FAINT_PEAK = 0.002
+
+# How long the app waits before it gives up on a microphone. The audio helper
+# tries to repair a route sooner than each of these (see audio_worker.py);
+# tests/test_capture.py holds the two sets of numbers in that order.
+NO_FRAME_SECONDS = 5.0    # device open, but no buffer has ever arrived
+STALLED_SECONDS = 3.0     # buffers were arriving and stopped
+QUIET_SECONDS = 10.0      # buffers arrive but hold only zeros
+RECONNECT_LIMIT_SECONDS = 8.0  # a replacement input is taking this long to open
+
+
+class CaptureHealth(StrEnum):
+    WAITING = "waiting"
+    RECEIVING = "receiving"
+    RECONNECTING = "reconnecting"
+    SILENT = "silent"
+    QUIET = "quiet"
+    MISSING = "missing"
+    DISCONNECTED = "disconnected"
 
 
 @dataclass(frozen=True)
@@ -29,33 +50,34 @@ class CaptureSnapshot:
     device_name: str
     # Seconds from the capture request until the device reported itself open.
     open_delay: float | None = None
-    reconnecting: bool = False
+    # Seconds since the helper began opening a replacement input, if it is.
+    reconnecting_seconds: float | None = None
 
     @property
-    def health(self) -> str:
-        if self.reconnecting:
-            return "reconnecting"
+    def health(self) -> CaptureHealth:
+        if self.reconnecting_seconds is not None and self.reconnecting_seconds < RECONNECT_LIMIT_SECONDS:
+            return CaptureHealth.RECONNECTING
         # A slow driver open (Bluetooth can take seconds) is not time spent
         # listening; the frame deadlines start once the stream exists.
         listening = self.elapsed - (self.open_delay or 0.0)
         # Digital silence is evidence of a broken route, not proof that the
         # speaker is quiet. Once signal has arrived, ordinary pauses are fine.
         if self.last_frame_age is None:
-            return "waiting" if listening < 5 else "missing"
-        if self.last_frame_age > 3:
-            return "disconnected"
+            return CaptureHealth.WAITING if listening < NO_FRAME_SECONDS else CaptureHealth.MISSING
+        if self.last_frame_age > STALLED_SECONDS:
+            return CaptureHealth.DISCONNECTED
         if self.nonzero_samples == 0:
-            return "waiting" if listening < 5 else "silent"
-        if self.last_signal_age is not None and self.last_signal_age > 10:
-            return "quiet"
-        return "receiving"
+            return CaptureHealth.WAITING if listening < NO_FRAME_SECONDS else CaptureHealth.SILENT
+        if self.last_signal_age is not None and self.last_signal_age > QUIET_SECONDS:
+            return CaptureHealth.QUIET
+        return CaptureHealth.RECEIVING
 
     @property
     def faint(self) -> bool:
         return self.peak < FAINT_PEAK
 
     def diagnostics(self) -> dict:
-        return asdict(self) | {"health": self.health}
+        return asdict(self) | {"health": str(self.health)}
 
 
 def _display_level(rms: float) -> float:
@@ -69,11 +91,17 @@ def _display_level(rms: float) -> float:
 class CaptureMeter:
     """Per-recording measurements; stale callbacks retain their old meter."""
 
-    def __init__(self, rate: int = 16000, clock=time.monotonic):
+    def __init__(self, rate: int = SAMPLE_RATE, clock=time.monotonic):
         self._clock = clock
-        self._started = clock()
         self._rate = rate
         self._lock = threading.Lock()
+        self.device_name = "System default"
+        self._reset(opened=False)
+
+    def _reset(self, opened: bool) -> None:
+        now = self._clock()
+        self._started = now
+        self._opened: float | None = now if opened else None
         self._samples = 0
         self._nonzero = 0
         self._callbacks = 0
@@ -81,11 +109,14 @@ class CaptureMeter:
         self._first: float | None = None
         self._last: float | None = None
         self._last_signal: float | None = None
-        self._opened: float | None = None
-        self._reconnecting = False
+        self._reconnecting_since: float | None = None
         self._peak = 0.0
         self._level = 0.0
-        self.device_name = "System default"
+
+    def restart(self) -> None:
+        """Begin measuring a new recording on a device that is already open."""
+        with self._lock:
+            self._reset(opened=True)
 
     def mark_open(self) -> None:
         """The device stream exists; frame deadlines count from here."""
@@ -95,19 +126,26 @@ class CaptureMeter:
 
     def set_reconnecting(self, reconnecting: bool) -> None:
         """A replacement stream is being opened mid-recording. Clearing the
-        flag restarts the frame deadline so the new device gets a fair wait."""
+        flag restarts whichever frame deadline applies, so the new device
+        gets a fair wait for its first buffer."""
         with self._lock:
-            self._reconnecting = reconnecting
-            if not reconnecting and self._last is not None:
-                self._last = self._clock()
+            now = self._clock()
+            if reconnecting:
+                self._reconnecting_since = now
+                return
+            self._reconnecting_since = None
+            if self._last is None:
+                self._opened = now
+            else:
+                self._last = now
 
     def feed(self, pcm: bytes, overflow: bool = False) -> None:
         # An empty callback isn't evidence that an audio route is working.
         if not pcm:
             return
         samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32)
-        peak = float(np.max(np.abs(samples))) / 32768.0
-        rms = math.sqrt(float(np.mean(samples * samples))) / 32768.0
+        peak = float(np.max(np.abs(samples))) / FULL_SCALE
+        rms = math.sqrt(float(np.mean(samples * samples))) / FULL_SCALE
         now = self._clock()
         with self._lock:
             self._samples += len(samples)
@@ -139,5 +177,6 @@ class CaptureMeter:
                 overflow_count=self._overflows,
                 device_name=self.device_name,
                 open_delay=None if self._opened is None else self._opened - self._started,
-                reconnecting=self._reconnecting,
+                reconnecting_seconds=(None if self._reconnecting_since is None
+                                      else now - self._reconnecting_since),
             )

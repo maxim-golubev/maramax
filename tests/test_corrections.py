@@ -41,14 +41,13 @@ def test_publication_keeps_raw_text_and_pastes_only_new_dictation(tmp_path, monk
     app = object.__new__(module.DictationApp)
     app.config = AppConfig(paste_to_active_app=True, replacements=[{"heard": "mara max", "replacement": "Maramax"}])
     app.history_store = HistoryStore(base_dir=tmp_path)
-    app._state_lock = threading.Lock()
-    app._force_copy_after_transcription = False
+    app._cancel_event = threading.Event()
     app._set_current_text_on_main = lambda *_args: None
     app._refresh_history_on_main = lambda: None
     copied, pending = [], []
     app._copy_text_with_feedback = lambda text, **kwargs: copied.append(text) or True
     monkeypatch.setattr(module.AppHelper, "callAfter", lambda *args: pending.append(args))
-    assert app._publish_transcript("mara max", "microphone", "Dictation", True, 1) == "Maramax"
+    assert app._publish_transcript("mara max", module.Source.MICROPHONE, "Dictation", 1) == ("Maramax", True)
     assert copied == ["Maramax"]
     assert len(pending) == 1
     assert pending[0][1:] == (1, "Maramax")
@@ -56,11 +55,18 @@ def test_publication_keeps_raw_text_and_pastes_only_new_dictation(tmp_path, monk
     assert entry.text == "Maramax" and entry.raw_text == "mara max"
     assert "Before word replacements" in HistoryStore(base_dir=tmp_path).render()
     pending.clear()
-    app._publish_transcript("mara max", "recovery", "Retry", True, 2)
+    app._publish_transcript("mara max", module.Source.RECOVERY, "Retry", 2)
     assert not pending  # Retry must not paste into a stale destination.
-    assert app._publish_transcript("mara max", "file", "File", True, 3) == "mara max"
+    assert app._publish_transcript("mara max", module.Source.FILE, "File", 3)[0] == "mara max"
     app.config.use_corrections = False
-    assert app._publish_transcript("mara max", "microphone", "Raw", True, 4) == "mara max"
+    assert app._publish_transcript("mara max", module.Source.MICROPHONE, "Raw", 4)[0] == "mara max"
+    # The copy setting is honoured on every path; nothing forces a copy.
+    app.config.paste_to_active_app = app.config.auto_copy_to_clipboard = False
+    copied.clear()
+    statuses = []
+    app._push_status = lambda message, revert_after=0: statuses.append(message)
+    app._publish_transcript("words", module.Source.MICROPHONE, "Quiet", 5)
+    assert copied == [] and statuses == ["Transcript ready"]
 
 
 def test_vocabulary_hint_lists_wanted_spellings_once():
@@ -70,3 +76,26 @@ def test_vocabulary_hint_lists_wanted_spellings_once():
              {"heard": "sig", "replacement": "Kind regards,\nMaxim"}, {"heard": "kairos", "replacement": "Cairos"}]
     assert vocabulary_hint(rules) == "Vocabulary: Maramax, Cairos."
     assert vocabulary_hint([]) is None
+
+
+def test_rules_match_however_the_recognizer_spaced_or_composed_the_words():
+    def rule(heard, replacement):
+        return [{"heard": heard, "replacement": replacement}]
+
+    assert apply_replacements("wait... what", rule("...", "…")) == "wait… what"
+    assert apply_replacements("open  ai and open\u00a0ai", rule("open ai", "OpenAI")) == "OpenAI and OpenAI"
+    assert apply_replacements("cafe\u0301 cafe", rule("cafe", "Coffee")) == "caf\u00e9 Coffee"
+
+
+def test_vocabulary_hint_never_carries_snippets_or_addresses():
+    from parakeet_dictation.corrections import vocabulary_hint
+
+    rules = [{"heard": "addr", "replacement": "maxim@example.com"}, {"heard": "list", "replacement": "one, two"},
+             {"heard": "dots", "replacement": "..."}, {"heard": "see", "replacement": "C++"},
+             {"heard": "phone", "replacement": "555 123 4567"}, {"heard": "site", "replacement": "example.com/login"}]
+    assert vocabulary_hint(rules) == "Vocabulary: C++."
+
+
+def test_rules_that_differ_only_in_spacing_are_one_rule():
+    rules = normalize_rules([{"heard": "open ai", "replacement": "OpenAI"}, {"heard": "open  ai", "replacement": "other"}])
+    assert rules == [{"heard": "open ai", "replacement": "OpenAI"}]

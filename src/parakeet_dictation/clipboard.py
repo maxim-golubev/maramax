@@ -1,4 +1,4 @@
-"""Clipboard helpers, including the fail-closed check that guards auto-paste."""
+"""The system clipboard, as text."""
 
 from __future__ import annotations
 

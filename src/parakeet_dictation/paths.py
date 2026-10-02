@@ -1,4 +1,4 @@
-"""Resource, support-directory, PATH, and TLS certificate resolution for dev and bundle runs."""
+"""Where things are on this machine: bundled resources, the data directory, command-line tools, CA certificates."""
 
 from __future__ import annotations
 

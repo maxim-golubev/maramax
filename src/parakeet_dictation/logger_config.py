@@ -13,6 +13,10 @@ from dotenv import load_dotenv
 _LOGGER_CONFIGURED = False
 _LOGGER_NAME = "maramax"
 
+# Modules import this; it stays silent until main() calls setup_logging(), so
+# importing a module never reads the environment or opens a log file.
+logger = logging.getLogger(_LOGGER_NAME)
+
 
 class ColoredFormatter(logging.Formatter):
     COLORS = {
@@ -53,8 +57,6 @@ class ColoredFormatter(logging.Formatter):
 
 def setup_logging(log_path: Path | None = None) -> logging.Logger:
     global _LOGGER_CONFIGURED
-
-    logger = logging.getLogger(_LOGGER_NAME)
 
     if log_path is not None and not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
         try:

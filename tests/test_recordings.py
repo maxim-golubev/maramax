@@ -138,3 +138,33 @@ def test_listing_does_not_wait_for_an_in_progress_archive_write(tmp_path, monkey
     finally:
         release.set()
         writer.join(timeout=3)
+
+
+def test_metadata_from_a_newer_version_keeps_its_transcript(tmp_path):
+    store = RecordingStore(tmp_path)
+    record = store.save(b"\x01\x02" * 16000)
+    store.update(record.id, status="done", text="Spoken words")
+    path = store.audio_path(record.id).with_suffix(".json")
+    payload = json.loads(path.read_text())
+    payload["speaker"] = "added by a later release"
+    path.write_text(json.dumps(payload))
+    entry = store.list_recordings()[0]
+    assert entry.text == "Spoken words" and entry.status == "done"
+    store.update(record.id, message="looked at")
+    saved = json.loads(path.read_text())
+    assert saved["speaker"] == "added by a later release" and saved["text"] == "Spoken words"
+
+
+def test_recovery_prefers_audio_that_never_reached_the_recognizer(tmp_path):
+    from parakeet_dictation.recordings import recovery_candidate
+
+    store = RecordingStore(tmp_path)
+    done = store.save(b"\x01\x00" * 16000)
+    store.update(done.id, status="done")
+    assert recovery_candidate(store.list_recordings()) is None
+    interrupted = store.save(b"\x02\x00" * 16000)
+    failed = store.save(b"\x03\x00" * 16000)
+    store.update(failed.id, status="failed")
+    assert recovery_candidate(store.list_recordings()).id == interrupted.id
+    store.update(interrupted.id, status="done")
+    assert recovery_candidate(store.list_recordings()).id == failed.id

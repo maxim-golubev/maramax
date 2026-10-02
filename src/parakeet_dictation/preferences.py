@@ -1,4 +1,4 @@
-"""Native settings and explicit word replacements."""
+"""The Settings window."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ from AppKit import (
 )
 from Foundation import NSObject
 
-from .corrections import MAX_RULES, normalize_rules
+from .corrections import MAX_HEARD_CHARS, MAX_REPLACEMENT_CHARS, MAX_RULES, normalize_rules
+from .hotkeys import STOP
 
 MARGIN = 24
 CONTENT_WIDTH = 512
@@ -23,7 +24,7 @@ CHECKBOX_INDENT = 20
 _HELP = {
     "compact_dictation": "A small bar that leaves the app you are typing in focused. "
                          "Turn off to dictate in the full Maramax window.",
-    "auto_start_recording": "Turn off to open the window first and start with Cmd+R.",
+    "auto_start_recording": f"Turn off to open the window first and start with {STOP.label}.",
     "live_preview": "Draft text while you speak. The final transcript always replaces it.",
     "auto_copy_to_clipboard": "",
     "paste_to_active_app": "Types the result where your cursor is. macOS asks for Accessibility permission once.",
@@ -31,7 +32,7 @@ _HELP = {
                      "as vocabulary. Several times slower on long dictations, about 6 GB of memory, "
                      "and a 4.1 GB download on first use.",
     "prefer_builtin_mic": "Records with the Mac so AirPods stay in high-quality playback. "
-                          "Skipped while the lid is closed, when the Mac's microphone is switched off.",
+                          "Skipped while the lid is closed, when the Mac’s microphone is switched off.",
     "use_corrections": "Fixes words the recognizer keeps getting wrong, such as names. "
                        "Whole words and phrases, ignoring capitalization. "
                        "The original text stays in History and Recordings.",
@@ -41,8 +42,25 @@ _SECTIONS = (
     ("Result", ("auto_copy_to_clipboard", "paste_to_active_app")),
     ("Speech model", ("high_accuracy",)),
 )
-_KEEP_READY_CHOICES = ((0, "Off"), (30, "30 seconds"), (120, "2 minutes"), (300, "5 minutes"))
+_KEEP_READY_CHOICES = (0, 30, 120, 300)
 _DEFAULT_NOTE = "Each replacement is applied once per match; replacements never chain."
+_RULE_TITLE_CHARS = 60
+TABS_TOP = 16
+TABS_TO_PAGE = 20
+ROW_GAP = 8  # Between controls that share a row.
+
+
+def duration_label(seconds: int) -> str:
+    if seconds == 0:
+        return "Off"
+    count, unit = (seconds // 60, "minute") if seconds % 60 == 0 else (seconds, "second")
+    return f"{count} {unit}" if count == 1 else f"{count} {unit}s"
+
+
+def rule_title(rule: dict[str, str]) -> str:
+    """One menu line per rule; a long snippet must not make a 4,000 pt menu."""
+    title = " ".join(f"{rule['heard']} → {rule['replacement']}".split())
+    return title if len(title) <= _RULE_TITLE_CHARS else title[: _RULE_TITLE_CHARS - 1] + "…"
 
 
 class PreferencesController(NSObject):
@@ -62,6 +80,8 @@ class PreferencesController(NSObject):
         )
         self.panel.setTitle_("Maramax Settings")
         self.panel.setReleasedWhenClosed_(False)
+        # A menu-bar app has no Dock icon to bring a hidden panel back with.
+        self.panel.setHidesOnDeactivate_(False)
         root = self.panel.contentView()
 
         self.tabs = NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(0, 0, 330, 24))
@@ -77,7 +97,7 @@ class PreferencesController(NSObject):
 
         self.pages = [self._general_page(), self._microphone_page(), self._words_page()]
         constraints = [
-            self.tabs.topAnchor().constraintEqualToAnchor_constant_(root.topAnchor(), 16),
+            self.tabs.topAnchor().constraintEqualToAnchor_constant_(root.topAnchor(), TABS_TOP),
             self.tabs.centerXAnchor().constraintEqualToAnchor_(root.centerXAnchor()),
         ]
         for index, page in enumerate(self.pages):
@@ -85,18 +105,31 @@ class PreferencesController(NSObject):
             root.addSubview_(page)
             page.setHidden_(index != 0)
             constraints += [
-                page.topAnchor().constraintEqualToAnchor_constant_(self.tabs.bottomAnchor(), 20),
+                page.topAnchor().constraintEqualToAnchor_constant_(self.tabs.bottomAnchor(), TABS_TO_PAGE),
                 page.leadingAnchor().constraintEqualToAnchor_constant_(root.leadingAnchor(), MARGIN),
                 page.widthAnchor().constraintEqualToConstant_(CONTENT_WIDTH),
             ]
         NSLayoutConstraint.activateConstraints_(constraints)
-        root.layoutSubtreeIfNeeded()
-        # One window size for every tab: the tallest page decides.
-        tallest = max(page.fittingSize().height for page in self.pages)
-        self.panel.setContentSize_((CONTENT_WIDTH + 2 * MARGIN, 16 + 24 + 20 + tallest + MARGIN))
-        self.update_input_devices([], getattr(delegate.config, "input_device", None))
+        self.update_input_devices([], delegate.config.input_device)
         self.refresh()
         return self
+
+    @objc.python_method
+    def _fit_window_to_page(self):
+        """Each tab gets a window exactly as tall as its content plus the
+        same bottom margin, keeping the title bar where it is."""
+        root = self.panel.contentView()
+        root.layoutSubtreeIfNeeded()
+        page = self.pages[self.tabs.selectedSegment()]
+        # Pages hang from the top, so the space above one is whatever the
+        # layout made it; measuring it avoids restating the tab control's size.
+        above = root.bounds().size.height - (page.frame().origin.y + page.frame().size.height)
+        height = above + page.fittingSize().height + MARGIN
+        frame = self.panel.frameRectForContentRect_(NSMakeRect(0, 0, CONTENT_WIDTH + 2 * MARGIN, height))
+        current = self.panel.frame()
+        top = current.origin.y + current.size.height
+        self.panel.setFrame_display_(
+            NSMakeRect(current.origin.x, top - frame.size.height, frame.size.width, frame.size.height), True)
 
     # -- Building blocks --
 
@@ -158,7 +191,7 @@ class PreferencesController(NSObject):
         groups = [[self._header(title)] + [self._option(name) for name in names] for title, names in _SECTIONS]
         self.model_status = self._help("")
         self.model_retry = self._button("Retry", "retryModel:")
-        groups[-1].append(self._stack([self.model_status, self.model_retry], horizontal=True, spacing=12))
+        groups[-1].append(self._stack([self.model_status, self.model_retry], horizontal=True, spacing=ROW_GAP))
         return self._page(groups)
 
     @objc.python_method
@@ -168,14 +201,14 @@ class PreferencesController(NSObject):
         self.device_picker.setAction_("selectDevice:")
         self.device_picker.widthAnchor().constraintEqualToConstant_(400).setActive_(True)
         picker_row = self._stack([self.device_picker, self._button("Refresh", "refreshDevices:")],
-                                 horizontal=True, spacing=12)
+                                 horizontal=True, spacing=ROW_GAP)
 
         self.keep_ready = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 100, 25), False)
         self.keep_ready.setTarget_(self)
         self.keep_ready.setAction_("selectKeepReady:")
         self.keep_ready.widthAnchor().constraintEqualToConstant_(140).setActive_(True)
         keep_row = self._stack([NSTextField.labelWithString_("Keep the microphone connected for"), self.keep_ready],
-                               horizontal=True)
+                               horizontal=True, spacing=ROW_GAP)
         return self._page([
             [self._header("Input"), picker_row,
              self._help("Automatic follows the input chosen in macOS. If a microphone disconnects while you "
@@ -202,7 +235,7 @@ class PreferencesController(NSObject):
             [self.heard, self.replacement, self._button("Save", "saveRule:")],
         ])
         grid.setRowSpacing_(4)
-        grid.setColumnSpacing_(12)
+        grid.setColumnSpacing_(ROW_GAP)
         grid.rowAtIndex_(1).setRowAlignment_(NSGridRowAlignmentFirstBaseline)
 
         self.picker = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 100, 25), False)
@@ -210,13 +243,15 @@ class PreferencesController(NSObject):
         self.picker.setAction_("selectRule:")
         self.picker.widthAnchor().constraintEqualToConstant_(CONTENT_WIDTH).setActive_(True)
         self.remove = self._button("Remove", "removeRule:")
+        new_rule = self._button("New", "newRule:")
+        rule_buttons = self._stack([self.remove, new_rule], horizontal=True, spacing=ROW_GAP)
+        # Siblings of equal weight get equal width (they share a parent now).
+        new_rule.widthAnchor().constraintEqualToAnchor_(self.remove.widthAnchor()).setActive_(True)
         self.note = self._help(_DEFAULT_NOTE)
         return self._page([
             [self._option("use_corrections")],
             [self._header("Add or change a replacement"), grid],
-            [self._header("Saved replacements"), self.picker,
-             self._stack([self.remove, self._button("New", "newRule:")], horizontal=True),
-             self.note],
+            [self._header("Saved replacements"), self.picker, rule_buttons, self.note],
         ])
 
     @objc.python_method
@@ -231,16 +266,9 @@ class PreferencesController(NSObject):
 
     @objc.python_method
     def _model_message(self):
-        transcriber = self.delegate.transcriber
-        message = ("Speech model ready." if transcriber.is_ready() else
-                   "Speech model unavailable — check your connection, then retry." if transcriber.load_error else
-                   "Preparing the speech model; the first launch downloads it…")
-        qwen = getattr(self.delegate, "qwen", None)
-        if qwen is not None and getattr(self.delegate.config, "high_accuracy", False):
-            message += (" High-accuracy model ready." if qwen.is_ready() else
-                        " High-accuracy model could not be loaded; using the standard model."
-                        if qwen.load_error is not None and not qwen.is_loading() else
-                        " Loading the high-accuracy model…")
+        message = self.delegate.transcriber.status_message() + "."
+        if self.delegate.config.high_accuracy:
+            message += " " + self.delegate.qwen.status_message().rstrip("…") + "."
         return message
 
     @objc.python_method
@@ -251,18 +279,14 @@ class PreferencesController(NSObject):
         self.model_status.setStringValue_(self._model_message())
         self.model_retry.setHidden_(self.delegate.transcriber.load_error is None)
 
-        seconds = getattr(config, "keep_mic_ready_seconds", 0)
-        choices = list(_KEEP_READY_CHOICES)
-        if seconds not in dict(choices):
-            choices.append((seconds, f"{seconds} seconds"))
-        self._keep_ready_values = [value for value, _ in choices]
+        # A hand-edited duration stays visible instead of snapping to a preset.
+        self._keep_ready_values = sorted({*_KEEP_READY_CHOICES, config.keep_mic_ready_seconds})
         self.keep_ready.removeAllItems()
-        self.keep_ready.addItemsWithTitles_([title for _, title in choices])
-        self.keep_ready.selectItemAtIndex_(self._keep_ready_values.index(seconds))
+        self.keep_ready.addItemsWithTitles_([duration_label(value) for value in self._keep_ready_values])
+        self.keep_ready.selectItemAtIndex_(self._keep_ready_values.index(config.keep_mic_ready_seconds))
 
-        selected_device = getattr(config, "input_device", None)
-        if selected_device in self.device_names:
-            self.device_picker.selectItemAtIndex_(self.device_names.index(selected_device))
+        if config.input_device in self.device_names:
+            self.device_picker.selectItemAtIndex_(self.device_names.index(config.input_device))
         self._sync_device_picker_enabled()
 
         selected = self.picker.indexOfSelectedItem()
@@ -270,21 +294,20 @@ class PreferencesController(NSObject):
         self.picker.removeAllItems()
         for rule in self.rules:
             # addItemWithTitle would merge rules whose titles collide.
-            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                f"{rule['heard']} → {rule['replacement']}", None, "",
-            )
-            self.picker.menu().addItem_(item)
+            self.picker.menu().addItem_(
+                NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(rule_title(rule), None, ""))
         if not self.rules:
             self.picker.addItemWithTitle_("No replacements yet")
         elif selected >= 0:
             self.picker.selectItemAtIndex_(min(selected, len(self.rules) - 1))
         self.picker.setEnabled_(bool(self.rules))
         self.remove.setEnabled_(bool(self.rules))
+        # The model status line can grow to two lines.
+        self._fit_window_to_page()
 
     @objc.python_method
     def _sync_device_picker_enabled(self):
-        self.device_picker.setEnabled_(not (getattr(self.delegate, "recording_active", False)
-                                           or getattr(self.delegate, "is_transcribing", False)))
+        self.device_picker.setEnabled_(not self.delegate.is_busy)
 
     @objc.python_method
     def show(self):
@@ -300,11 +323,17 @@ class PreferencesController(NSObject):
         index = self.tabs.selectedSegment()
         for page_index, page in enumerate(self.pages):
             page.setHidden_(page_index != index)
+        self._fit_window_to_page()
         if index == 1:
             self.refreshDevices_(None)
 
     def refreshDevices_(self, sender):
-        self.delegate._refresh_input_devices()
+        self.delegate.refresh_input_devices()
+
+    @objc.python_method
+    def shows_microphones(self):
+        """Whether the device list is on screen and worth refreshing."""
+        return self.panel.isVisible() and self.tabs.selectedSegment() == 1
 
     @objc.python_method
     def update_input_devices(self, devices, selected_name, automatic_name=None):
@@ -321,18 +350,18 @@ class PreferencesController(NSObject):
         self._sync_device_picker_enabled()
 
     def selectDevice_(self, sender):
-        self.delegate.handle_device_selected(self.device_names[self.device_picker.indexOfSelectedItem()])
+        self.delegate.select_input_device(self.device_names[self.device_picker.indexOfSelectedItem()])
 
     def selectKeepReady_(self, sender):
         del sender
         index = self.keep_ready.indexOfSelectedItem()
         if 0 <= index < len(self._keep_ready_values):
-            self.delegate.handle_keep_ready_selected(self._keep_ready_values[index])
+            self.delegate.set_keep_microphone_ready(self._keep_ready_values[index])
 
     def toggleSetting_(self, sender):
         for name, button in self.options.items():
             if button is sender:
-                self.delegate._on_setting_toggled(self.delegate._settings_items[name])
+                self.delegate.toggle_setting(name)
                 return
 
     def retryModel_(self, sender):
@@ -361,7 +390,8 @@ class PreferencesController(NSObject):
             "heard": str(self.heard.stringValue()), "replacement": str(self.replacement.stringValue()),
         }])
         if not candidate:
-            self.note.setStringValue_("Enter both phrases (up to 200 characters heard and 2,000 for the replacement).")
+            self.note.setStringValue_(f"Enter both phrases (up to {MAX_HEARD_CHARS} characters heard and "
+                                      f"{MAX_REPLACEMENT_CHARS:,} for the replacement).")
             return
         rule = candidate[0]
         replaced = {rule["heard"].casefold()}
@@ -371,9 +401,8 @@ class PreferencesController(NSObject):
         if len(rules) >= MAX_RULES:
             self.note.setStringValue_(f"Up to {MAX_RULES} replacements are supported. Remove one to add another.")
             return
-        self.delegate.config.replacements = rules + [rule]
         self._editing_heard = rule["heard"]
-        saved = self.delegate._save_settings()
+        saved = self.delegate.replace_word_rules(rules + [rule])
         self.refresh()
         self.picker.selectItemAtIndex_(len(self.rules) - 1)
         self.note.setStringValue_("Replacement saved." if saved else
@@ -383,8 +412,7 @@ class PreferencesController(NSObject):
         del sender
         index = self.picker.indexOfSelectedItem()
         if 0 <= index < len(self.rules):
-            self.delegate.config.replacements = [r for i, r in enumerate(self.rules) if i != index]
-            saved = self.delegate._save_settings()
+            saved = self.delegate.replace_word_rules([r for i, r in enumerate(self.rules) if i != index])
             self.refresh()
             self.newRule_(None)
             self.note.setStringValue_("Replacement removed." if saved else "Could not save this change to disk.")

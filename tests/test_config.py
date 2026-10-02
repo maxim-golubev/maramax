@@ -28,11 +28,25 @@ def test_save_load_round_trip(tmp_path):
     assert loaded.history_limit == 50
 
 
-def test_corrupt_file_falls_back_to_defaults(tmp_path):
+def test_corrupt_file_falls_back_to_defaults_and_is_kept_aside(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text("{not json", encoding="utf-8")
     config = AppConfig.load(path)
     assert config.auto_start_recording is True
+    # The next save must not destroy the only copy of the user's word list.
+    config.save(path)
+    assert (tmp_path / "settings.json.corrupt").read_text() == "{not json"
+
+
+def test_settings_from_a_newer_version_survive_a_save(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"high_accuracy": True, "push_to_talk": True}), encoding="utf-8")
+    config = AppConfig.load(path)
+    config.compact_dictation = False
+    config.save(path)
+    saved = json.loads(path.read_text())
+    assert saved["push_to_talk"] is True and saved["high_accuracy"] is True
+    assert saved["compact_dictation"] is False
 
 
 def test_wrong_types_ignored(tmp_path):

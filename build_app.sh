@@ -111,4 +111,10 @@ codesign --force --sign - "$ROOT_DIR/dist/Maramax.app"
 
 # Exercise the installed dependencies and native view without starting the app,
 # opening a microphone, registering shortcuts, or loading model weights.
-python "$ROOT_DIR/packaging/check_bundle.py" --bundle "$ROOT_DIR/dist/Maramax.app"
+# A bundle that fails is moved aside, so nothing can install or release it.
+if ! python "$ROOT_DIR/packaging/check_bundle.py" --bundle "$ROOT_DIR/dist/Maramax.app"; then
+  rm -rf "$ROOT_DIR/dist/Maramax.app.failed-check"
+  mv "$ROOT_DIR/dist/Maramax.app" "$ROOT_DIR/dist/Maramax.app.failed-check"
+  echo "ERROR: bundle check failed; the bundle is at dist/Maramax.app.failed-check" >&2
+  exit 1
+fi

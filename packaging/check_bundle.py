@@ -39,8 +39,8 @@ def check(args: argparse.Namespace) -> dict:
 
     started = time.perf_counter()
     modules = [
-        "parakeet_dictation.app", "parakeet_dictation.recorder",
-        "parakeet_dictation.recordings_window", "mlx.core", "parakeet_mlx",
+        "parakeet_dictation.app", "parakeet_dictation.recorder", "parakeet_dictation.audio_worker",
+        "parakeet_dictation.recordings_window", "mlx.core", "parakeet_mlx", "parakeet_mlx.alignment",
         "parakeet_dictation.preferences", "parakeet_dictation.instance",
         "qwen3_asr_mlx", "pyaudio", "soundfile", "scipy", "numpy",
         "tokenizers", "huggingface_hub", "httpx", "certifi", "AppKit",
@@ -68,6 +68,19 @@ def check(args: argparse.Namespace) -> dict:
     from parakeet_dictation.recordings_window import RecordingsController
     from parakeet_dictation.overlay import OverlayController
     from parakeet_dictation.app import _SETTING_LABELS
+    from parakeet_dictation.recordings import RecordingStatus
+
+    # The spectrogram front end pulls in a filter-bank dependency that no
+    # import above touches; build one and run audio through it. No model.
+    import mlx.core as mx
+    from parakeet_mlx.audio import PreprocessArgs, get_logmel
+
+    front_end = PreprocessArgs(sample_rate=16000, normalize="per_feature", window_size=0.025,
+                               window_stride=0.01, window="hann", features=128, n_fft=512, dither=1e-5)
+    mel = get_logmel(mx.random.normal((16000,)), front_end)
+    mx.eval(mel)
+    if mel.shape[-1] != 128:
+        raise RuntimeError(f"Spectrogram front end produced shape {mel.shape}, expected 128 features")
 
     NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyProhibited)
     # Creating the native view does not order it onto the screen.
@@ -78,21 +91,24 @@ def check(args: argparse.Namespace) -> dict:
 
     with tempfile.TemporaryDirectory(prefix="maramax-bundle-check-") as directory:
         store = RecordingStore(Path(directory))
-        delegate = SimpleNamespace(config=AppConfig(), recording_active=False, is_transcribing=False,
-                                   transcriber=SimpleNamespace(is_ready=lambda: True, load_error=None))
+        delegate = SimpleNamespace(
+            config=AppConfig(), is_busy=False,
+            transcriber=SimpleNamespace(load_error=None, status_message=lambda: "Speech model ready"),
+            qwen=SimpleNamespace(status_message=lambda: "High-accuracy model ready"),
+        )
         preferences = PreferencesController.alloc().initWithDelegate_labels_(delegate, _SETTING_LABELS)
         recordings = RecordingsController.alloc().initWithDelegate_store_(delegate, store)
-        overlay = OverlayController.alloc().initWithDelegate_config_(delegate, delegate.config)
+        overlay = OverlayController.alloc().initWithDelegate_(delegate)
         for controller in (preferences, recordings, overlay):
             assert not controller.panel.isVisible()
         assert recordings.sound is None
         pcm = b"\x01\x00" * 16000
         recording = store.save(pcm, {"validation": True})
         assert store.load_pcm(recording.id) == pcm
-        store.update(recording.id, status="failed", message="Synthetic validation", raw_text="Original")
+        store.update(recording.id, status=RecordingStatus.FAILED, message="Synthetic validation", raw_text="Original")
         recordings.refresh()
         assert recordings.records[0].raw_text == "Original"
-        assert store.list_recordings()[0].status == "failed"
+        assert store.list_recordings()[0].status == RecordingStatus.FAILED
         store.clear()
         assert not store.list_recordings()
 
@@ -101,15 +117,15 @@ def check(args: argparse.Namespace) -> dict:
         "python": sys.version.split()[0],
         "imports": origins,
         "component_check_seconds": round(time.perf_counter() - started, 3),
-        "checks": ["isolated bundled imports", "TLS certificates", "hidden passive panel",
+        "checks": ["isolated bundled imports", "TLS certificates", "spectrogram front end", "hidden passive panel",
                    "hidden settings, transcript, and recovery windows",
                    "audio archive round trip and deletion"],
         "microphone_opened": False,
         "audio_played": False,
     }
     if args.audio:
+        from parakeet_dictation.audio_format import seconds as audio_seconds
         from parakeet_dictation.transcription import ParakeetTranscriber, normalize_media
-        import mlx.core as mx
         import wave
 
         started = time.perf_counter()
@@ -118,13 +134,13 @@ def check(args: argparse.Namespace) -> dict:
         load_seconds = time.perf_counter() - started
         normalized = normalize_media(args.audio)
         try:
+            # normalize_media produces the app's own PCM format.
             with wave.open(normalized, "rb") as audio:
-                channels, width, rate = audio.getnchannels(), audio.getsampwidth(), audio.getframerate()
                 pcm = audio.readframes(audio.getnframes())
             results = []
             for _ in range(args.repeats):
                 started = time.perf_counter()
-                text = transcriber.transcribe_pcm(pcm, channels, width, rate)
+                text = transcriber.transcribe_pcm(pcm)
                 results.append({
                     "seconds": round(time.perf_counter() - started, 3), "text": text,
                     "mlx_active_bytes": mx.get_active_memory(),
@@ -135,7 +151,7 @@ def check(args: argparse.Namespace) -> dict:
             durations = [result["seconds"] for result in results]
             report["recognition"] = {
                 "model": transcriber.model_id,
-                "audio_seconds": len(pcm) / (channels * width * rate),
+                "audio_seconds": audio_seconds(pcm),
                 "load_and_warm_seconds": round(load_seconds, 3),
                 "runs": results,
                 "median_seconds": statistics.median(durations),

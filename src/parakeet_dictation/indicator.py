@@ -1,25 +1,48 @@
-"""A passive dictation bar. Showing it never activates Maramax."""
+"""The compact dictation bar, which never takes focus from the app being typed in."""
 
 from __future__ import annotations
+
+from enum import StrEnum
 
 import objc
 import warnings
 from AppKit import (
     NSBackingStoreBuffered, NSBezierPath, NSButton, NSColor, NSFont, NSFontWeightSemibold,
-    NSLineCapStyleRound, NSMakeRect, NSPanel, NSScreen, NSStatusWindowLevel, NSTextField, NSView,
+    NSLineBreakByTruncatingTail, NSLineCapStyleRound, NSMakeRect, NSPanel, NSScreen, NSStatusWindowLevel, NSTextField, NSView,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSWindowStyleMaskBorderless, NSWindowStyleMaskNonactivatingPanel,
 )
 from Foundation import NSObject
-from PyObjCTools import AppHelper
 
-WIDTH = 380
+from .hotkeys import DICTATE, STOP
+from .main_thread import call_later
+
+WIDTH = 440
 HEIGHT = 64
 MARGIN = 18
 BUTTON = 30
 BUTTON_GAP = 8
 METER_BARS = 7
+FINISHED_HINT = "Open Maramax for the transcript and recordings"
+
+
+def split_status(message: str) -> tuple[str, str]:
+    """A finished bar has two lines and no meter: put the outcome on the
+    first and the explanation on the second, so a long status is read in
+    full instead of being cut off."""
+    cuts = [(message.index(separator), separator) for separator in (" — ", ": ") if separator in message]
+    if not cuts:
+        return message, FINISHED_HINT
+    at, separator = min(cuts)  # Whichever comes first ends the outcome.
+    tail = message[at + len(separator):]
+    return (message[:at], tail[0].upper() + tail[1:]) if tail else (message, FINISHED_HINT)
+
+
+class Glyph(StrEnum):
+    STOP = "stop"
+    CLOSE = "close"
+    EXPAND = "expand"
 
 
 class PassivePanel(NSPanel):
@@ -56,7 +79,7 @@ class RoundIconButton(NSButton):
     def initWithFrame_(self, frame):
         self = objc.super(RoundIconButton, self).initWithFrame_(frame)
         if self is not None:
-            self.kind = "stop"
+            self.kind = Glyph.STOP
             self.setBordered_(False)
             self.setTitle_("")
         return self
@@ -76,7 +99,7 @@ class RoundIconButton(NSButton):
         y = bounds.origin.y + (bounds.size.height - side) / 2
         cx, cy = x + side / 2, y + side / 2
         pressed = bool(self.cell().isHighlighted())
-        stop = self.kind == "stop"
+        stop = self.kind is Glyph.STOP
         fill = NSColor.systemRedColor() if stop else NSColor.labelColor().colorWithAlphaComponent_(0.10)
         if pressed:
             fill = fill.blendedColorWithFraction_ofColor_(0.25, NSColor.blackColor()) or fill
@@ -87,7 +110,7 @@ class RoundIconButton(NSButton):
 
         ink = NSColor.whiteColor() if stop else NSColor.labelColor()
         if stop:
-            half = side * 0.17
+            half = round(side * 0.17)  # Whole points: crisp edges, equal margins.
             ink.setFill()
             NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
                 NSMakeRect(cx - half, cy - half, half * 2, half * 2), 2, 2,
@@ -98,13 +121,16 @@ class RoundIconButton(NSButton):
         path.setLineWidth_(1.8)
         path.setLineCapStyle_(NSLineCapStyleRound)
         reach = side * 0.16
-        if self.kind == "close":
+        if self.kind is Glyph.CLOSE:
             path.moveToPoint_((cx - reach, cy - reach))
             path.lineToPoint_((cx + reach, cy + reach))
             path.moveToPoint_((cx - reach, cy + reach))
             path.lineToPoint_((cx + reach, cy - reach))
-        else:  # "expand": an arrow to the upper right
+        else:  # Glyph.EXPAND: an arrow to the upper right
             up = -reach if self.isFlipped() else reach  # Controls draw with y pointing down.
+            # The arrowhead puts more ink in the upper right, so the shape is
+            # nudged the other way to sit centred to the eye, not the box.
+            cx, cy = cx - reach * 0.22, cy - up * 0.22
             path.moveToPoint_((cx - reach, cy - up))
             path.lineToPoint_((cx + reach, cy + up))
             path.moveToPoint_((cx - reach * 0.35, cy + up))
@@ -179,7 +205,7 @@ class DictationIndicator(NSObject):
         button_y = (HEIGHT - BUTTON) / 2
         self.stop_button = self._button(NSMakeRect(stop_x, button_y, BUTTON, BUTTON), "stop:")
         self.expand_button = self._button(NSMakeRect(expand_x, button_y, BUTTON, BUTTON), "expand:")
-        self.expand_button.set_kind("expand", "Open transcript and controls")
+        self.expand_button.set_kind(Glyph.EXPAND, "Open transcript and controls")
         self._text_right = stop_x - 12
         self._text_left_with_meter = MARGIN + meter_width + 12
         self.title = self._label(13, NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold))
@@ -199,7 +225,7 @@ class DictationIndicator(NSObject):
         label.setBezeled_(False)
         label.setDrawsBackground_(False)
         label.setFont_(font)
-        label.setLineBreakMode_(4)  # truncate tail; tooltip keeps the full message
+        label.setLineBreakMode_(NSLineBreakByTruncatingTail)  # The tooltip keeps the full message.
         return label
 
     @objc.python_method
@@ -223,12 +249,12 @@ class DictationIndicator(NSObject):
     def show(self):
         self._token += 1
         self._finished = False
-        self.stop_button.set_kind("stop", "Finish dictation (Option+Space or Cmd+R)")
+        self.stop_button.set_kind(Glyph.STOP, f"Finish dictation ({DICTATE.label} or {STOP.label})")
         self.stop_button.setEnabled_(True)
         self.meter.reset()
         self._layout_text(True)
         self.set_status("Connecting microphone…")
-        self.detail.setStringValue_("Option+Space or Cmd+R to finish")
+        self.detail.setStringValue_(f"{DICTATE.label} or {STOP.label} to finish")
         screen = NSScreen.mainScreen()
         if screen is not None:
             visible = screen.visibleFrame()
@@ -256,17 +282,26 @@ class DictationIndicator(NSObject):
         self.set_status("Transcribing…")
         self.detail.setStringValue_("Your audio is saved")
         self._layout_text(False)
-        self.stop_button.set_kind("close", "Cancel transcription; captured audio is retained")
+        self.stop_button.set_kind(Glyph.CLOSE, "Cancel transcription; captured audio is retained")
 
     @objc.python_method
-    def finish(self, message, duration=8):
+    def is_finished(self):
+        return self._finished and self.panel.isVisible()
+
+    @objc.python_method
+    def finish(self, message, duration):
+        """Show the outcome, then hide after `duration`. Calling it again
+        with a later status restarts the countdown for that status."""
         self._finished = True
-        self.set_status(message)
-        self.detail.setStringValue_("Open Maramax for transcript and recordings")
+        self._token += 1
+        title, detail = split_status(message)
+        self.title.setStringValue_(title)
+        self.title.setToolTip_(message)
+        self.detail.setStringValue_(detail)
+        self.detail.setToolTip_(message)
         self._layout_text(False)
-        self.stop_button.set_kind("close", "Dismiss")
-        token = self._token
-        AppHelper.callLater(duration, self._hide_if_current, token)
+        self.stop_button.set_kind(Glyph.CLOSE, "Dismiss")
+        call_later(duration, self._hide_if_current, self._token)
 
     @objc.python_method
     def _hide_if_current(self, token):
@@ -283,8 +318,8 @@ class DictationIndicator(NSObject):
         if self._finished:
             self.hide()
         else:
-            self.delegate.hide_overlay()
+            self.delegate.dismiss_requested()
 
     def expand_(self, sender):
         del sender
-        self.delegate.show_overlay()
+        self.delegate.open_transcript_window()

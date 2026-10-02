@@ -2,18 +2,33 @@
 
 from __future__ import annotations
 
+import enum
+from dataclasses import dataclass
 from pathlib import Path
 
 from .clipboard import ClipboardError, copy_text
-from .queue import OutputConfig, OutputMode, QueueItem
+from .file_queue import QueuedFile, QueueStatus
+
+
+class OutputMode(enum.Enum):
+    CLIPBOARD = "clipboard"
+    INDIVIDUAL_SAME_DIR = "individual_same_dir"
+    INDIVIDUAL_CHOSEN_DIR = "individual_chosen_dir"
+    SINGLE_FILE = "single_file"
+
+
+@dataclass
+class OutputConfig:
+    mode: OutputMode
+    output_path: str | None = None
 
 
 class ExportError(RuntimeError):
     pass
 
 
-def export_results(items: list[QueueItem], config: OutputConfig) -> str:
-    completed = [i for i in items if i.status == "done" and i.result_text]
+def export_results(items: list[QueuedFile], config: OutputConfig) -> str:
+    completed = [i for i in items if i.status == QueueStatus.DONE and i.result_text]
     if not completed:
         raise ExportError("No completed transcriptions to export")
 
@@ -40,7 +55,7 @@ def export_results(items: list[QueueItem], config: OutputConfig) -> str:
         raise ExportError(f"Export failed: {exc}") from exc
 
 
-def _export_clipboard(items: list[QueueItem]) -> str:
+def _export_clipboard(items: list[QueuedFile]) -> str:
     if len(items) == 1:
         text = items[0].result_text
     else:
@@ -56,7 +71,7 @@ def _export_clipboard(items: list[QueueItem]) -> str:
     return f"Copied {count} transcript{'s' if count != 1 else ''} to clipboard"
 
 
-def _export_individual(items: list[QueueItem], target_dir: str | None) -> str:
+def _export_individual(items: list[QueuedFile], target_dir: str | None) -> str:
     written = 0
 
     for item in items:
@@ -81,7 +96,7 @@ def _export_individual(items: list[QueueItem], target_dir: str | None) -> str:
     return f"Saved {written} file{'s' if written != 1 else ''} to {dir_label}"
 
 
-def _export_single_file(items: list[QueueItem], output_path: str) -> str:
+def _export_single_file(items: list[QueuedFile], output_path: str) -> str:
     if len(items) == 1:
         text = items[0].result_text
     else:

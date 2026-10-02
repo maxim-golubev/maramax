@@ -1,4 +1,4 @@
-"""A process-scoped lock prevents two copies sharing hotkeys and recovery files."""
+"""The lock that keeps a second copy of the app from starting."""
 
 from __future__ import annotations
 

@@ -1,9 +1,10 @@
-"""Parakeet and Qwen speech recognizers on MLX, plus WAV and FFmpeg helpers."""
+"""Speech recognition: audio in, text out, with the Parakeet or the Qwen engine."""
 
 from __future__ import annotations
 
 import gc
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -16,23 +17,25 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 from parakeet_mlx import from_pretrained
+from parakeet_mlx.alignment import (
+    merge_longest_common_subsequence,
+    merge_longest_contiguous,
+    sentences_to_result,
+    tokens_to_sentences,
+)
 from parakeet_mlx.audio import get_logmel
+from parakeet_mlx.parakeet import DecodingConfig
 from huggingface_hub import try_to_load_from_cache
 
-from .logger_config import setup_logging
-
-logger = setup_logging()
+from .audio_format import FULL_SCALE, SAMPLE_RATE, SAMPLE_WIDTH, whole_samples
+from .logger_config import logger
+from .paths import RUNTIME_BIN_CANDIDATES
 
 FFMPEG_TIMEOUT_SECONDS = 120
 CHUNK_SECONDS = 120.0
 OVERLAP_SECONDS = 15.0
-FFMPEG_CANDIDATES = (
-    "ffmpeg",
-    "/opt/homebrew/bin/ffmpeg",
-    "/usr/local/bin/ffmpeg",
-    "/usr/bin/ffmpeg",
-)
-
+# How long a draft stream may take to let go of the encoder once told to stop.
+DRAFT_RELEASE_SECONDS = 30.0
 
 class TranscriptionError(RuntimeError):
     pass
@@ -50,17 +53,29 @@ def cached_model_source(model_id: str) -> str:
             if config_path.is_file() and weights_path.is_file() and config_path.parent == weights_path.parent:
                 return str(config_path.parent)
     except (OSError, ValueError):
-        pass
+        pass  # An unreadable cache is the same as no cache: load by id.
     return model_id
 
 
+def _samples(pcm_bytes: bytes) -> np.ndarray:
+    return np.frombuffer(whole_samples(pcm_bytes), dtype=np.int16)
+
+
 class ParakeetTranscriber:
+    """The standard engine. One encoder serves both the offline pass and the
+    draft stream, and the stream switches it into a mode in which the offline
+    pass produces garbage, so this class owns the stream and refuses an
+    offline pass until the stream has let go."""
+
     def __init__(self, model_id: str = "mlx-community/parakeet-tdt-0.6b-v2"):
         self.model_id = model_id
         self.model = None
         self.load_error: Exception | None = None
         self.ready_event = threading.Event()
         self._load_lock = threading.Lock()
+        self._drafts: threading.Thread | None = None
+        self._drafts_stop = threading.Event()
+        self._drafts_wedged = False
         self._loader = threading.Thread(target=self._load_model, daemon=True)
         self._loader.start()
 
@@ -88,8 +103,7 @@ class ParakeetTranscriber:
             self.ready_event.set()
 
     def _warm_model(self) -> None:
-        assert self.model is not None
-        self._transcribe_samples(np.zeros(int(0.3 * 16000), dtype=np.int16))
+        self._transcribe_samples(np.zeros(int(0.3 * SAMPLE_RATE), dtype=np.int16))
 
     def wait_until_ready(self) -> None:
         self.ready_event.wait()
@@ -101,40 +115,22 @@ class ParakeetTranscriber:
     def is_ready(self) -> bool:
         return self.ready_event.is_set() and self.model is not None and self.load_error is None
 
-    def transcribe_pcm(
-        self,
-        pcm_bytes: bytes,
-        channels: int,
-        sample_width: int,
-        rate: int,
-        progress_callback: Callable | None = None,
-    ) -> str:
+    def status_message(self) -> str:
+        if self.is_ready():
+            return "Speech model ready"
+        if self.load_error is not None:
+            return "Speech model unavailable — check your connection, then retry"
+        return "Preparing the speech model — the first launch downloads it"
+
+    # -- Offline pass --
+
+    def transcribe_pcm(self, pcm_bytes: bytes, progress_callback: Callable | None = None) -> str:
+        """Recognize a capture in the app's PCM format, entirely in memory."""
         if not pcm_bytes:
             return ""
-
         self.wait_until_ready()
-        assert self.model is not None
-        config = self.model.preprocessor_config
-        if (sample_width == 2 and rate == config.sample_rate
-                and len(pcm_bytes) <= CHUNK_SECONDS * rate * channels * 2):
-            # A dictation that fits one chunk goes straight from memory to the
-            # model: no temporary file and no FFmpeg process. The result is
-            # identical to the file path, which longer captures still take
-            # for the library's chunk merging.
-            samples = np.frombuffer(pcm_bytes, dtype=np.int16)
-            if channels > 1:
-                samples = samples.reshape(-1, channels).mean(axis=1).astype(np.int16)
-            if progress_callback is not None:
-                progress_callback(len(samples), len(samples))
-            return self._transcribe_samples(samples)
-        temp_path = write_wav_file(pcm_bytes, channels=channels, sample_width=sample_width, rate=rate)
-        try:
-            return self._transcribe_path(temp_path, progress_callback=progress_callback)
-        finally:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
+        self._require_encoder()
+        return self._transcribe_samples(_samples(pcm_bytes), progress_callback)
 
     def transcribe_file(
         self,
@@ -142,38 +138,133 @@ class ParakeetTranscriber:
         progress_callback: Callable | None = None,
     ) -> str:
         self.wait_until_ready()
+        self._require_encoder()
         normalized_path = normalize_media(file_path)
         try:
-            return self._transcribe_path(normalized_path, progress_callback=progress_callback)
+            with wave.open(normalized_path, "rb") as audio:
+                pcm_bytes = audio.readframes(audio.getnframes())
         finally:
-            try:
-                os.unlink(normalized_path)
-            except OSError:
-                pass
+            Path(normalized_path).unlink(missing_ok=True)
+        return self._transcribe_samples(_samples(pcm_bytes), progress_callback)
 
-    def stream_drafts(
-        self,
-        frames_provider: Callable[[], list[bytes]],
-        stop_event: threading.Event,
-        on_draft: Callable[[str], None],
-        rate: int = 16000,
-    ) -> None:
-        """Feed PCM chunks from an in-progress recording into streaming
-        inference, emitting draft text after each ~1s of new audio.
+    def _require_encoder(self) -> None:
+        if not self.finish_drafts():
+            raise TranscriptionError("Transcription engine stalled — restart the app")
 
-        Drafts use local attention with limited context, so they are less
-        accurate than the offline pass — callers must replace them with the
-        final transcribe_pcm result. Must not run concurrently with other
-        inference: the stream switches the shared encoder's attention mode
-        until it finishes.
-        """
-        self.wait_until_ready()
+    def _transcribe_samples(self, samples: np.ndarray, progress_callback: Callable | None = None) -> str:
         assert self.model is not None
-        min_chunk_bytes = rate * 2  # ~1s of 16-bit mono PCM
-        consumed = 0
+        config = self.model.preprocessor_config
+        # Empty audio crashes the encoder with a Metal allocation error, and
+        # less than one analysis hop cannot form a spectrogram frame.
+        if len(samples) < config.hop_length:
+            return ""
+        result = None
         try:
+            audio = mx.array(samples).astype(mx.float32) / FULL_SCALE
+            chunk = int(CHUNK_SECONDS * config.sample_rate)
+            if len(audio) <= chunk:
+                if progress_callback is not None:
+                    progress_callback(len(audio), len(audio))
+                result = self._recognize(audio)
+            else:
+                result = self._recognize_in_chunks(audio, chunk, progress_callback)
+            return (result.text or "").strip()
+        finally:
+            # Cancellation and inference errors need cleanup too, otherwise
+            # repeated failed sessions can retain Metal's cached allocations.
+            del result
+            gc.collect()
+            mx.clear_cache()
+
+    def _recognize(self, audio: mx.array):
+        assert self.model is not None
+        config = self.model.preprocessor_config
+        # The library's spectrogram sizes its frames by the FFT length but
+        # counts them by the shorter window, so the last frame can read up
+        # to 112 samples past the end of the buffer. Those samples are
+        # multiplied by zero, which is harmless only while that memory holds
+        # finite numbers. Zeros appended up to the last frame's end keep the
+        # read inside the buffer without adding a frame.
+        frames = (len(audio) + config.n_fft - config.win_length + config.hop_length) // config.hop_length
+        overread = (frames - 1) * config.hop_length - len(audio)
+        if overread > 0:
+            audio = mx.pad(audio, [(0, overread)])
+        return self.model.generate(get_logmel(audio, config))[0]
+
+    def _recognize_in_chunks(self, audio: mx.array, chunk: int, progress_callback: Callable | None):
+        """Overlapping chunks merged on their shared words: the procedure of
+        parakeet_mlx's own transcribe() (0.5.x), run on samples already in
+        memory so a long dictation needs neither a file nor FFmpeg."""
+        assert self.model is not None
+        config = self.model.preprocessor_config
+        overlap = int(OVERLAP_SECONDS * config.sample_rate)
+        tokens: list = []
+        for start in range(0, len(audio), chunk - overlap):
+            end = min(start + chunk, len(audio))
+            if progress_callback is not None:
+                progress_callback(end, len(audio))
+            if end - start < config.hop_length:
+                break
+            piece = self._recognize(audio[start:end])
+            offset = start / config.sample_rate
+            for sentence in piece.sentences:
+                for token in sentence.tokens:
+                    token.start += offset
+                    token.end = token.start + token.duration
+            if not tokens:
+                tokens = piece.tokens
+                continue
+            try:
+                tokens = merge_longest_contiguous(tokens, piece.tokens, overlap_duration=OVERLAP_SECONDS)
+            except RuntimeError:
+                # No run of matching words in the overlap; fall back to the
+                # looser alignment, as the library does.
+                tokens = merge_longest_common_subsequence(tokens, piece.tokens, overlap_duration=OVERLAP_SECONDS)
+        return sentences_to_result(tokens_to_sentences(tokens, DecodingConfig().sentence))
+
+    # -- Draft stream --
+
+    def start_drafts(self, frames_provider: Callable[[], list[bytes]], on_draft: Callable[[str], None]) -> bool:
+        """Emit draft text while a recording is in progress, about once per
+        second of new audio. Drafts use limited context and are less accurate
+        than the offline pass, which must replace them. False when an earlier
+        stream never let go of the encoder: a second one must not start."""
+        if self._drafts is not None and self._drafts.is_alive():
+            logger.warning("Previous draft stream still running; no drafts for this recording")
+            return False
+        stop = self._drafts_stop = threading.Event()
+        self._drafts = threading.Thread(target=self._stream_drafts, args=(frames_provider, stop, on_draft), daemon=True)
+        self._drafts.start()
+        return True
+
+    def finish_drafts(self) -> bool:
+        """Stop the draft stream. True once the encoder is free for the
+        offline pass; False if the stream is wedged and still holds it."""
+        thread = self._drafts
+        if thread is None:
+            return True
+        self._drafts_stop.set()
+        # The full wait is paid once; a stream already known to be wedged is
+        # only looked at again, not waited for (a queue asks once per file).
+        thread.join(timeout=0 if self._drafts_wedged else DRAFT_RELEASE_SECONDS)
+        if thread.is_alive():
+            if not self._drafts_wedged:
+                logger.error("Draft stream wedged; the standard engine cannot run an offline pass")
+            self._drafts_wedged = True
+            return False
+        self._drafts = None
+        self._drafts_wedged = False
+        return True
+
+    def _stream_drafts(self, frames_provider: Callable[[], list[bytes]], stop: threading.Event,
+                       on_draft: Callable[[str], None]) -> None:
+        try:
+            self.wait_until_ready()
+            assert self.model is not None
+            min_chunk_bytes = SAMPLE_RATE * SAMPLE_WIDTH  # ~1 s
+            consumed = 0
             with self.model.transcribe_stream(context_size=(256, 256)) as stream:
-                while not stop_event.is_set():
+                while not stop.is_set():
                     frames = frames_provider()
                     available = len(frames)
                     pending = b"".join(frames[consumed:available])
@@ -181,61 +272,17 @@ class ParakeetTranscriber:
                         time.sleep(0.05)
                         continue
                     consumed = available
-                    samples = np.frombuffer(pending, dtype=np.int16).astype(np.float32) / 32768.0
-                    stream.add_audio(mx.array(samples))
+                    stream.add_audio(mx.array(_samples(pending).astype(np.float32) / FULL_SCALE))
                     text = (stream.result.text or "").strip()
                     if text:
                         on_draft(text)
+        except Exception as exc:
+            # Drafts are a convenience; the offline pass still runs.
+            logger.warning(f"Live preview unavailable: {exc}")
         finally:
             gc.collect()
             mx.clear_cache()
 
-    def _transcribe_samples(self, samples: np.ndarray) -> str:
-        assert self.model is not None
-        config = self.model.preprocessor_config
-        # Shorter than one analysis hop cannot form a spectrogram frame.
-        if len(samples) < config.hop_length:
-            return ""
-        result = None
-        try:
-            audio = mx.array(samples).astype(mx.float32) / 32768.0
-            result = self.model.generate(get_logmel(audio, config))[0]
-            return (getattr(result, "text", "") or "").strip()
-        finally:
-            del result
-            gc.collect()
-            mx.clear_cache()
-
-    def _transcribe_path(
-        self,
-        file_path: str | Path,
-        progress_callback: Callable | None = None,
-    ) -> str:
-        assert self.model is not None
-        # Zero-length audio (e.g. a corrupt or silent media file) crashes the
-        # encoder with a Metal allocation error — treat it as "no speech".
-        try:
-            with wave.open(str(file_path), "rb") as wav_file:
-                if wav_file.getnframes() == 0:
-                    return ""
-        except (wave.Error, OSError):
-            pass
-
-        kwargs: dict = {}
-        kwargs["chunk_duration"] = CHUNK_SECONDS
-        kwargs["overlap_duration"] = OVERLAP_SECONDS
-        if progress_callback is not None:
-            kwargs["chunk_callback"] = progress_callback
-        result = None
-        try:
-            result = self.model.transcribe(str(file_path), **kwargs)
-            return (getattr(result, "text", "") or "").strip()
-        finally:
-            # Cancellation and inference errors need cleanup too, otherwise
-            # repeated failed sessions can retain Metal's cached allocations.
-            del result
-            gc.collect()
-            mx.clear_cache()
 
 class QwenTranscriber:
     """High-accuracy offline transcriber (Qwen3-ASR 1.7B via MLX).
@@ -299,10 +346,7 @@ class QwenTranscriber:
                     self._on_loaded()
         except Exception as exc:
             if model is not None:
-                try:
-                    model.close()
-                except Exception:
-                    pass
+                self._close(model)
             gc.collect()
             mx.clear_cache()
             self.load_error = exc
@@ -313,11 +357,27 @@ class QwenTranscriber:
             with self._load_lock:
                 self._loading = False
 
+    @staticmethod
+    def _close(model) -> None:
+        try:
+            model.close()
+        except Exception as exc:
+            # The weights are reclaimed by the collector either way; a failed
+            # close must not stop the caller from releasing the rest.
+            logger.warning(f"High-accuracy model did not close cleanly: {exc}")
+
     def is_ready(self) -> bool:
         return self.model is not None
 
     def is_loading(self) -> bool:
         return self._loading
+
+    def status_message(self) -> str:
+        if self.is_ready():
+            return "High-accuracy model ready"
+        if self.load_error is not None and not self._loading:
+            return "High-accuracy model could not be loaded — using the standard model"
+        return "Loading the high-accuracy model…"
 
     def _acquire_model(self):
         """Take an in-use reference so unload() can't close the model out
@@ -337,10 +397,7 @@ class QwenTranscriber:
                 close_target = self._deferred_close
                 self._deferred_close = None
         if close_target is not None:
-            try:
-                close_target.close()
-            except Exception:
-                pass
+            self._close(close_target)
             gc.collect()
             mx.clear_cache()
 
@@ -360,32 +417,40 @@ class QwenTranscriber:
                 else:
                     close_target = model
         if close_target is not None:
-            try:
-                close_target.close()
-            except Exception:
-                pass
+            self._close(close_target)
         gc.collect()
         mx.clear_cache()
 
-    def transcribe_pcm(self, pcm_bytes: bytes, channels: int, sample_width: int, rate: int,
-                       context: str | None = None) -> str:
-        """`context` is free text the model reads before listening, used to
-        pass the spellings of names and jargon the user cares about."""
+    @staticmethod
+    def _without_echo(text: str, context: str | None) -> str:
+        """Given audio with no speech in it, the model tends to answer with
+        the context it was handed. That is not a transcript: report no text
+        so the caller's fallback decides."""
+        if not context or not text:
+            return text
+
+        def squash(value: str) -> str:
+            return re.sub(r"[\W_]+", "", value.casefold())
+
+        heard = squash(text)
+        # The whole context, or just what follows its label ("Vocabulary: …").
+        echoes = [squash(context), squash(context.partition(":")[2])]
+        return "" if heard and any(e and (e.startswith(heard) or heard.startswith(e)) for e in echoes) else text
+
+    def transcribe_pcm(self, pcm_bytes: bytes, context: str | None = None) -> str:
+        """Recognize a capture in the app's PCM format. `context` is free
+        text the model reads before listening, used to pass the spellings of
+        names and jargon the user cares about."""
         if not pcm_bytes:
             return ""
-        if sample_width != 2 or rate != 16000:
-            raise TranscriptionError("High-accuracy model expects 16-bit 16kHz PCM")
 
         model = self._acquire_model()
         result = None
         samples = None
         try:
-            samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            if channels > 1:
-                samples = samples.reshape(-1, channels).mean(axis=1)
+            samples = _samples(pcm_bytes).astype(np.float32) / FULL_SCALE
             result = model.transcribe(samples, language="en", context=context)
-            text = (result.text or "").strip()
-            return text
+            return self._without_echo((result.text or "").strip(), context)
         finally:
             del result, samples
             self._release_model()
@@ -403,10 +468,9 @@ class QwenTranscriber:
                         if wav_file.getnframes() == 0:
                             return ""
                 except (wave.Error, OSError):
-                    pass
+                    pass  # Not inspectable as WAV: let the model report what it finds.
                 result = model.transcribe(normalized_path, language="en", context=context)
-                text = (result.text or "").strip()
-                return text
+                return self._without_echo((result.text or "").strip(), context)
             finally:
                 try:
                     os.unlink(normalized_path)
@@ -419,35 +483,15 @@ class QwenTranscriber:
             mx.clear_cache()
 
 
-def write_wav_file(frames: bytes, channels: int, sample_width: int, rate: int) -> str:
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-        temp_path = temp_file.name
-
-    try:
-        with wave.open(temp_path, "wb") as wav_file:
-            wav_file.setnchannels(channels)
-            wav_file.setsampwidth(sample_width)
-            wav_file.setframerate(rate)
-            wav_file.writeframes(frames)
-    except Exception:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-        raise
-
-    return temp_path
-
-
 def normalize_media(file_path: str | Path) -> str:
     file_path = Path(file_path)
     if not file_path.exists():
         raise TranscriptionError(f"Media file not found: {file_path}")
 
+    ffmpeg_path = resolve_ffmpeg()  # Before the temporary file: it raises when FFmpeg is absent.
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
         temp_path = temp_file.name
 
-    ffmpeg_path = resolve_ffmpeg()
     command = [
         ffmpeg_path,
         "-v",
@@ -458,7 +502,9 @@ def normalize_media(file_path: str | Path) -> str:
         "-ac",
         "1",
         "-ar",
-        "16000",
+        str(SAMPLE_RATE),
+        "-sample_fmt",
+        "s16",
         temp_path,
     ]
 
@@ -492,11 +538,12 @@ def normalize_media(file_path: str | Path) -> str:
 
 
 def resolve_ffmpeg() -> str:
-    for candidate in FFMPEG_CANDIDATES:
-        resolved = shutil.which(candidate) if os.path.sep not in candidate else candidate
-        if resolved and Path(resolved).exists():
-            return str(Path(resolved))
-
-    raise TranscriptionError(
-        "ffmpeg is required for media file transcription. Install it with `brew install ffmpeg`."
-    )
+    # The same directories the app adds to PATH at start-up, searched here as
+    # well so a conversion works even where PATH was never extended.
+    search = os.pathsep.join([os.environ.get("PATH", ""), *(c for c in RUNTIME_BIN_CANDIDATES if os.path.isabs(c))])
+    found = shutil.which("ffmpeg", path=search)
+    if found is None:
+        raise TranscriptionError(
+            "ffmpeg is required for media file transcription. Install it with `brew install ffmpeg`."
+        )
+    return found

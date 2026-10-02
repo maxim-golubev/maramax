@@ -55,6 +55,12 @@ class HotKeySpec:
     key_code: int
     modifiers: int
     identifier: int
+    label: str  # How the shortcut is named to the user.
+
+
+# The two shortcuts and their names live here and nowhere else.
+DICTATE = HotKeySpec(key_code=kVK_Space, modifiers=optionKey, identifier=1, label="Option+Space")
+STOP = HotKeySpec(key_code=kVK_ANSI_R, modifiers=cmdKey, identifier=2, label="Cmd+R")
 
 
 def _four_char_code(value: str) -> int:
@@ -63,21 +69,22 @@ def _four_char_code(value: str) -> int:
     return int.from_bytes(value.encode("ascii"), "big")
 
 
-class GlobalHotKeyManager:
-    _carbon = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Carbon.framework/Carbon")
-    _handler_proc = ctypes.CFUNCTYPE(OSStatus, EventHandlerCallRef, EventRef, ctypes.c_void_p)
+_HANDLER_PROC = ctypes.CFUNCTYPE(OSStatus, EventHandlerCallRef, EventRef, ctypes.c_void_p)
 
-    _carbon.GetApplicationEventTarget.restype = EventTargetRef
-    _carbon.InstallEventHandler.argtypes = [
+
+def _load_carbon():
+    carbon = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Carbon.framework/Carbon")
+    carbon.GetApplicationEventTarget.restype = EventTargetRef
+    carbon.InstallEventHandler.argtypes = [
         EventTargetRef,
-        _handler_proc,
+        _HANDLER_PROC,
         UInt64,
         ctypes.POINTER(EventTypeSpec),
         ctypes.c_void_p,
         ctypes.POINTER(EventHandlerRef),
     ]
-    _carbon.InstallEventHandler.restype = OSStatus
-    _carbon.GetEventParameter.argtypes = [
+    carbon.InstallEventHandler.restype = OSStatus
+    carbon.GetEventParameter.argtypes = [
         EventRef,
         UInt32,
         UInt32,
@@ -86,8 +93,8 @@ class GlobalHotKeyManager:
         ctypes.POINTER(UInt64),
         ctypes.c_void_p,
     ]
-    _carbon.GetEventParameter.restype = OSStatus
-    _carbon.RegisterEventHotKey.argtypes = [
+    carbon.GetEventParameter.restype = OSStatus
+    carbon.RegisterEventHotKey.argtypes = [
         UInt32,
         UInt32,
         EventHotKeyID,
@@ -95,25 +102,29 @@ class GlobalHotKeyManager:
         OptionBits,
         ctypes.POINTER(EventHotKeyRef),
     ]
-    _carbon.RegisterEventHotKey.restype = OSStatus
-    _carbon.UnregisterEventHotKey.argtypes = [EventHotKeyRef]
-    _carbon.UnregisterEventHotKey.restype = OSStatus
-    _carbon.RemoveEventHandler.argtypes = [EventHandlerRef]
-    _carbon.RemoveEventHandler.restype = OSStatus
+    carbon.RegisterEventHotKey.restype = OSStatus
+    carbon.UnregisterEventHotKey.argtypes = [EventHotKeyRef]
+    carbon.UnregisterEventHotKey.restype = OSStatus
+    carbon.RemoveEventHandler.argtypes = [EventHandlerRef]
+    carbon.RemoveEventHandler.restype = OSStatus
+    return carbon
 
+
+class GlobalHotKeyManager:
     def __init__(self, handler):
+        self._carbon = _load_carbon()
         self._handler = handler
         self._target = self._carbon.GetApplicationEventTarget()
         self._event_handler_ref = EventHandlerRef()
         self._hotkey_refs: list[EventHotKeyRef] = []
         self._recording_ref: EventHotKeyRef | None = None
         self._stop_handler = None
-        self._callback = self._handler_proc(self._handle_event)
+        self._callback = _HANDLER_PROC(self._handle_event)
         self._signature = _four_char_code("MRMX")
         self._install_event_handler()
 
-    def register_default_overlay_shortcut(self) -> None:
-        self.register(HotKeySpec(key_code=kVK_Space, modifiers=optionKey, identifier=1))
+    def register_dictation_shortcut(self) -> None:
+        self.register(DICTATE)
 
     def register(self, spec: HotKeySpec) -> EventHotKeyRef:
         hotkey_id = EventHotKeyID(self._signature, spec.identifier)
@@ -135,7 +146,7 @@ class GlobalHotKeyManager:
         """Cmd+R belongs to other apps except during our own recording."""
         self._stop_handler = handler
         if handler is not None and self._recording_ref is None:
-            self._recording_ref = self.register(HotKeySpec(kVK_ANSI_R, cmdKey, 2))
+            self._recording_ref = self.register(STOP)
         elif handler is None and self._recording_ref is not None:
             self._carbon.UnregisterEventHotKey(self._recording_ref)
             self._hotkey_refs.remove(self._recording_ref)
@@ -178,9 +189,9 @@ class GlobalHotKeyManager:
             ctypes.byref(hotkey_id),
         )
         if status == noErr and hotkey_id.signature == self._signature:
-            if hotkey_id.id == 1:
+            if hotkey_id.id == DICTATE.identifier:
                 AppHelper.callAfter(self._handler)
-            elif hotkey_id.id == 2 and self._stop_handler is not None:
+            elif hotkey_id.id == STOP.identifier and self._stop_handler is not None:
                 AppHelper.callAfter(self._stop_handler)
             return noErr
         return eventNotHandledErr

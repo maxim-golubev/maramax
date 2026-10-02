@@ -5,23 +5,16 @@ from __future__ import annotations
 import ctypes
 import threading
 import time
-from pathlib import Path
-from typing import IO, Any, NamedTuple
+from typing import Any
 
 import pyaudio
 
-from . import recovery
+from .audio_format import CHANNELS, SAMPLE_RATE
 from .capture import CaptureMeter, CaptureSnapshot
-from .logger_config import setup_logging
-from .paths import app_support_dir
+from .helper_protocol import InputDevice
+from .logger_config import logger
 
-logger = setup_logging()
-
-
-class InputDevice(NamedTuple):
-    device_index: int
-    name: str
-    is_default: bool
+FRAMES_PER_BUFFER = 512
 
 
 def lid_closed() -> bool:
@@ -64,27 +57,26 @@ def lid_closed() -> bool:
             return cf.CFGetTypeID(value) == cf.CFBooleanGetTypeID() and bool(cf.CFBooleanGetValue(value))
         finally:
             cf.CFRelease(value)
-    except Exception:
+    except Exception as exc:
+        # An unreadable lid state is treated as open: the preference for the
+        # built-in microphone then behaves as it did before lids were checked.
+        logger.debug(f"Lid state unavailable: {exc}")
         return False
 
 
 class AudioRecorder:
-    def __init__(self, recovery_dir: Path | None = None, prefer_builtin: bool = True):
+    def __init__(self, device_name: str | None = None, prefer_builtin: bool = True):
+        # None records from Automatic; a name is resolved strictly.
+        self.device_name = device_name
+        self.prefer_builtin = prefer_builtin
         # Even PortAudio initialization can block during a route change.
         # Defer it to the first background enumeration or capture request.
         self.audio: Any = None
-        self.format = pyaudio.paInt16
-        self.channels = 1
-        self.rate = 16000
-        self.chunk = 512
         self.frames: list[bytes] = []
         self.recording = False
         self.last_error: Exception | None = None
-        self.first_frame_event = threading.Event()
-        # Set when frames contain actual signal (Bluetooth mics deliver
-        # pure-zero frames for 1-2s while switching into headset mode).
-        self.signal_event = threading.Event()
-        # Incremented per start(); lets watchers detect they span recordings.
+        # Incremented per start() and reopen(); a stream whose generation
+        # is stale can no longer write into the recording.
         self.start_generation = 0
         self._recording_thread: threading.Thread | None = None
         self._stream: Any = None
@@ -94,28 +86,9 @@ class AudioRecorder:
         # background device refresh can't tear it down mid-open.
         self._audio_lock = threading.Lock()
         self._cleaned_up = False
-        self._selected_device_name: str | None = None
-        self.prefer_builtin = prefer_builtin
-        self.meter = CaptureMeter(self.rate)
+        self._released_cleanly = False
+        self.meter = CaptureMeter()
         self.abandoned_sessions = 0
-        # Crash insurance: the capture is spilled to disk while recording so
-        # a hang, crash, or failed transcription can't lose a long dictation.
-        self._recovery_dir = recovery_dir or app_support_dir()
-        self._recovery_file: IO[bytes] | None = None
-        self._recovery_flushed = 0
-        # Guards the spill handle/cursor between the record loop and the
-        # app-side preserve/discard calls (never held around Pa calls).
-        self._recovery_lock = threading.Lock()
-
-    @property
-    def recovery_dir(self) -> Path:
-        return self._recovery_dir
-
-    def set_device(self, name: str | None) -> None:
-        self._selected_device_name = name
-
-    def get_selected_device_name(self) -> str | None:
-        return self._selected_device_name
 
     def _reinit_audio(self) -> None:
         # Callers must hold _audio_lock. Close any live stream first:
@@ -131,8 +104,9 @@ class AudioRecorder:
         try:
             if self.audio is not None:
                 self.audio.terminate()
-        except Exception:
-            pass
+        except Exception as exc:
+            # Nothing to recover: the replacement instance below is what matters.
+            logger.warning(f"PortAudio did not terminate cleanly: {exc}")
         self.audio = pyaudio.PyAudio()
 
     def list_input_devices(self) -> list[InputDevice] | None:
@@ -148,14 +122,14 @@ class AudioRecorder:
             try:
                 default_index = self.audio.get_default_input_device_info()["index"]
             except (IOError, OSError):
-                default_index = -1
+                default_index = -1  # No default input: no entry is marked.
 
             devices: list[InputDevice] = []
             for i in range(self.audio.get_device_count()):
                 try:
                     info = self.audio.get_device_info_by_index(i)
                 except (IOError, OSError):
-                    continue
+                    continue  # A device that vanished mid-enumeration.
                 if info.get("maxInputChannels", 0) > 0:
                     devices.append(InputDevice(
                         device_index=i,
@@ -167,17 +141,17 @@ class AudioRecorder:
             self._audio_lock.release()
 
     def _resolve_device_index(self) -> int | None:
-        if self._selected_device_name is None:
+        if self.device_name is None:
             return self._find_builtin_index() if self.prefer_builtin else None
         for i in range(self.audio.get_device_count()):
             try:
                 info = self.audio.get_device_info_by_index(i)
             except (IOError, OSError):
                 continue
-            if info["name"] == self._selected_device_name and info.get("maxInputChannels", 0) > 0:
+            if info["name"] == self.device_name and info.get("maxInputChannels", 0) > 0:
                 return i
         # A locked device disappearing must not silently choose another mic.
-        raise OSError(f"Selected microphone disconnected: {self._selected_device_name}")
+        raise OSError(f"Selected microphone disconnected: {self.device_name}")
 
     def capture_snapshot(self) -> CaptureSnapshot:
         return self.meter.snapshot()
@@ -194,12 +168,12 @@ class AudioRecorder:
                 index = int(self.audio.get_default_input_device_info()["index"])
             return str(self.audio.get_device_info_by_index(index)["name"])
         except (IOError, OSError, KeyError, ValueError):
-            return None
+            return None  # No usable input right now; the picker shows plain "Automatic".
         finally:
             self._audio_lock.release()
 
     def _find_builtin_index(self) -> int | None:
-        """Prefer the Mac's input without changing the system's output or
+        """Prefer the Mac’s input without changing the system's output or
         opening a Bluetooth headset microphone unless explicitly selected."""
         if lid_closed():
             # The built-in microphone is cut off in hardware; preferring it
@@ -231,17 +205,13 @@ class AudioRecorder:
             self.last_error = None
             self.start_generation += 1
 
-        self.first_frame_event = threading.Event()
-        self.signal_event = threading.Event()
-        self.meter = CaptureMeter(self.rate)
+        self.meter = CaptureMeter()
 
-        # Rebuild the audio session at each start (~85ms): PortAudio
+        # Rebuild the audio session at each start (~40 ms): PortAudio
         # snapshots the device list at init, so a reused session silently
         # records from a stale default device after AirPods reconnect.
-        # Capture starts on a worker; the UI stays in "Connecting" until
-        # input arrives, so a driver open cannot freeze the main loop.
         # The lock acquire is bounded; native calls themselves may still
-        # wedge and require an application restart.
+        # wedge, which is why this runs in a process the app can replace.
         if not self._audio_lock.acquire(timeout=5.0):
             exc: Exception = TimeoutError("audio session busy")
             logger.error("Microphone start failed: audio session lock timeout")
@@ -263,14 +233,13 @@ class AudioRecorder:
             self._audio_lock.release()
 
         self.meter.mark_open()
-        self._open_recovery_file()
         self._start_record_loop()
         return True
 
     def _start_record_loop(self) -> None:
         thread = threading.Thread(
             target=self._record_loop,
-            args=(self._stream, self._recovery_file, self.start_generation),
+            args=(self._stream, self.start_generation),
             daemon=True,
         )
         with self._state_lock:
@@ -297,6 +266,10 @@ class AudioRecorder:
             return False
         try:
             self._reinit_audio()
+            if self.abandoned_sessions:
+                # The old session could not be shut down, so PortAudio kept
+                # its device list: it still names the device that vanished.
+                raise OSError("the audio session could not be rebuilt after the device stopped responding")
             self._open_stream()
         except Exception as exc:
             logger.error(f"Microphone could not be reopened: {exc}")
@@ -312,12 +285,14 @@ class AudioRecorder:
 
     def rearm(self) -> bool:
         """Begin a new recording on a stream that was kept open. The buffer
-        is emptied in place because the live callback holds this list."""
+        is emptied and the meter restarted in place, because the live
+        callback holds both objects."""
         with self._state_lock:
             if self._cleaned_up or not self.recording or self._stream is None:
                 return False
             self.last_error = None
         del self.frames[:]
+        self.meter.restart()
         return True
 
     def stream_active(self) -> bool:
@@ -325,7 +300,7 @@ class AudioRecorder:
         try:
             return stream is not None and bool(stream.is_active())
         except Exception:
-            return False
+            return False  # A stream that cannot answer is not usable.
 
     def stop(self) -> bytes:
         with self._state_lock:
@@ -338,15 +313,12 @@ class AudioRecorder:
         if thread is not None:
             thread.join(timeout=5.0)
             if thread.is_alive():
-                # The recording thread is stuck inside PortAudio, possibly
-                # before its finalize ran — spill the tail of the capture
-                # first so the recovery file is complete. Then force a close
-                # on a sacrificial thread: PortAudio calls cannot be
+                # The recording thread is stuck inside PortAudio. Force a
+                # close on a sacrificial thread: PortAudio calls cannot be
                 # interrupted, so even the forced close may wedge, and it
                 # must not take this caller down with it. The captured
                 # frames are safe in memory regardless.
                 logger.warning("Recording thread did not stop in time, forcing stream close")
-                self._flush_recovery(self._recovery_file)
                 closed: list[bool] = []
                 closer = threading.Thread(
                     target=lambda: closed.append(self._close_stream(timeout=2.0)),
@@ -366,10 +338,13 @@ class AudioRecorder:
         with self._state_lock:
             return self.recording
 
-    def cleanup(self) -> None:
+    def cleanup(self) -> bool:
+        """Release the device. False when PortAudio could not be shut down
+        completely: it then stays initialized in this process with its
+        device list frozen, so the process must not record again."""
         with self._state_lock:
             if self._cleaned_up:
-                return
+                return self._released_cleanly
             self._cleaned_up = True
 
         if self.is_recording():
@@ -383,13 +358,12 @@ class AudioRecorder:
             try:
                 if self.audio is not None:
                     self.audio.terminate()
-            except Exception:
-                pass
+                self._released_cleanly = self.abandoned_sessions == 0
+            except Exception as exc:
+                logger.warning(f"PortAudio did not terminate cleanly: {exc}")
             finally:
                 self._audio_lock.release()
-
-    def sample_width(self) -> int:
-        return pyaudio.get_sample_size(self.format)
+        return self._released_cleanly
 
     def _abandon_stream_session(self) -> None:
         """A wedged holder owns the current stream lock and may never
@@ -421,8 +395,6 @@ class AudioRecorder:
         # write into a newer recording's buffers or vouch for its mic.
         generation = self.start_generation
         frames = self.frames
-        first_frame_event = self.first_frame_event
-        signal_event = self.signal_event
         meter = self.meter
 
         def callback(in_data, frame_count, time_info, status_flags):
@@ -431,49 +403,32 @@ class AudioRecorder:
             if self.start_generation == generation and self.is_recording():
                 frames.append(in_data)
                 meter.feed(in_data, overflow=bool(status_flags & pyaudio.paInputOverflow))
-                if in_data:
-                    first_frame_event.set()
-                if not signal_event.is_set() and any(in_data):
-                    # A live mic always has a noise floor; exact digital
-                    # silence means the route (e.g. a Bluetooth headset
-                    # switching into mic mode) isn't delivering audio yet.
-                    signal_event.set()
                 return (None, pyaudio.paContinue)
 
             return (None, pyaudio.paComplete)
 
-        kwargs = dict(
-            format=self.format,
-            channels=self.channels,
-            rate=self.rate,
-            input=True,
-            frames_per_buffer=self.chunk,
-            stream_callback=callback,
-        )
-        if device_index is not None:
-            kwargs["input_device_index"] = device_index
-
         with self._stream_lock:
-            self._stream = self.audio.open(**kwargs)
-            # PyAudio starts an input stream by default. Avoid a second start
+            # PyAudio starts an input stream on open. Avoid a second start
             # during Bluetooth route negotiation.
+            self._stream = self.audio.open(
+                format=pyaudio.paInt16,
+                channels=CHANNELS,
+                rate=SAMPLE_RATE,
+                input=True,
+                frames_per_buffer=FRAMES_PER_BUFFER,
+                stream_callback=callback,
+                input_device_index=device_index,
+            )
 
-    def _record_loop(self, stream, recovery_handle: IO[bytes] | None, generation: int) -> None:
+    def _record_loop(self, stream, generation: int) -> None:
         # These references are captured BEFORE the thread is started. A loop
         # delayed by scheduling/driver locks cannot adopt a newer recording.
         if stream is None:
-            self._finalize_recovery(recovery_handle)
             return
-
-        last_flush = time.monotonic()
         try:
             while stream.is_active():
                 if generation != self.start_generation or not self.is_recording():
                     break
-                now = time.monotonic()
-                if now - last_flush >= 1.0:
-                    self._flush_recovery(recovery_handle)
-                    last_flush = now
                 time.sleep(0.01)
         except Exception as exc:
             logger.error(f"Microphone stream error: {exc}")
@@ -481,96 +436,7 @@ class AudioRecorder:
                 if generation == self.start_generation:
                     self.last_error = exc
         finally:
-            # Recovery file first: even if the stream close wedges below,
-            # the captured audio is already complete on disk. After reopen()
-            # the same recording continues, so its spill stays open.
-            handed_over = (generation != self.start_generation and self.is_recording()
-                           and recovery_handle is self._recovery_file)
-            if not handed_over:
-                self._finalize_recovery(recovery_handle)
             self._close_stream(expected=stream)
-
-    def _open_recovery_file(self) -> None:
-        with self._recovery_lock:
-            self._close_current_recovery_handle()
-            self._recovery_flushed = 0
-            try:
-                self._recovery_dir.mkdir(parents=True, exist_ok=True)
-                self._recovery_file = open(recovery.in_progress_path(self._recovery_dir), "wb")
-            except OSError as exc:
-                self._recovery_file = None
-                logger.warning(f"Recording recovery file unavailable: {exc}")
-
-    def _flush_recovery(self, handle: IO[bytes] | None) -> None:
-        with self._recovery_lock:
-            if handle is None or handle is not self._recovery_file:
-                # A stale (zombie) handle must not touch the current spill.
-                return
-            frames = self.frames
-            end = len(frames)
-            if end <= self._recovery_flushed:
-                return
-            try:
-                handle.write(b"".join(frames[self._recovery_flushed:end]))
-                handle.flush()
-                self._recovery_flushed = end
-            except (OSError, ValueError) as exc:
-                # ValueError: the handle was closed under us (e.g. the app
-                # discarded the recovery file while a wedged stop lingered).
-                logger.warning(f"Recovery write failed: {exc}")
-                self._close_current_recovery_handle()
-
-    def _finalize_recovery(self, handle: IO[bytes] | None) -> None:
-        self._flush_recovery(handle)
-        with self._recovery_lock:
-            if handle is not None and handle is self._recovery_file:
-                self._close_current_recovery_handle()
-            elif handle is not None:
-                # Stale handle from an abandoned recording — close just it.
-                try:
-                    handle.close()
-                except (OSError, ValueError):
-                    pass
-
-    def _close_recovery(self) -> None:
-        with self._recovery_lock:
-            self._close_current_recovery_handle()
-
-    def _close_current_recovery_handle(self) -> None:
-        # Callers must hold _recovery_lock.
-        handle = self._recovery_file
-        self._recovery_file = None
-        if handle is None:
-            return
-        try:
-            handle.close()
-        except (OSError, ValueError):
-            pass
-
-    def discard_recovery(self) -> None:
-        """The capture was transcribed (or deliberately dropped) — remove
-        the in-progress spill file."""
-        self._close_recovery()
-        recovery.discard_in_progress(self._recovery_dir)
-
-    def preserve_recovery(self, only_if_larger: bool = False) -> bool:
-        """Keep the current capture on disk as the recoverable last
-        recording. True when a recoverable file is in place. Flushes any
-        frames the record loop never reached (wedged mid-loop) first."""
-        self._flush_recovery(self._recovery_file)
-        self._close_recovery()
-        return recovery.promote_in_progress(self._recovery_dir, only_if_larger=only_if_larger)
-
-    def has_recoverable_recording(self) -> bool:
-        return recovery.has_last_recording(self._recovery_dir)
-
-    def load_recoverable_recording(self) -> bytes | None:
-        """Raw PCM of the preserved recording — worker threads only (reads
-        the whole file into memory)."""
-        return recovery.load_last_recording(self._recovery_dir)
-
-    def discard_recoverable_recording(self) -> None:
-        recovery.discard_last_recording(self._recovery_dir)
 
     def _close_stream(self, timeout: float | None = None, expected: Any = None) -> bool:
         # stop+close stay inside the lock: if another thread terminates the
@@ -599,15 +465,17 @@ class AudioRecorder:
             if stream is None:
                 return True
 
+            # A stream whose device vanished raises from both calls; either
+            # way it is no longer ours to use, which is all that is wanted.
             try:
                 stream.stop_stream()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"stop_stream on a dying stream: {exc}")
 
             try:
                 stream.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"close on a dying stream: {exc}")
             return True
         finally:
             lock.release()

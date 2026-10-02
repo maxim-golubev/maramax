@@ -37,33 +37,24 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
 from parakeet_dictation import app as module
-from parakeet_dictation import recorder as recorder_module
-from parakeet_dictation import isolated_recorder as isolated_module
 from parakeet_dictation.config import AppConfig
-from parakeet_dictation.history import HistoryStore
-from parakeet_dictation.preferences import PreferencesController
 
 NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyProhibited)
 base = Path(sys.argv[1])
-def forbid_audio():
-    raise AssertionError("Startup must not initialize PortAudio")
-
-with patch.object(module, "app_support_dir", lambda: base), \
-     patch.object(isolated_module, "app_support_dir", lambda: base), \
-     patch.object(module, "HistoryStore", lambda **kw: HistoryStore(base_dir=base, **kw)), \
-     patch.object(module, "ParakeetTranscriber", lambda: SimpleNamespace(is_ready=lambda: True, load_error=None)), \
+transcriber = SimpleNamespace(is_ready=lambda: True, load_error=None, status_message=lambda: "Speech model ready")
+with patch.object(module, "ParakeetTranscriber", lambda: transcriber), \
      patch.object(module.DictationApp, "_start_model_watchdog", lambda self: None), \
-     patch.object(module.DictationApp, "_register_global_hotkeys", lambda self: None), \
-     patch.object(recorder_module.pyaudio, "PyAudio", forbid_audio):
-    app = module.DictationApp(config=AppConfig())
+     patch.object(module.DictationApp, "_register_global_hotkeys", lambda self: None):
+    # Everything the app stores goes under the directory it is given.
+    app = module.DictationApp(config=AppConfig(), support_dir=base)
     import rumps
     for bind in getattr(rumps.clicked, "*buttons", []):
         bind(app)
     assert app.menu["Start Dictation"].callback is not None
     assert app.menu["Recordings…"].callback is not None
     assert app.menu["More"]["History"].callback is not None
-    assert "Toggle Recording" not in app.menu
-    assert "Recordings & Recovery…" not in app.menu
+    assert "pyaudio" not in sys.modules  # The audio driver lives in the helper process only.
+    from parakeet_dictation.preferences import PreferencesController
     prefs = PreferencesController.alloc().initWithDelegate_labels_(app, module._SETTING_LABELS)
     app._preferences_window = prefs
     prefs.toggleSetting_(prefs.options["use_corrections"])
@@ -77,8 +68,29 @@ with patch.object(module, "app_support_dir", lambda: base), \
     assert {str(edit.itemAtIndex_(i).keyEquivalent()) for i in range(edit.numberOfItems())} >= set("zxcva")
     # The audio helper is launched only once the model is ready, never by construction.
     assert app.recorder._process is None
+    assert (app.recorder.device_name, app.recorder.prefer_builtin, app.recorder.keep_warm_seconds) == (None, True, 0)
     assert app.indicator.stop_button.frame().size == app.indicator.expand_button.frame().size
+    assert not app.is_busy and app.overlay_controller.intro_text
+    statuses = []
+    app._push_status = lambda message, revert_after=0: statuses.append(message)
+    app.copy_current_transcript()
+    assert statuses == ["No transcript to copy"]  # The intro text is guidance, not a transcript.
     app.cleanup()
     app.cleanup()
+    assert sorted(path.name for path in base.iterdir()) == ["recordings", "settings.json"]
 '''
-    subprocess.run([sys.executable, "-c", script, str(tmp_path)], check=True, capture_output=True, text=True, timeout=20)
+    result = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr[-1500:]
+
+
+def test_importing_the_package_modules_has_no_side_effects(tmp_path):
+    script = r'''
+import logging, os, sys
+before = dict(os.environ)
+import parakeet_dictation.main, parakeet_dictation.transcription, parakeet_dictation.recordings
+import parakeet_dictation.history, parakeet_dictation.hotkeys, parakeet_dictation.recovery
+import parakeet_dictation.isolated_recorder, parakeet_dictation.capture, parakeet_dictation.corrections
+assert dict(os.environ) == before, "importing must not change the environment"
+assert not logging.getLogger("maramax").handlers, "logging is configured by main(), not by imports"
+'''
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True, timeout=60, cwd=tmp_path)

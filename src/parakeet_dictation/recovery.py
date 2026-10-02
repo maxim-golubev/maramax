@@ -1,9 +1,10 @@
 """Crash-safe recording recovery.
 
-While the mic is recording, AudioRecorder spills the raw PCM stream to an
-in-progress file. If transcription succeeds the file is discarded; if the
-app hangs, crashes, or transcription fails, the audio survives on disk and
-can be transcribed later via "Recover Last Recording".
+While the microphone is recording, IsolatedAudioRecorder spills the raw PCM
+stream to an in-progress file. Once the capture is safe in the recordings
+archive the spill is discarded; if the app hangs or crashes before that, or
+the archive cannot be written, the audio survives here and is offered again
+at the next launch.
 
 Files (raw 16-bit mono 16kHz PCM, no header):
 - recording-in-progress.pcm  written live during a recording
@@ -14,15 +15,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .logger_config import setup_logging
-
-logger = setup_logging()
+from .audio_format import BYTES_PER_SECOND
+from .logger_config import logger
 
 IN_PROGRESS_NAME = "recording-in-progress.pcm"
 LAST_RECORDING_NAME = "last-recording.pcm"
 
-# Below ~0.5s of 16-bit 16kHz mono audio there is nothing worth recovering.
-MIN_RECOVERABLE_BYTES = 16000
+# Below half a second of audio there is nothing worth recovering.
+MIN_RECOVERABLE_BYTES = BYTES_PER_SECOND // 2
 
 
 def in_progress_path(base_dir: Path) -> Path:

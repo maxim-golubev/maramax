@@ -1,8 +1,17 @@
-"""Synthetic Cmd+V through CoreGraphics; requires macOS Accessibility trust."""
+"""Putting a transcript into the app the user was working in (needs Accessibility trust)."""
 
 from __future__ import annotations
 
 import ctypes
+import os
+
+from AppKit import (
+    NSApplicationActivateIgnoringOtherApps,
+    NSWorkspace,
+    NSWorkspaceApplicationKey,
+    NSWorkspaceDidActivateApplicationNotification,
+)
+from Foundation import NSOperationQueue
 
 kCGHIDEventTap = 0
 kCGEventFlagMaskCommand = 1 << 20
@@ -61,3 +70,44 @@ def send_paste_keystroke() -> None:
     finally:
         for event in events:
             _core_foundation.CFRelease(event)
+
+
+class PasteTarget:
+    """The app the user was last working in, other than Maramax itself.
+
+    Asking for the frontmost app at the moment a dictation starts is not
+    enough: when a Maramax window is in front, that answer is Maramax, and
+    whatever was remembered earlier may be an app the user left long ago."""
+
+    def __init__(self, workspace=None, own_pid: int | None = None):
+        self._workspace = workspace or NSWorkspace.sharedWorkspace()
+        self._own_pid = os.getpid() if own_pid is None else own_pid
+        self._last_other_app = None
+        self._note(self._workspace.frontmostApplication())
+        self._observer = self._workspace.notificationCenter().addObserverForName_object_queue_usingBlock_(
+            NSWorkspaceDidActivateApplicationNotification, None, NSOperationQueue.mainQueue(), self._activated,
+        )
+
+    def _activated(self, notification) -> None:
+        self._note((notification.userInfo() or {}).get(NSWorkspaceApplicationKey))
+
+    def _note(self, app) -> None:
+        if app is not None and app.processIdentifier() != self._own_pid:
+            self._last_other_app = app
+
+    def current(self):
+        """The app to paste into, or None if there has not been one."""
+        return self._last_other_app
+
+    def is_frontmost(self, app) -> bool:
+        front = self._workspace.frontmostApplication()
+        return app is not None and front is not None and front.processIdentifier() == app.processIdentifier()
+
+    @staticmethod
+    def bring_forward(app) -> None:
+        app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+
+    def stop(self) -> None:
+        if self._observer is not None:
+            self._workspace.notificationCenter().removeObserver_(self._observer)
+            self._observer = None

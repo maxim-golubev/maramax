@@ -1,39 +1,16 @@
-"""User settings persisted atomically to settings.json with type-validated loading."""
+"""User settings, persisted to settings.json."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+from .atomic_file import set_aside, write_text_atomically
 from .corrections import normalize_rules
 
-# Settings the user can change at runtime; everything else stays code-defined.
 # How long the microphone may stay connected after a dictation.
 MAX_KEEP_MIC_READY_SECONDS = 600
-
-_PERSISTED_FIELDS = (
-    "auto_start_recording",
-    "auto_copy_to_clipboard",
-    "paste_to_active_app",
-    "live_preview",
-    "high_accuracy",
-    "history_limit",
-    "compact_dictation",
-    "prefer_builtin_mic",
-    "input_device",
-    "keep_mic_ready_seconds",
-    "use_corrections",
-    "replacements",
-)
-
-
-@dataclass(frozen=True)
-class ShortcutConfig:
-    open_overlay: str = "Option+Space"
-    toggle_recording: str = "Cmd+R"
-    copy_result: str = "Cmd+C"
-    close_overlay: str = "Esc"
 
 
 @dataclass
@@ -51,21 +28,32 @@ class AppConfig:
     keep_mic_ready_seconds: int = 0
     use_corrections: bool = True
     replacements: list[dict[str, str]] = field(default_factory=list)
-    shortcuts: ShortcutConfig = field(default_factory=ShortcutConfig)
+    # Settings written by a newer version, kept so saving here (for example
+    # after rolling back) does not erase them.
+    unrecognized: dict = field(default_factory=dict, repr=False)
 
     @classmethod
     def load(cls, path: Path) -> AppConfig:
-        """Load settings from JSON, falling back to defaults for anything
-        missing, malformed, or of the wrong type."""
+        """Load settings from JSON. A missing file gives defaults; a single
+        missing or mistyped value falls back to its default; a file that is
+        not valid settings at all is set aside rather than overwritten."""
         config = cls()
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return config
+        except (OSError, UnicodeDecodeError) as exc:
+            set_aside(path, str(exc))
+            return config
+        try:
+            payload = json.loads(text)
+            if not isinstance(payload, dict):
+                raise ValueError("settings are not an object")
+        except ValueError as exc:
+            set_aside(path, str(exc))
             return config
 
-        if not isinstance(payload, dict):
-            return config
-
+        config.unrecognized = {key: value for key, value in payload.items() if key not in _PERSISTED_FIELDS}
         for name in _PERSISTED_FIELDS:
             if name not in payload:
                 continue
@@ -91,8 +79,10 @@ class AppConfig:
         return config
 
     def save(self, path: Path) -> None:
-        payload = {name: getattr(self, name) for name in _PERSISTED_FIELDS}
+        payload = dict(self.unrecognized) | {name: getattr(self, name) for name in _PERSISTED_FIELDS}
         path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(f"{path.suffix}.tmp")
-        temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        temp_path.replace(path)
+        write_text_atomically(path, json.dumps(payload, indent=2))
+
+
+# Every setting is persisted; the list is the dataclass itself.
+_PERSISTED_FIELDS = tuple(f.name for f in fields(AppConfig) if f.name != "unrecognized")

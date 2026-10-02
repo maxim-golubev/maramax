@@ -1,15 +1,30 @@
-"""Bounded local recordings with atomic metadata and retryable WAV audio."""
+"""Bounded local archive of dictation audio: retryable WAV files with atomic metadata."""
 
 from __future__ import annotations
 
 import json
 import math
+import os
 import threading
 import uuid
 import wave
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
+
+from .atomic_file import write_text_atomically
+from .audio_format import CHANNELS, SAMPLE_RATE, SAMPLE_WIDTH, seconds
+
+MAX_RECORDINGS = 20
+MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+
+
+class RecordingStatus(StrEnum):
+    SAVED = "saved"          # archived; recognition has not produced an outcome
+    DONE = "done"            # transcribed
+    FAILED = "failed"        # recognition ran and produced no transcript
+    CANCELLED = "cancelled"  # the user cancelled recognition
 
 
 @dataclass
@@ -17,16 +32,31 @@ class Recording:
     id: str
     created_at: str
     duration: float
-    status: str = "saved"
+    status: str = RecordingStatus.SAVED
     text: str = ""
     message: str = ""
     diagnostics: dict = field(default_factory=dict)
     raw_text: str = ""
+    # Metadata keys written by a newer version. They are carried through
+    # untouched so that opening a recording here does not erase them.
+    unrecognized: dict = field(default_factory=dict, repr=False)
+
+
+_KNOWN_FIELDS = tuple(f.name for f in fields(Recording) if f.name != "unrecognized")
+
+
+def recovery_candidate(records: list[Recording]) -> Recording | None:
+    """Which recording "Recover Last Recording" should transcribe, given the
+    archive newest-first: audio that never reached the recognizer (a crash or
+    a quit mid-dictation) before captures that were already tried."""
+    untried = [record for record in records if record.status == RecordingStatus.SAVED]
+    unfinished = untried or [record for record in records if record.status != RecordingStatus.DONE]
+    return unfinished[0] if unfinished else None
 
 
 class RecordingStore:
     # Always keep the newest recording, even if it alone exceeds the budget.
-    def __init__(self, base_dir: Path, limit: int = 20, max_bytes: int = 512 * 1024 * 1024):
+    def __init__(self, base_dir: Path, limit: int = MAX_RECORDINGS, max_bytes: int = MAX_ARCHIVE_BYTES):
         self.base_dir = base_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.limit = limit
@@ -42,29 +72,38 @@ class RecordingStore:
         return self.audio_path(recording_id).with_suffix(".json")
 
     def _write_metadata(self, record: Recording) -> None:
-        path = self._metadata_path(record.id)
-        temp = path.with_suffix(".json.tmp")
-        temp.write_text(json.dumps(asdict(record), indent=2), encoding="utf-8")
-        temp.replace(path)
+        payload = dict(record.unrecognized) | {name: getattr(record, name) for name in _KNOWN_FIELDS}
+        write_text_atomically(self._metadata_path(record.id), json.dumps(payload, indent=2))
+
+    @staticmethod
+    def _from_metadata(payload: object, recording_id: str) -> Recording:
+        if not isinstance(payload, dict):
+            raise ValueError("Recording metadata is not an object")
+        record = Recording(
+            **{name: payload[name] for name in _KNOWN_FIELDS if name in payload},
+            unrecognized={key: value for key, value in payload.items() if key not in _KNOWN_FIELDS},
+        )
+        if record.id != recording_id:
+            raise ValueError("Mismatched recording identifier")
+        if (not isinstance(record.created_at, str)
+                or not isinstance(record.duration, (int, float))
+                or not math.isfinite(record.duration) or record.duration < 0
+                or not isinstance(record.text, str) or not isinstance(record.raw_text, str)
+                or not isinstance(record.message, str)
+                or not isinstance(record.status, str) or not isinstance(record.diagnostics, dict)):
+            raise ValueError("Invalid recording metadata")
+        return record
 
     def list_recordings(self) -> list[Recording]:
-        # WAV and JSON files appear by atomic rename. Reading a snapshot
-        # without the writer lock keeps the UI responsive during a large save.
+        """Newest first. WAV and JSON files appear by atomic rename, so a
+        snapshot is read without the writer lock and the UI stays responsive
+        during a large save."""
         records = []
         for path in self.base_dir.glob("*.wav"):
             try:
+                self.audio_path(path.stem)
                 payload = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
-                record = Recording(**payload)
-                if record.id != path.stem:
-                    raise ValueError("Mismatched recording identifier")
-                self.audio_path(record.id)
-                if (not isinstance(record.created_at, str)
-                        or not isinstance(record.duration, (int, float))
-                        or not math.isfinite(record.duration) or record.duration < 0
-                        or not isinstance(record.text, str) or not isinstance(record.raw_text, str)
-                        or not isinstance(record.message, str)
-                        or not isinstance(record.status, str) or not isinstance(record.diagnostics, dict)):
-                    raise ValueError("Invalid recording metadata")
+                record = self._from_metadata(payload, path.stem)
             except (OSError, ValueError, TypeError):
                 # A crash between WAV and metadata writes must not hide
                 # the audio. Reconstruct a minimal, retryable entry.
@@ -75,28 +114,31 @@ class RecordingStore:
                     created = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
                     record = Recording(path.stem, created, duration, message="Recovered saved audio")
                 except (OSError, ValueError, wave.Error, EOFError):
-                    continue
+                    continue  # Not a readable recording; clear() still removes it.
             records.append(record)
         return sorted(records, key=lambda r: (r.created_at, r.id), reverse=True)
 
     def save(self, pcm: bytes, diagnostics: dict | None = None) -> Recording | None:
         if not pcm:
             return None
-        if len(pcm) % 2:
+        if len(pcm) % SAMPLE_WIDTH:
             raise ValueError("Expected complete 16-bit PCM samples")
         record = Recording(
-            uuid.uuid4().hex, datetime.now(timezone.utc).isoformat(), len(pcm) / 32000,
+            uuid.uuid4().hex, datetime.now(timezone.utc).isoformat(), seconds(pcm),
             diagnostics=dict(diagnostics or {}),
         )
         with self._lock:
             path = self.audio_path(record.id)
             temp = path.with_suffix(".wav.tmp")
             try:
-                with wave.open(str(temp), "wb") as audio:
-                    audio.setnchannels(1)
-                    audio.setsampwidth(2)
-                    audio.setframerate(16000)
-                    audio.writeframes(pcm)
+                with temp.open("wb") as handle:
+                    with wave.open(handle, "wb") as audio:
+                        audio.setnchannels(CHANNELS)
+                        audio.setsampwidth(SAMPLE_WIDTH)
+                        audio.setframerate(SAMPLE_RATE)
+                        audio.writeframes(pcm)
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 temp.replace(path)
                 self._write_metadata(record)
             finally:
@@ -109,13 +151,15 @@ class RecordingStore:
         with self._lock:
             record = next((r for r in self.list_recordings() if r.id == recording_id), None)
             if record is None:
-                raise FileNotFoundError("Recording no longer available")
+                raise FileNotFoundError(f"Recording {recording_id} is no longer in the archive")
             self._write_metadata(replace(record, **changes))
 
     def load_pcm(self, recording_id: str) -> bytes:
         with self._lock, wave.open(str(self.audio_path(recording_id)), "rb") as audio:
-            if (audio.getnchannels(), audio.getsampwidth(), audio.getframerate()) != (1, 2, 16000):
-                raise ValueError("Unexpected recording format")
+            found = (audio.getnchannels(), audio.getsampwidth(), audio.getframerate())
+            if found != (CHANNELS, SAMPLE_WIDTH, SAMPLE_RATE):
+                raise ValueError(f"Recording {recording_id} has format {found}, expected "
+                                 f"{(CHANNELS, SAMPLE_WIDTH, SAMPLE_RATE)}")
             return audio.readframes(audio.getnframes())
 
     def clear(self) -> None:
@@ -128,7 +172,7 @@ class RecordingStore:
                 try:
                     self.audio_path(recording_id)
                 except ValueError:
-                    continue
+                    continue  # Not one of ours.
                 if path.name in {recording_id + suffix for suffix in (".wav", ".json", ".wav.tmp", ".json.tmp")}:
                     path.unlink(missing_ok=True)
 

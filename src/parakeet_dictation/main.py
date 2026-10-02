@@ -1,35 +1,23 @@
 #!/usr/bin/env python3
-"""Entry point: CLI flags, single-instance guard, and audio-helper dispatch."""
+"""Process entry point: starts the app or, with --audio-worker, the audio helper."""
 
 import argparse
 import os
 import signal
 
-from .logger_config import setup_logging
-from .paths import app_support_dir, ensure_runtime_path, ensure_ssl_certs
 from . import __version__
 from .instance import InstanceLock
+from .logger_config import logger, setup_logging
+from .paths import app_support_dir, ensure_runtime_path, ensure_ssl_certs
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-ensure_runtime_path()
-ensure_ssl_certs()
-
-logger = setup_logging()
-
-
-def _get_version() -> str:
-    return __version__
+# Must match CFBundleIdentifier in packaging/setup.py.
+BUNDLE_ID = "com.maramax.dictation"
 
 
 def _ensure_gui_app() -> None:
-    try:
-        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+    from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
 
-        NSApplication.sharedApplication().setActivationPolicy_(
-            NSApplicationActivationPolicyAccessory
-        )
-    except Exception:
-        pass
+    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
 
 def main():
@@ -37,29 +25,37 @@ def main():
         description=(
             "Maramax for macOS.\n\n"
             "Press Option+Space to start dictating and again, or Cmd+R, to finish. "
-            "The transcript is copied to the clipboard; enable Paste Into Active App in Settings for insertion."
+            "The transcript is copied to the clipboard; turn on “Paste into the active app” in Settings for insertion."
         )
     )
-    parser.add_argument("--version", action="version", version=f"maramax {_get_version()}")
+    parser.add_argument("--version", action="version", version=f"maramax {__version__}")
     parser.add_argument("--audio-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.audio_worker:
+        # The helper needs none of the app's environment, logging, or GUI.
         from .audio_worker import main as audio_main
         audio_main()
         return
 
+    # Before anything imports the speech stack: these shape how it loads.
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    ensure_runtime_path()
+    ensure_ssl_certs()
+    setup_logging()
+
     _ensure_gui_app()
     from AppKit import NSRunningApplication
     import rumps
-    from PyObjCTools import AppHelper
+    from PyObjCTools import MachSignals
 
     # Also recognize older installed versions that predate the instance lock.
-    others = NSRunningApplication.runningApplicationsWithBundleIdentifier_("com.maramax.dictation")
+    others = NSRunningApplication.runningApplicationsWithBundleIdentifier_(BUNDLE_ID)
     if any(app.processIdentifier() != os.getpid() for app in others):
         rumps.alert(title="Maramax is already running", message="Quit the other copy from its menu bar before opening this version.")
         return
 
-    lock = InstanceLock(app_support_dir() / "app.lock")
+    support_dir = app_support_dir()
+    lock = InstanceLock(support_dir / "app.lock")
     try:
         acquired = lock.acquire()
     except OSError:
@@ -73,18 +69,23 @@ def main():
 
     app = None
     try:
-        setup_logging(app_support_dir() / "logs" / "maramax.log")
+        setup_logging(support_dir / "logs" / "maramax.log")
         logger.info(f"Starting Maramax {__version__}")
         from .app import DictationApp
 
-        app = DictationApp()
+        app = DictationApp(support_dir=support_dir)
+        # Quit from the menu, AppleScript, logout, or a signal all end in
+        # applicationWillTerminate, so the microphone is released one way.
+        rumps.events.before_quit.register(app.cleanup)
 
-        def handle_signal(signum, frame):
-            del signum, frame
-            AppHelper.callAfter(rumps.quit_application)
+        def quit_on_signal(_signum):
+            rumps.quit_application()
 
-        signal.signal(signal.SIGINT, handle_signal)
-        signal.signal(signal.SIGTERM, handle_signal)
+        # A plain signal.signal handler only runs when Python next executes
+        # on the main thread, which an idle menu-bar app may not do for
+        # hours; MachSignals delivers through the run loop.
+        MachSignals.signal(signal.SIGINT, quit_on_signal)
+        MachSignals.signal(signal.SIGTERM, quit_on_signal)
         app.run()
     except Exception:
         logger.exception("Maramax could not start or stopped unexpectedly")
@@ -94,7 +95,7 @@ def main():
         ))
     finally:
         if app is not None:
-            app.cleanup()
+            app.cleanup()  # Idempotent; reached only when the run loop returned or failed.
         lock.close()
 
 

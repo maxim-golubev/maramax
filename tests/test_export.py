@@ -1,11 +1,11 @@
 import pytest
 
-from parakeet_dictation.export import ExportError, export_results
-from parakeet_dictation.queue import OutputConfig, OutputMode, QueueItem
+from parakeet_dictation.export import ExportError, OutputConfig, OutputMode, export_results
+from parakeet_dictation.file_queue import QueuedFile
 
 
 def _make_item(filename="test.mp3", path="/tmp/test.mp3", text="hello world", status="done"):
-    return QueueItem(id="abc123", path=path, filename=filename, status=status, result_text=text)
+    return QueuedFile(id="abc123", path=path, filename=filename, status=status, result_text=text)
 
 
 def test_export_clipboard(monkeypatch):

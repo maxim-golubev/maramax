@@ -1,16 +1,4 @@
-from parakeet_dictation.queue import TranscriptionQueue
-
-
-def test_add_and_list_items():
-    q = TranscriptionQueue()
-    q.add("/path/to/file.mp3")
-    q.add("/path/to/other.wav")
-
-    items = q.items()
-    assert len(items) == 2
-    assert items[0].filename == "file.mp3"
-    assert items[1].filename == "other.wav"
-    assert items[0].status == "pending"
+from parakeet_dictation.file_queue import QueueStatus, TranscriptionQueue
 
 
 def test_add_many():
@@ -66,22 +54,22 @@ def test_clear():
     assert q.items() == []
 
 
-def test_clear_done():
+def test_cancelled_files_run_again_but_failed_ones_do_not():
     q = TranscriptionQueue()
     q.add_many(["/a.mp3", "/b.wav", "/c.flac"])
     items = q.items()
-    q.set_status(items[0].id, "done", result_text="text")
-    q.set_status(items[1].id, "failed", error="oops")
-
-    q.clear_done()
-    remaining = q.items()
-    assert len(remaining) == 1
-    assert remaining[0].filename == "c.flac"
+    q.set_status(items[0].id, QueueStatus.DONE, result_text="text")
+    q.set_status(items[1].id, QueueStatus.CANCELLED)
+    q.set_status(items[2].id, QueueStatus.FAILED, error="oops")
+    assert q.pending_count() == 0
+    q.requeue_cancelled()
+    assert [item.status for item in q.items()] == ["done", "pending", "failed"]
+    assert q.pending_count() == 1
 
 
 def test_set_status():
     q = TranscriptionQueue()
-    q.add("/a.mp3")
+    q.add_many(["/a.mp3"])
     item_id = q.items()[0].id
 
     q.set_status(item_id, "done", result_text="hello world")
@@ -101,7 +89,7 @@ def test_pending_count():
 
 def test_items_returns_copies():
     q = TranscriptionQueue()
-    q.add("/a.mp3")
+    q.add_many(["/a.mp3"])
 
     items1 = q.items()
     items1[0].status = "done"

@@ -2,8 +2,10 @@
 import subprocess
 import sys
 import json
+import threading
 import time
 
+from parakeet_dictation import recovery
 from parakeet_dictation.isolated_recorder import IsolatedAudioRecorder, worker_command
 from parakeet_dictation.recovery import in_progress_path
 
@@ -18,9 +20,9 @@ FAKE_AUDIO = r'''
 import sys, threading, time, types
 m = types.ModuleType("pyaudio")
 m.paInt16, m.paContinue, m.paComplete, m.paInputOverflow = 8, 0, 1, 2
-m.get_sample_size = lambda fmt: 2
 STATE = {"devices": ["MacBook Pro Microphone", "AirPods"], "default": 1, "opens": 0}
-VANISH_AFTER = %(vanish_after)d
+VANISH_AFTER = %(vanish_after)d   # buffers the first stream delivers before its device disappears
+MUTE_FIRST = %(mute_first)d       # the first stream opens but never delivers
 
 class Stream:
     def __init__(self, callback, index):
@@ -30,8 +32,9 @@ class Stream:
     def _pump(self):
         sent = 0
         while self.active:
-            if VANISH_AFTER and self.first and sent >= VANISH_AFTER:
-                STATE["devices"], STATE["default"] = ["MacBook Pro Microphone"], 0
+            if self.first and (MUTE_FIRST or (VANISH_AFTER and sent >= VANISH_AFTER)):
+                if VANISH_AFTER:
+                    STATE["devices"], STATE["default"] = ["MacBook Pro Microphone"], 0
                 time.sleep(0.01)
                 continue
             sample = bytes([self.index + 1, 0])
@@ -55,15 +58,27 @@ class PyAudio:
 
 m.PyAudio = PyAudio
 sys.modules["pyaudio"] = m
-import parakeet_dictation.recorder
-parakeet_dictation.recorder.lid_closed = lambda: False  # Independent of this Mac's real lid.
+import parakeet_dictation.recorder as recorder
+recorder.lid_closed = lambda: False  # Independent of this Mac's real lid.
+if %(leaks_session)d:
+    # What a wedged close leaves behind: PortAudio could not be shut down.
+    released = recorder.AudioRecorder.cleanup
+    recorder.AudioRecorder.cleanup = lambda self: released(self) and False
 from parakeet_dictation.audio_worker import main
 main()
 '''
 
 
-def helper(vanish_after=0):
-    return [sys.executable, '-u', '-c', FAKE_AUDIO % {"vanish_after": vanish_after}]
+def helper(vanish_after=0, mute_first=False, leaks_session=False):
+    return [sys.executable, '-u', '-c', FAKE_AUDIO % {
+        "vanish_after": vanish_after, "mute_first": int(mute_first), "leaks_session": int(leaks_session)}]
+
+
+def recorder_for(tmp_path, cmd, device=None, prefer_builtin=True, **kwargs):
+    recorder = IsolatedAudioRecorder(tmp_path, command=cmd, **kwargs)
+    recorder.device_name = device
+    recorder.prefer_builtin = prefer_builtin
+    return recorder
 
 
 def wait_for(condition, timeout=5):
@@ -80,12 +95,13 @@ def test_worker_ping_without_gui_or_audio():
 
 
 def test_stalled_start_is_bounded_and_next_attempt_works(tmp_path):
-    recorder = IsolatedAudioRecorder(tmp_path, command=command('time.sleep(60)'), start_timeout=.15)
+    recorder = recorder_for(tmp_path, command('time.sleep(60)'), start_timeout=.15)
     before = time.monotonic()
     assert not recorder.start()
     assert time.monotonic() - before < 3
     assert recorder._process is None
     assert recorder.reset_count == 1
+    recorder._start_timeout = 5  # Generous: these are real interpreter launches.
     recorder._command = command('print(json.dumps({"event":"ready","device":"Fake"}),flush=True)\nsys.stdin.readline()\nprint(json.dumps({"event":"done"}),flush=True)')
     helpers = []
     for _ in range(8):
@@ -100,11 +116,31 @@ def test_stalled_start_is_bounded_and_next_attempt_works(tmp_path):
     assert recorder.reset_count == 1  # Helpers that finished on their own were not forced.
 
 
-def test_connection_can_be_cancelled_before_start(tmp_path):
-    recorder = IsolatedAudioRecorder(tmp_path, command=command('time.sleep(60)'))
-    recorder.cancel_start()
+def test_cancel_belongs_to_one_attempt_and_cannot_leak_into_the_next(tmp_path):
+    recorder = recorder_for(tmp_path, helper())
+    cancelled = threading.Event()
+    cancelled.set()
     before = time.monotonic()
-    assert not recorder.start()
+    assert not recorder.start(cancelled)
+    assert time.monotonic() - before < 1
+    assert 'cancelled' in str(recorder.last_error)
+    assert recorder._process is None  # Cancelled before any helper was involved.
+    attempt = threading.Event()
+    assert recorder.start(attempt)    # A later attempt is unaffected.
+    assert recorder.last_error is None
+    attempt.set()  # A cancel for a start that already succeeded changes nothing afterwards.
+    recorder.stop()
+    assert recorder.start()
+    recorder.stop()
+    recorder.cleanup()
+
+
+def test_cancel_during_a_slow_open_returns_promptly(tmp_path):
+    recorder = recorder_for(tmp_path, command('time.sleep(60)'))
+    cancel = threading.Event()
+    threading.Timer(0.2, cancel.set).start()
+    before = time.monotonic()
+    assert not recorder.start(cancel)
     assert time.monotonic() - before < 3
     assert 'cancelled' in str(recorder.last_error)
     recorder.cleanup()
@@ -119,17 +155,16 @@ for _ in range(300):
 sys.stdin.readline()
 time.sleep(60)
 '''
-    recorder = IsolatedAudioRecorder(tmp_path, command=command(body), stop_timeout=.15)
+    recorder = recorder_for(tmp_path, command(body), stop_timeout=.15)
     assert recorder.start()
     expected = b'\x01\x00' * (16000 * 300)
-    deadline = time.monotonic() + 10
-    while recorder.capture_snapshot().audio_seconds < 300 and time.monotonic() < deadline:
-        time.sleep(.01)
+    # The spill is written after the meter is fed, so wait on the file itself.
+    assert wait_for(lambda: in_progress_path(tmp_path).stat().st_size == len(expected), timeout=10)
     assert in_progress_path(tmp_path).read_bytes() == expected
     assert recorder.stop() == expected
     assert recorder.reset_count == 1
     assert recorder.preserve_recovery()
-    assert recorder.load_recoverable_recording() == expected
+    assert recovery.load_last_recording(tmp_path) == expected
     recorder.cleanup()
 
 
@@ -139,7 +174,7 @@ print(json.dumps({"event":"ready","device":"Fake"}),flush=True)
 time.sleep(.1)
 print(json.dumps({"event":"audio","pcm":base64.b64encode(b'\\x01\\x00' * 16000).decode()}),flush=True)
 '''
-    recorder = IsolatedAudioRecorder(tmp_path, command=command(body))
+    recorder = recorder_for(tmp_path, command(body))
     assert recorder.start()
     recorder._reader.join(timeout=3)
     assert recorder.last_error is not None
@@ -150,19 +185,30 @@ print(json.dumps({"event":"audio","pcm":base64.b64encode(b'\\x01\\x00' * 16000).
     recorder.cleanup()
 
 
-def test_cancel_that_arrives_after_the_start_cannot_abort_the_next_recording(tmp_path):
-    recorder = IsolatedAudioRecorder(tmp_path, command=helper())
+def test_disk_error_while_spilling_does_not_end_the_recording(tmp_path):
+    recorder = recorder_for(tmp_path, helper())
     assert recorder.start()
-    recorder.cancel_start()  # The app's cancel raced a start that had already succeeded.
-    recorder.stop()
-    assert recorder.start()
+    assert wait_for(lambda: recorder.capture_snapshot().audio_seconds > 0.05)
+
+    class FullDisk:
+        def write(self, _pcm):
+            raise OSError(28, "No space left on device")
+
+        def close(self):
+            raise OSError(28, "No space left on device")
+
+    with recorder._data_lock:
+        recorder._spill = FullDisk()
+    before = recorder.capture_snapshot().audio_seconds
+    assert wait_for(lambda: recorder.capture_snapshot().audio_seconds > before + 0.2)
+    assert recorder._spill is None and recorder._reader.is_alive()
+    assert recorder.stop()
     assert recorder.last_error is None
-    recorder.stop()
     recorder.cleanup()
 
 
 def test_standby_helper_is_reused_and_only_opens_audio_on_request(tmp_path):
-    recorder = IsolatedAudioRecorder(tmp_path, command=helper(), prefer_builtin=False)
+    recorder = recorder_for(tmp_path, helper(), prefer_builtin=False)
     recorder.prepare()
     standby = recorder._process
     assert standby is not None and standby.poll() is None
@@ -183,19 +229,20 @@ def test_standby_helper_is_reused_and_only_opens_audio_on_request(tmp_path):
 
 
 def test_stop_keeps_the_tail_spoken_while_the_key_was_pressed(tmp_path):
-    recorder = IsolatedAudioRecorder(tmp_path, command=helper())
+    recorder = recorder_for(tmp_path, helper())
     assert recorder.start()
     assert wait_for(lambda: recorder.capture_snapshot().audio_seconds > 0.05)
     at_stop = recorder.capture_snapshot().audio_seconds
     pcm = recorder.stop()
-    # The fake device runs faster than real time; 0.2 s of wall-clock tail
-    # is well over 0.2 s of its audio.
-    assert len(pcm) / 32000 - at_stop > 0.2
+    # The fake device runs about eight times faster than real time, so the
+    # 0.2 s wall-clock tail is over a second of its audio; a tail shortened
+    # to a few polls would be a fraction of that.
+    assert len(pcm) / 32000 - at_stop > 1.0
     recorder.cleanup()
 
 
 def test_kept_warm_microphone_starts_instantly_then_lets_go(tmp_path):
-    recorder = IsolatedAudioRecorder(tmp_path, command=helper(), prefer_builtin=False)
+    recorder = recorder_for(tmp_path, helper(), prefer_builtin=False)
     recorder.keep_warm_seconds = 0.6
     assert recorder.start()
     assert not recorder.warm_start
@@ -204,25 +251,54 @@ def test_kept_warm_microphone_starts_instantly_then_lets_go(tmp_path):
     assert recorder.start()
     assert time.monotonic() - before < 0.5
     assert recorder.warm_start
+    assert recorder.capture_snapshot().open_delay is not None
     assert wait_for(lambda: recorder.capture_snapshot().audio_seconds > 0.05)
     first = recorder.stop()
     assert first and set(first[::2]) == {2}
-    # Audio heard while waiting never reaches the app.
-    recorder._accepting.clear()
-    assert wait_for(recorder._accepting.is_set, timeout=3)  # "idle" after the window closes
-    assert recorder.frames == []
+    assert wait_for(recorder._accepting.is_set)  # Warm: ready for the next request.
+    time.sleep(1.0)                              # The 0.6 s window ends.
+    assert recorder.frames == []                 # Audio heard while waiting never reached the app.
+    assert recorder._process.poll() is None      # The same helper is now idle,
+    assert recorder.start()
+    assert not recorder.warm_start               # and opens the device afresh.
+    recorder.stop()
+    recorder.cleanup()
+
+
+def test_turning_keep_warm_off_applies_to_the_recording_in_progress(tmp_path):
+    recorder = recorder_for(tmp_path, helper())
+    recorder.keep_warm_seconds = 30
+    assert recorder.start()
+    recorder.keep_warm_seconds = 0  # Changed in Settings mid-dictation.
+    recorder.stop()
+    assert wait_for(recorder._accepting.is_set)
     assert recorder.start()
     assert not recorder.warm_start
     recorder.stop()
     recorder.cleanup()
 
 
+def test_release_closes_a_microphone_that_is_being_kept_warm(tmp_path):
+    recorder = recorder_for(tmp_path, helper())
+    recorder.keep_warm_seconds = 30
+    assert recorder.start()
+    recorder.stop()
+    assert wait_for(recorder._accepting.is_set)
+    helper_process = recorder._process
+    recorder.release_device()
+    assert recorder.start()  # Requests are handled in order: the release comes first.
+    assert not recorder.warm_start
+    assert recorder._process is helper_process
+    recorder.stop()
+    recorder.cleanup()
+
+
 def test_changing_microphone_does_not_reuse_a_warm_stream(tmp_path):
-    recorder = IsolatedAudioRecorder(tmp_path, command=helper(), prefer_builtin=False)
+    recorder = recorder_for(tmp_path, helper(), prefer_builtin=False)
     recorder.keep_warm_seconds = 5
     assert recorder.start()
     recorder.stop()
-    recorder.set_device("MacBook Pro Microphone")
+    recorder.device_name = "MacBook Pro Microphone"
     assert recorder.start()
     assert not recorder.warm_start
     assert recorder.capture_snapshot().device_name == "MacBook Pro Microphone"
@@ -233,7 +309,7 @@ def test_changing_microphone_does_not_reuse_a_warm_stream(tmp_path):
 
 
 def test_recording_continues_on_another_input_when_the_device_vanishes(tmp_path):
-    recorder = IsolatedAudioRecorder(tmp_path, command=helper(vanish_after=40), prefer_builtin=False)
+    recorder = recorder_for(tmp_path, helper(vanish_after=40), prefer_builtin=False)
     assert recorder.start()
     assert recorder.capture_snapshot().device_name == "AirPods"
     assert wait_for(lambda: recorder.capture_snapshot().device_name == "MacBook Pro Microphone", timeout=6)
@@ -247,18 +323,50 @@ def test_recording_continues_on_another_input_when_the_device_vanishes(tmp_path)
     recorder.cleanup()
 
 
-def test_locked_microphone_that_vanishes_does_not_switch_devices(tmp_path):
-    recorder = IsolatedAudioRecorder(tmp_path, command=helper(vanish_after=40))
-    recorder.set_device("AirPods")
+def test_stream_that_never_delivers_is_replaced_before_the_app_gives_up(tmp_path):
+    recorder = recorder_for(tmp_path, helper(mute_first=True), prefer_builtin=False)
     assert recorder.start()
-    assert wait_for(lambda: recorder.capture_snapshot().health == "disconnected", timeout=12)
+    healths = set()
+
+    def delivering():
+        healths.add(recorder.capture_snapshot().health)
+        return recorder.capture_snapshot().audio_seconds > 0.2
+
+    assert wait_for(delivering, timeout=8)
+    assert "missing" not in healths and "disconnected" not in healths
+    assert recorder.stop()
+    assert recorder.last_error is None
+    recorder.cleanup()
+
+
+def test_locked_microphone_that_vanishes_ends_the_recording_without_switching(tmp_path):
+    recorder = recorder_for(tmp_path, helper(vanish_after=40), device="AirPods")
+    assert recorder.start()
+    before = time.monotonic()
+    assert wait_for(lambda: recorder.last_error is not None, timeout=6)
+    assert time.monotonic() - before < 4  # Reported once the reopen fails, not after a dead wait.
+    assert "no other input" in str(recorder.last_error)
     pcm = recorder.stop()
     assert pcm and set(pcm[::2]) == {2}
     recorder.cleanup()
 
 
+def test_helper_whose_audio_session_leaked_is_not_used_again(tmp_path):
+    recorder = recorder_for(tmp_path, helper(leaks_session=True))
+    assert recorder.start()
+    poisoned = recorder._process
+    assert wait_for(lambda: recorder.capture_snapshot().audio_seconds > 0.05)
+    assert recorder.stop()
+    assert wait_for(lambda: poisoned.poll() is not None)  # It left rather than record from a stale device list.
+    assert recorder.start()
+    assert recorder._process is not poisoned
+    assert recorder.reset_count == 0
+    assert recorder.stop()
+    recorder.cleanup()
+
+
 def test_device_listing_reports_what_automatic_would_use(tmp_path):
-    recorder = IsolatedAudioRecorder(tmp_path, command=helper(), prefer_builtin=False)
+    recorder = recorder_for(tmp_path, helper(), prefer_builtin=False)
     devices = recorder.list_input_devices()
     assert [device.name for device in devices] == ["MacBook Pro Microphone", "AirPods"]
     assert recorder.automatic_device_name == "AirPods"
@@ -269,8 +377,79 @@ def test_device_listing_reports_what_automatic_would_use(tmp_path):
     recorder.cleanup()
 
 
+def test_helper_that_survives_being_killed_does_not_strand_the_lock(tmp_path):
+    recorder = recorder_for(tmp_path, helper())
+
+    class Unkillable:
+        pid = 1
+        stdin = stdout = None
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("helper", timeout)
+
+    recorder._kill(Unkillable())  # Logged, not raised.
+    assert recorder._operation_lock.acquire(blocking=False)
+    recorder._operation_lock.release()
+    recorder.cleanup()
+
+
+def test_helper_whose_output_closes_just_before_it_exits_is_still_replaced(tmp_path):
+    marker = tmp_path / "first-attempt"
+    body = f'''
+import os
+if not os.path.exists({str(marker)!r}):
+    open({str(marker)!r}, "w").close()
+    os.close(1)       # The reader sees the end of output...
+    time.sleep(0.2)   # ...before the exit status exists.
+    os._exit(0)
+print(json.dumps({{"event":"ready","device":"Fake"}}),flush=True)
+sys.stdin.readline()
+print(json.dumps({{"event":"done"}}),flush=True)
+'''
+    recorder = recorder_for(tmp_path, command(body))
+    assert recorder.start()
+    assert recorder.last_error is None and recorder.reset_count == 0
+    recorder.stop()
+    recorder.cleanup()
+
+
+def test_slow_to_die_helper_does_not_close_the_recorder_for_good(tmp_path):
+    recorder = recorder_for(tmp_path, helper())
+
+    class Lingering:
+        pid = 1
+        stdin = stdout = None
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("helper", timeout)
+
+    release = threading.Event()
+    recorder._process = Lingering()
+    recorder._reader = threading.Thread(target=release.wait, daemon=True)  # Waiting on its pipe, holding no lock.
+    recorder._reader.start()
+    with recorder._operation_lock:
+        recorder._retire_process()
+    release.set()
+    assert not recorder._closed
+    assert recorder.start()  # A fresh helper; the old reader was simply left behind.
+    recorder.stop()
+    recorder.cleanup()
+
+
 def test_standby_helper_that_was_killed_is_replaced_without_failing_the_recording(tmp_path):
-    recorder = IsolatedAudioRecorder(tmp_path, command=helper())
+    recorder = recorder_for(tmp_path, helper())
     recorder.prepare()
     dead = recorder._process
     dead.kill()
@@ -294,7 +473,7 @@ print(json.dumps({{"event":"ready","device":"Fake"}}),flush=True)
 sys.stdin.readline()
 print(json.dumps({{"event":"done"}}),flush=True)
 '''
-    recorder = IsolatedAudioRecorder(tmp_path, command=command(body))
+    recorder = recorder_for(tmp_path, command(body))
     before = time.monotonic()
     assert recorder.start()
     assert time.monotonic() - before < 3
