@@ -51,7 +51,8 @@ def controller(monkeypatch):
         set_queue_processing=lambda _on: None,
         hide=lambda: calls.append("window hidden"),
     )
-    app.indicator = SimpleNamespace(show=lambda: calls.append("passive bar"),
+    app._dictate = module.dictation_shortcut(0x31, 1 << 11)
+    app.indicator = SimpleNamespace(show=lambda shortcut: calls.append("passive bar"),
                                     set_capture=lambda _snapshot: None,
                                     set_transcribing=lambda: calls.append("bar transcribing"),
                                     finish=lambda message, duration: calls.append(("bar finished", duration)),

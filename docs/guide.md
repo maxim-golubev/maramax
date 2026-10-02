@@ -4,7 +4,12 @@ Everything the app does and where it keeps things. For a first launch, see [the 
 
 ## Everyday dictation
 
-- Press **Option+Space** to start, then **Option+Space** or **Cmd+R** to finish.
+- Press **Option+Space** to start, then **Option+Space** or **Cmd+R** to finish. The
+  first launch opens a short welcome that lets you pick another shortcut (and
+  whether to paste); change it any time under **Settings → General → Shortcut**,
+  or reopen the welcome from **More → Welcome…**. Shortcuts macOS keeps for
+  itself (Spotlight's Cmd+Space, the input-source switches) and Cmd+letter
+  combinations apps rely on are refused with the reason.
 - A small bar shows the selected microphone, captured duration, and actual input
   level without taking focus from your current app. Cmd+R is registered globally
   only while recording from the compact bar; it is released afterward.

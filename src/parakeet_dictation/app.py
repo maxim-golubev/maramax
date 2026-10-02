@@ -23,7 +23,7 @@ from .corrections import apply_replacements, vocabulary_hint
 from .export import ExportError, OutputMode, export_results
 from .file_queue import QueueStatus, TranscriptionQueue
 from .history import HistoryStore, Source, adopt_legacy_history
-from .hotkeys import DICTATE, STOP, GlobalHotKeyManager, HotKeyError
+from .hotkeys import STOP, GlobalHotKeyManager, HotKeyError, HotKeySpec, dictation_shortcut, shortcut_problem
 from .indicator import DictationIndicator
 from .isolated_recorder import IsolatedAudioRecorder
 from .logger_config import logger
@@ -35,11 +35,12 @@ from .recordings import RecordingStatus, RecordingStore, recovery_candidate
 from .recordings_window import RecordingsController
 from .transcription import ParakeetTranscriber, QwenTranscriber, TranscriptionCancelled, TranscriptionError
 from .update_offer import CHECK_TITLE, UpdateOffer
+from .welcome import WelcomeController
 
 _SETTING_LABELS = {
     "compact_dictation": "Use the compact dictation bar",
     "prefer_builtin_mic": "Prefer the Mac’s own microphone in Automatic",
-    "auto_start_recording": f"Start dictating on {DICTATE.label}",
+    "auto_start_recording": "Start dictating as soon as the shortcut is pressed",
     "auto_copy_to_clipboard": "Copy the transcript to the clipboard",
     "paste_to_active_app": "Paste into the active app",
     "live_preview": "Show a live preview in the full window",
@@ -49,25 +50,17 @@ _SETTING_LABELS = {
 }
 _PASTE_LABEL = _SETTING_LABELS["paste_to_active_app"]
 
-INTRO_TEXT = (
-    f"Press {DICTATE.label} to dictate. Press it again, or {STOP.label}, to finish.\n\n"
-    f"Your transcript is copied automatically. Turn on “{_PASTE_LABEL}” in Settings "
-    "for direct insertion. Saved audio and retries are in Recordings."
-)
-EMPTY_HISTORY_TEXT = (
-    "No transcriptions yet.\n\n"
-    f"Use {DICTATE.label} to dictate, or drop audio and video files into this window."
-)
-QUICK_START_TEXT = (
-    f"Press {DICTATE.label} to start dictating and again to finish. {STOP.label} also finishes a recording.\n\n"
-    "The small bar leaves your current app focused. Your words copy to the clipboard. "
-    f"Turn on “{_PASTE_LABEL}” in Settings for automatic insertion; macOS will require Accessibility access.\n\n"
-    "Settings → Microphone chooses the input. Automatic follows macOS, or prefers the Mac’s own "
-    "microphone so headphones stay in high-quality playback. Bluetooth microphones need a moment "
-    "to connect: start speaking when the bar says Recording.\n\n"
-    "Recordings keeps audio for playback, export, and retry. "
-    "Speech recognition runs locally; model weights download on first use."
-)
+
+
+def intro_text(shortcut: str) -> str:
+    return (f"Press {shortcut} to dictate. Press it again, or {STOP.label}, to finish.\n\n"
+            f"Your transcript is copied automatically. Turn on “{_PASTE_LABEL}” in Settings "
+            "for direct insertion. Saved audio and retries are in Recordings.")
+
+
+def empty_history_text(shortcut: str) -> str:
+    return f"No transcriptions yet.\n\nUse {shortcut} to dictate, or drop audio and video files into this window."
+
 
 _HEALTH_STATUS = {
     CaptureHealth.WAITING: "Waiting for microphone signal…",
@@ -132,6 +125,7 @@ class DictationApp(rumps.App):
         self._support_dir = support_dir or app_support_dir()
         self._settings_path = self._support_dir / "settings.json"
         self.config = config or AppConfig.load(self._settings_path)
+        self._dictate = dictation_shortcut(*self.config.dictation_shortcut)
         self.transcriber = ParakeetTranscriber()
         self.qwen = QwenTranscriber(
             on_load_failed=self._on_qwen_load_failed,
@@ -181,6 +175,7 @@ class DictationApp(rumps.App):
         self._previous_app = None
         self._recordings_window: RecordingsController | None = None
         self._preferences_window: PreferencesController | None = None
+        self._welcome_window: WelcomeController | None = None
 
         self.status_item = rumps.MenuItem(f"Status: {self._resting_status}")
         self.record_menu = rumps.MenuItem("Start Dictation")
@@ -194,7 +189,7 @@ class DictationApp(rumps.App):
             update_item,
             ("More", [rumps.MenuItem(name) for name in (
                 "History", "Open Media Files…", "Copy Last Transcript", "Recover Last Recording",
-                "Retry Speech Model", "Clear History & Recordings…", "Quick Start…",
+                "Retry Speech Model", "Clear History & Recordings…", "Welcome…",
             )]),
             None,
             self.status_item,
@@ -205,7 +200,7 @@ class DictationApp(rumps.App):
         self.indicator = DictationIndicator.alloc().initWithDelegate_(self)
         self.overlay_controller.set_status(self._resting_status)
         self.overlay_controller.set_history_text(self._history_text())
-        self.overlay_controller.set_intro_text(INTRO_TEXT)
+        self.overlay_controller.set_intro_text(intro_text(self._dictate.label))
 
         self.updates = UpdateOffer(
             menu_item=update_item, current_version=__version__, installed_app=app_bundle(),
@@ -217,6 +212,8 @@ class DictationApp(rumps.App):
         self._start_model_watchdog()
         self._register_global_hotkeys()
         self.updates.start()
+        if not self.config.onboarded:
+            call_later(1.0, self.show_welcome)
         # Opening even a temporary mic at launch can change a Bluetooth
         # playback route. Capture is opened only after an explicit request.
 
@@ -320,11 +317,12 @@ class DictationApp(rumps.App):
     def _register_global_hotkeys(self) -> None:
         try:
             self.hotkey_manager = GlobalHotKeyManager(self.dictation_hotkey_pressed)
-            self.hotkey_manager.register_dictation_shortcut()
-            logger.info(f"Registered global shortcut: {DICTATE.label}")
+            self.hotkey_manager.set_dictation_shortcut(self._dictate)
+            logger.info(f"Registered global shortcut: {self._dictate.label}")
         except HotKeyError as exc:
             logger.error(f"Global hotkey registration failed: {exc}")
-            self._hotkey_error_message = f"{DICTATE.label} unavailable. Check macOS shortcut conflicts."
+            self._hotkey_error_message = (f"{self._dictate.label} unavailable — choose another shortcut in "
+                                          "Settings")
             self._push_status(self._hotkey_error_message)
 
     # -- What the user asks for --
@@ -411,7 +409,7 @@ class DictationApp(rumps.App):
             message = self.transcriber.status_message()
             if self.config.compact_dictation and not self.overlay_visible:
                 self._compact_session = True
-                self.indicator.show()
+                self.indicator.show(self._dictate.label)
                 self.indicator.finish(message, BAR_SECONDS_AFTER_PROBLEM)
             self._push_status(message)
             return False
@@ -445,7 +443,7 @@ class DictationApp(rumps.App):
             self._recordings_window.stop_playback()
         self.overlay_controller.prepare_for_recording()
         if self._compact_session:
-            self.indicator.show()
+            self.indicator.show(self._dictate.label)
             self._set_recording_shortcut(True)
         else:
             self.overlay_visible = True
@@ -516,7 +514,7 @@ class DictationApp(rumps.App):
         try:
             self.hotkey_manager.set_recording_shortcut(stop_current_session if enabled else None)
         except HotKeyError as exc:
-            logger.warning(f"{STOP.label} unavailable; use {DICTATE.label}: {exc}")
+            logger.warning(f"{STOP.label} unavailable; use {self._dictate.label}: {exc}")
 
     def _monitor_capture(self, session: int) -> None:
         if session != self._session or self._phase is not Phase.RECORDING or self._shutting_down:
@@ -1080,7 +1078,7 @@ class DictationApp(rumps.App):
             return
         if not accessibility_trusted():
             self._push_status("Auto-paste needs Accessibility permission", revert_after=8)
-            self._open_accessibility_settings()
+            self.open_accessibility_settings()
             return
 
         target = self._previous_app
@@ -1126,7 +1124,7 @@ class DictationApp(rumps.App):
         self._save_settings()
         if name == "paste_to_active_app" and value and not accessibility_trusted():
             self._push_status("Grant Accessibility access to enable auto-paste", revert_after=8)
-            self._open_accessibility_settings()
+            self.open_accessibility_settings()
         elif name == "high_accuracy":
             if value:
                 self.qwen.start_loading()
@@ -1189,11 +1187,75 @@ class DictationApp(rumps.App):
             self._push_status("Settings could not be saved — check available disk space", revert_after=8)
             return False
 
-    def _open_accessibility_settings(self) -> None:
+    def open_accessibility_settings(self) -> None:
         subprocess.Popen([
             "open",
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
         ])
+
+    # -- The dictation shortcut (the picker in Settings and Welcome) --
+
+    def current_shortcut(self) -> HotKeySpec:
+        return self._dictate
+
+    def choose_shortcut(self, key_code: int, modifiers: int) -> str | None:
+        """Make this the dictation shortcut. Returns why it cannot be, or None."""
+        problem = shortcut_problem(key_code, modifiers)
+        if problem is not None:
+            return problem
+        spec = dictation_shortcut(key_code, modifiers)
+        if self.hotkey_manager is not None:
+            try:
+                self.hotkey_manager.set_dictation_shortcut(spec)
+            except HotKeyError as exc:
+                logger.warning(f"Could not register {spec.label}: {exc}")
+                self.resume_shortcut()  # The previous one, if recording had paused it.
+                return f"{spec.label} is already used by another app. Choose another."
+        self._dictate = spec
+        self._hotkey_error_message = None
+        self.config.dictation_shortcut = [key_code, modifiers]
+        self._save_settings()
+        logger.info(f"Dictation shortcut is now {spec.label}")
+        self.overlay_controller.set_intro_text(intro_text(spec.label))
+        self._refresh_history_on_main()
+        self._refresh_preferences()
+        if self._welcome_window is not None:
+            self._welcome_window.refresh()
+        return None
+
+    def pause_shortcut(self) -> None:
+        """While new keys are recorded, the current shortcut must not fire."""
+        if self.hotkey_manager is not None:
+            self.hotkey_manager.set_dictation_shortcut(None)
+
+    def resume_shortcut(self) -> None:
+        if self.hotkey_manager is not None:
+            try:
+                self.hotkey_manager.set_dictation_shortcut(self._dictate)
+            except HotKeyError as exc:
+                logger.error(f"Could not register {self._dictate.label} again: {exc}")
+                self._hotkey_error_message = f"{self._dictate.label} unavailable — choose another shortcut in Settings"
+                self._push_status(self._hotkey_error_message)
+
+    # -- Welcome --
+
+    def show_welcome(self) -> None:
+        if self._welcome_window is None:
+            self._welcome_window = WelcomeController.alloc().initWithDelegate_(self)
+        self._welcome_window.show()
+
+    def finish_welcome(self) -> None:
+        if not self.config.onboarded:
+            self.config.onboarded = True
+            self._save_settings()
+
+    def set_paste_into_apps(self, enabled: bool) -> None:
+        self.config.paste_to_active_app = enabled
+        self._save_settings()
+        self._refresh_preferences()
+
+    def paste_permitted(self) -> bool:
+        return accessibility_trusted()
 
     # -- History and recordings windows --
 
@@ -1242,7 +1304,7 @@ class DictationApp(rumps.App):
 
     def _history_text(self) -> str:
         rendered = self.history_store.render()
-        return EMPTY_HISTORY_TEXT if rendered is None else rendered
+        return empty_history_text(self._dictate.label) if rendered is None else rendered
 
     def _refresh_history_on_main(self) -> None:
         AppHelper.callAfter(self.overlay_controller.set_history_text, self._history_text())
@@ -1397,10 +1459,10 @@ class DictationApp(rumps.App):
         del sender
         self.clear_history_requested()
 
-    @rumps.clicked("More", "Quick Start…")
-    def menu_quick_start(self, sender):
+    @rumps.clicked("More", "Welcome…")
+    def menu_welcome(self, sender):
         del sender
-        rumps.alert(title="Welcome to Maramax", message=QUICK_START_TEXT)
+        self.show_welcome()
 
     @rumps.clicked("Quit")
     def menu_quit(self, sender):

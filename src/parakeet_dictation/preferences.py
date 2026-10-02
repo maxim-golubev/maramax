@@ -16,6 +16,7 @@ from Foundation import NSObject
 from . import __version__
 from .corrections import MAX_HEARD_CHARS, MAX_REPLACEMENT_CHARS, MAX_RULES, normalize_rules
 from .hotkeys import STOP
+from .shortcut_picker import ShortcutPicker
 
 MARGIN = 24
 CONTENT_WIDTH = 512
@@ -40,10 +41,11 @@ _HELP = {
                        "Whole words and phrases, ignoring capitalization. "
                        "The original text stays in History and Recordings.",
 }
+_DICTATION = "Dictation"
 _SPEECH_MODEL = "Speech model"
 _UPDATES = "Updates"
 _SECTIONS = (
-    ("Dictation", ("compact_dictation", "auto_start_recording", "live_preview")),
+    (_DICTATION, ("compact_dictation", "auto_start_recording", "live_preview")),
     ("Result", ("auto_copy_to_clipboard", "paste_to_active_app")),
     (_SPEECH_MODEL, ("high_accuracy",)),
     (_UPDATES, ("check_for_updates",)),
@@ -88,6 +90,8 @@ class PreferencesController(NSObject):
         self.panel.setReleasedWhenClosed_(False)
         # A menu-bar app has no Dock icon to bring a hidden panel back with.
         self.panel.setHidesOnDeactivate_(False)
+        self.panel.setDelegate_(self)
+        self.shortcut_picker = ShortcutPicker.alloc().initWithOwner_width_(delegate, CONTENT_WIDTH)
         root = self.panel.contentView()
 
         self.tabs = NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(0, 0, 330, 24))
@@ -195,6 +199,9 @@ class PreferencesController(NSObject):
     @objc.python_method
     def _general_page(self):
         sections = {title: [self._header(title)] + [self._option(name) for name in names] for title, names in _SECTIONS}
+        shortcut_row = self._stack([NSTextField.labelWithString_("Shortcut"), self.shortcut_picker.view],
+                                   horizontal=True, spacing=ROW_GAP)
+        sections[_DICTATION].insert(1, shortcut_row)
         self.model_status = self._help("")
         self.model_retry = self._button("Retry", "retryModel:")
         sections[_SPEECH_MODEL].append(self._stack([self.model_status, self.model_retry], horizontal=True,
@@ -294,6 +301,8 @@ class PreferencesController(NSObject):
             button.setState_(int(getattr(config, name)))
         self.model_status.setStringValue_(self._model_message())
         self.model_retry.setHidden_(self.delegate.transcriber.load_error is None)
+        if not self.shortcut_picker.is_recording():
+            self.shortcut_picker.refresh()
         self.show_update_status()
 
         # A hand-edited duration stays visible instead of snapping to a preset.
@@ -346,6 +355,10 @@ class PreferencesController(NSObject):
         self.panel.makeKeyAndOrderFront_(None)
         if self.tabs.selectedSegment() == 1:
             self.refreshDevices_(None)
+
+    def windowWillClose_(self, notification):
+        del notification
+        self.shortcut_picker.stop_recording()  # Never leave the global shortcut paused.
 
     def selectTab_(self, sender):
         index = self.tabs.selectedSegment()

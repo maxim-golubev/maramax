@@ -1,7 +1,7 @@
 # Maramax
 
-On-device dictation for Apple Silicon Macs. Press **Option+Space**, speak, press
-it again: NVIDIA's Parakeet model transcribes on the GPU through MLX, and the
+On-device dictation for Apple Silicon Macs. Press **Option+Space** (or a
+shortcut you choose), speak, press it again: NVIDIA's Parakeet model transcribes on the GPU through MLX, and the
 text is copied, or pasted into the app you were using. No audio or text leaves
 the Mac.
 

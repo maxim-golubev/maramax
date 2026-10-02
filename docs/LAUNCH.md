@@ -6,10 +6,12 @@
 2. The first time, macOS blocks it: Maramax is signed with its own release
    certificate but not notarized by Apple. Open **System Settings → Privacy &
    Security** and choose **Open Anyway**. The app then appears in the menu bar.
-3. The first launch downloads the speech model (about 2.5 GB). After that it
+3. A short welcome asks which shortcut you want (Option+Space is recommended)
+   and whether Maramax should paste the text for you or only copy it. Meanwhile
+   the first launch downloads the speech model (about 2.5 GB); after that it
    loads from the local cache in a few seconds, with no network request.
-4. Press **Option+Space** and speak; press **Option+Space** again, or **Cmd+R**,
-   to finish. The transcript is on your clipboard: paste it with **Cmd+V**.
+4. Press your shortcut and speak; press it again, or **Cmd+R**, to finish. The
+   transcript is on your clipboard: paste it with **Cmd+V**.
 
 macOS asks for microphone access the first time you dictate; allow it. If you
 denied it earlier, switch Maramax on under **System Settings → Privacy &

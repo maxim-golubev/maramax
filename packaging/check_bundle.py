@@ -43,6 +43,7 @@ def check(args: argparse.Namespace) -> dict:
         "parakeet_dictation.recordings_window", "mlx.core", "parakeet_mlx", "parakeet_mlx.alignment",
         "parakeet_dictation.preferences", "parakeet_dictation.instance",
         "parakeet_dictation.updater", "parakeet_dictation.update_offer", "parakeet_dictation.update_window",
+        "parakeet_dictation.welcome", "parakeet_dictation.shortcut_picker",
         "qwen3_asr_mlx", "pyaudio", "soundfile", "scipy", "numpy",
         "tokenizers", "huggingface_hub", "httpx", "certifi", "AppKit",
     ]
@@ -69,6 +70,7 @@ def check(args: argparse.Namespace) -> dict:
     from parakeet_dictation.recordings_window import RecordingsController
     from parakeet_dictation.overlay import OverlayController
     from parakeet_dictation.app import _SETTING_LABELS
+    from parakeet_dictation.hotkeys import DEFAULT_DICTATE
     from parakeet_dictation.recordings import RecordingStatus
 
     # The spectrogram front end pulls in a filter-bank dependency that no
@@ -97,13 +99,19 @@ def check(args: argparse.Namespace) -> dict:
             transcriber=SimpleNamespace(load_error=None, status_message=lambda: "Speech model ready"),
             qwen=SimpleNamespace(status_message=lambda: "High-accuracy model ready"),
             updates=SimpleNamespace(status_text=lambda: "Not checked yet.", can_check=lambda: True),
+            current_shortcut=lambda: DEFAULT_DICTATE, choose_shortcut=lambda key, modifiers: None,
+            pause_shortcut=lambda: None, resume_shortcut=lambda: None,
+            paste_permitted=lambda: False, set_paste_into_apps=lambda enabled: None,
+            open_accessibility_settings=lambda: None, finish_welcome=lambda: None,
         )
         preferences = PreferencesController.alloc().initWithDelegate_labels_(delegate, _SETTING_LABELS)
         recordings = RecordingsController.alloc().initWithDelegate_store_(delegate, store)
         overlay = OverlayController.alloc().initWithDelegate_(delegate)
         from parakeet_dictation.update_window import UpdateProgressWindow
+        from parakeet_dictation.welcome import WelcomeController
         update_window = UpdateProgressWindow.alloc().initWithCancel_(lambda: None)
-        for controller in (preferences, recordings, overlay, update_window):
+        welcome = WelcomeController.alloc().initWithDelegate_(delegate)
+        for controller in (preferences, recordings, overlay, update_window, welcome):
             assert not controller.panel.isVisible()
         assert recordings.sound is None
         pcm = b"\x01\x00" * 16000

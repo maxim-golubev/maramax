@@ -38,7 +38,7 @@ def paste_context(monkeypatch):
     app.overlay_visible = False
     app.overlay_controller = SimpleNamespace(hide=lambda: events.append("hide"))
     app._push_status = lambda message, *args, **kwargs: statuses.append(message)
-    app._open_accessibility_settings = lambda: events.append("settings")
+    app.open_accessibility_settings = lambda: events.append("settings")
     return app, front, events, scheduled, statuses
 
 

@@ -24,7 +24,8 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Maramax for macOS.\n\n"
-            "Press Option+Space to start dictating and again, or Cmd+R, to finish. "
+            "Press your dictation shortcut (Option+Space unless you chose another) to start dictating "
+            "and again, or Cmd+R, to finish. "
             "The transcript is copied to the clipboard; turn on “Paste into the active app” in Settings for insertion."
         )
     )

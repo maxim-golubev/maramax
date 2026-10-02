@@ -15,7 +15,7 @@ from AppKit import (
 )
 from Foundation import NSObject
 
-from .hotkeys import DICTATE, STOP
+from .hotkeys import STOP
 from .main_thread import call_later
 
 WIDTH = 440
@@ -251,15 +251,15 @@ class DictationIndicator(NSObject):
         return button
 
     @objc.python_method
-    def show(self):
+    def show(self, shortcut):
         self._token += 1
         self._finished = False
-        self.stop_button.set_kind(Glyph.STOP, f"Finish dictation ({DICTATE.label} or {STOP.label})")
+        self.stop_button.set_kind(Glyph.STOP, f"Finish dictation ({shortcut} or {STOP.label})")
         self.stop_button.setEnabled_(True)
         self.meter.reset()
         self._layout_text(True)
         self.set_status("Connecting microphone…")
-        self.detail.setStringValue_(f"{DICTATE.label} or {STOP.label} to finish")
+        self.detail.setStringValue_(f"{shortcut} or {STOP.label} to finish")
         screen = NSScreen.mainScreen()
         if screen is not None:
             visible = screen.visibleFrame()

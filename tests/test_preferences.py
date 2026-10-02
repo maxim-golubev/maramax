@@ -13,6 +13,7 @@ from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
 from parakeet_dictation.preferences import PreferencesController
 from parakeet_dictation.config import AppConfig
 from parakeet_dictation.app import _SETTING_LABELS
+from parakeet_dictation.hotkeys import DEFAULT_DICTATE
 
 NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyProhibited)
 path = Path(sys.argv[1]) / "settings.json"
@@ -22,6 +23,8 @@ delegate = SimpleNamespace(
     transcriber=SimpleNamespace(load_error=None, status_message=lambda: "Speech model ready"),
     qwen=SimpleNamespace(status_message=lambda: "Loading the high-accuracy model…"),
     updates=SimpleNamespace(status_text=lambda: "This is the newest version.", can_check=lambda: True),
+    current_shortcut=lambda: DEFAULT_DICTATE, choose_shortcut=lambda key, modifiers: None,
+    pause_shortcut=lambda: None, resume_shortcut=lambda: None,
 )
 def replace_word_rules(rules):
     config.replacements = rules

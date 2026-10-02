@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .atomic_file import set_aside, write_text_atomically
 from .corrections import normalize_rules
+from .hotkeys import DEFAULT_DICTATE, shortcut_problem
 
 # How long the microphone may stay connected after a dictation.
 MAX_KEEP_MIC_READY_SECONDS = 600
@@ -29,6 +30,11 @@ class AppConfig:
     use_corrections: bool = True
     replacements: list[dict[str, str]] = field(default_factory=list)
     check_for_updates: bool = True
+    # [virtual key code, Carbon modifier bits]; see hotkeys.shortcut_problem().
+    dictation_shortcut: list[int] = field(
+        default_factory=lambda: [DEFAULT_DICTATE.key_code, DEFAULT_DICTATE.modifiers])
+    # The welcome window has been through once (it can be reopened from the menu).
+    onboarded: bool = False
     # A release the user chose "Skip This Version" for; automatic checks do not offer it again.
     skipped_update_version: str | None = None
     # Settings written by a newer version, kept so saving here (for example
@@ -68,6 +74,12 @@ class AppConfig:
             if name in ("input_device", "skipped_update_version"):
                 if value is None or (isinstance(value, str) and value.strip()):
                     setattr(config, name, value)
+                continue
+            if name == "dictation_shortcut":
+                if (isinstance(value, list) and len(value) == 2
+                        and all(isinstance(part, int) and not isinstance(part, bool) for part in value)
+                        and shortcut_problem(*value) is None):
+                    config.dictation_shortcut = value
                 continue
             if name == "keep_mic_ready_seconds":
                 if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_KEEP_MIC_READY_SECONDS:
