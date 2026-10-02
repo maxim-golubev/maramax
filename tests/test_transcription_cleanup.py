@@ -361,9 +361,25 @@ def test_a_repair_that_changes_the_words_is_not_accepted():
     original = words("so i think we should go and then we said that we can")
     reworded = words("So, I thought we could go. And then she said that we can.")
     same = words("So I think we should go. And then we said that we can.")
-    assert transcription.repair_acceptable(original, same, 0.0, 6.4)
-    assert not transcription.repair_acceptable(original, reworded, 0.0, 6.4)
-    assert not transcription.repair_acceptable(original, original, 0.0, 6.4)  # Still unformatted.
+    span = (0.0, 6.4)
+    assert transcription.repair_acceptable(original, same, span, span)
+    assert not transcription.repair_acceptable(original, reworded, span, span)
+    assert not transcription.repair_acceptable(original, original, span, span)  # Still unformatted.
+
+
+def test_a_repair_may_not_reword_the_formatted_text_around_the_stretch():
+    lead_in = words("The meeting went well. We agreed on the plan.", start=0.0)
+    stretch = words("so i think we should go and then we said that we", start=10.0)
+    fixed = words("So I think we should go. And then we said that we.", start=10.0)
+    reworded_lead_in = words("The meeting went badly. We argued about the plan.", start=0.0)
+    span, replaced = (10.0, 15.9), (0.0, 15.9)
+    assert transcription.repair_acceptable(lead_in + stretch, lead_in + fixed, span, replaced)
+    assert not transcription.repair_acceptable(lead_in + stretch, reworded_lead_in + fixed, span, replaced)
+
+
+def test_a_splice_and_its_check_agree_on_what_is_replaced():
+    assert transcription.replaced_range(5.0, 30.0, 60.0) == (9.0, 26.0)
+    assert transcription.replaced_range(0.0, 60.0, 60.0) == (0.0, 60.0)   # Nothing beyond the audio to merge with.
 
 
 def test_a_cancel_during_the_repair_keeps_the_finished_first_pass(monkeypatch):
@@ -374,7 +390,7 @@ def test_a_cancel_during_the_repair_keeps_the_finished_first_pass(monkeypatch):
     def cancel_after_first_pass(*position):
         progress.append(position)
         if len(progress) > 1:
-            raise transcription.TranscriptionError("Cancelled")
+            raise transcription.TranscriptionCancelled("Cancelled")
 
     text = transcriber.transcribe_pcm(FORTY_SECONDS, progress_callback=cancel_after_first_pass)
     assert text == "Hello there. so i think we should go and then i said that we can do it later today Thanks."

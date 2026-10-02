@@ -33,7 +33,7 @@ from .paths import app_bundle, app_support_dir, resource_path
 from .preferences import PreferencesController
 from .recordings import RecordingStatus, RecordingStore, recovery_candidate
 from .recordings_window import RecordingsController
-from .transcription import ParakeetTranscriber, QwenTranscriber, TranscriptionError
+from .transcription import ParakeetTranscriber, QwenTranscriber, TranscriptionCancelled, TranscriptionError
 from .update_offer import CHECK_TITLE, UpdateOffer
 
 _SETTING_LABELS = {
@@ -581,7 +581,7 @@ class DictationApp(rumps.App):
     def _check_cancel(self, current_pos, total_pos) -> None:
         del current_pos, total_pos
         if self._cancel_event.is_set():
-            raise TranscriptionError("Cancelled")
+            raise TranscriptionCancelled("Cancelled")
 
     def _vocabulary_hint(self) -> str | None:
         # The high-accuracy model can be told how the user's names and
@@ -594,7 +594,7 @@ class DictationApp(rumps.App):
         still produce a transcript."""
         encoder_free = self.transcriber.finish_drafts()
         if cancel_event.is_set():
-            raise TranscriptionError("Cancelled")
+            raise TranscriptionCancelled("Cancelled")
         if self.qwen.is_ready() and (self.config.high_accuracy or not encoder_free):
             try:
                 text = qwen_pass()
@@ -605,7 +605,7 @@ class DictationApp(rumps.App):
                 # Any Qwen failure falls back to the standard engine.
                 logger.error(f"High-accuracy transcription failed, falling back: {exc}")
         if cancel_event.is_set():
-            raise TranscriptionError("Cancelled")
+            raise TranscriptionCancelled("Cancelled")
         if not encoder_free:
             raise TranscriptionError("Transcription engine stalled — restart the app")
         return parakeet_pass()
@@ -779,7 +779,7 @@ class DictationApp(rumps.App):
     def _transcribe_file_worker(self, path: str, filename: str, session: int) -> None:
         def _progress(current_pos, total_pos):
             if self._cancel_event.is_set():
-                raise TranscriptionError("Cancelled")
+                raise TranscriptionCancelled("Cancelled")
             pct = int(current_pos / total_pos * 100) if total_pos > 0 else 0
             self._push_status(f"{filename}: {pct}%")
 
@@ -962,7 +962,7 @@ class DictationApp(rumps.App):
 
                 def _progress(current_pos, total_pos, _label=f"{prefix}{item.filename}"):
                     if self._queue_cancel_event.is_set():
-                        raise TranscriptionError("Cancelled")
+                        raise TranscriptionCancelled("Cancelled")
                     pct = int(current_pos / total_pos * 100) if total_pos > 0 else 0
                     self._push_status(f"{_label}: {pct}%")
 

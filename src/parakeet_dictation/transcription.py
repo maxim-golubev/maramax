@@ -55,7 +55,7 @@ REPAIR_CONTEXT_SECONDS = 5.0
 REPAIR_RETRY_LEAD_SECONDS = 15.0    # a window that collapsed too is tried once more, starting this early
 # A repair may change capitals and punctuation, not what was said.
 MIN_WORD_AGREEMENT = 0.9
-MAX_REPAIRS = 6
+MAX_STRETCHES = 6                   # unformatted stretches tried per capture
 _PUNCTUATION = re.compile(r"[.,?!;:]")
 _LOWER_I = re.compile(r"i(?:['’][a-z]+)?")
 _CAPITAL = re.compile(r"[A-Z]")
@@ -64,6 +64,10 @@ _TIMING_SLACK_SECONDS = 0.5
 
 class TranscriptionError(RuntimeError):
     pass
+
+
+class TranscriptionCancelled(TranscriptionError):
+    """The user cancelled: raised from a progress callback to stop recognition."""
 
 
 class Word(NamedTuple):
@@ -98,15 +102,32 @@ def word_agreement(original: list[Word], candidate: list[Word]) -> float:
     return difflib.SequenceMatcher(a=bare(original), b=bare(candidate), autojunk=False).ratio()
 
 
-def repair_acceptable(original: list[Word], candidate: list[Word], start: float, end: float) -> bool:
-    """Whether `candidate` may replace the stretch from `start` to `end`
-    seconds: formatted throughout and saying the same words. Word times move
-    a little between recognitions, so the comparison reaches slightly past
-    both ends."""
-    def near(words: list[Word]) -> list[Word]:
-        return [word for word in words if start - _TIMING_SLACK_SECONDS <= word.start < end + _TIMING_SLACK_SECONDS]
+def replaced_range(start: float, end: float, seconds: float) -> tuple[float, float]:
+    """The part of a repair window from `start` to `end` seconds that a
+    splice takes from the re-recognition alone. Within one overlap of an
+    inner edge the two are merged on the words they share; an edge at the
+    start or end of the audio has nothing to merge with."""
+    return (start + REPAIR_OVERLAP_SECONDS if start > 0 else 0.0,
+            end - REPAIR_OVERLAP_SECONDS if end < seconds else seconds)
+
+
+def repair_acceptable(original: list[Word], candidate: list[Word], span: tuple[float, float],
+                      replaced: tuple[float, float]) -> bool:
+    """Whether `candidate` may replace what lies in `replaced`: formatted
+    throughout, and saying the same words both in the unformatted `span` and
+    in the formatted text around it, judged apart so agreeing context cannot
+    hide a change inside the stretch. Word times move a little between
+    recognitions, so each comparison reaches slightly past its ends."""
+    def within(words: list[Word], low: float, high: float) -> list[Word]:
+        return [word for word in words if low - _TIMING_SLACK_SECONDS <= word.start < high + _TIMING_SLACK_SECONDS]
+
+    def around_span(words: list[Word]) -> list[Word]:
+        inside = set(map(id, within(words, *span)))
+        return [word for word in within(words, *replaced) if id(word) not in inside]
+
     return (bool(candidate) and not collapsed_spans(candidate)
-            and word_agreement(near(original), near(candidate)) >= MIN_WORD_AGREEMENT)
+            and word_agreement(within(original, *span), within(candidate, *span)) >= MIN_WORD_AGREEMENT
+            and word_agreement(around_span(original), around_span(candidate)) >= MIN_WORD_AGREEMENT)
 
 
 def _words(tokens: list[AlignedToken]) -> list[Word]:
@@ -136,8 +157,9 @@ def _splice(tokens: list[AlignedToken], replacement: list[AlignedToken], start: 
     `replacement`, joined on the words both have near each edge. An edge at
     the start or end of the audio has nothing beyond it to join to: the
     replacement runs to it."""
-    before = [token for token in tokens if token.start < start + REPAIR_OVERLAP_SECONDS] if start > 0 else []
-    after = [token for token in tokens if token.end > end - REPAIR_OVERLAP_SECONDS] if end < seconds else []
+    low, high = replaced_range(start, end, seconds)
+    before = [token for token in tokens if token.start < low] if start > 0 else []
+    after = [token for token in tokens if token.end > high] if end < seconds else []
     joined = _merge(before, replacement, REPAIR_OVERLAP_SECONDS) if before else replacement
     return _merge(joined, after, REPAIR_OVERLAP_SECONDS) if after else joined
 
@@ -332,7 +354,7 @@ class ParakeetTranscriber:
         # twice; a short capture's first pass already was its only window.
         tried = {(0, len(audio))} if len(audio) <= int(REPAIR_CHUNK_SECONDS * rate) else set()
         given_up: set[tuple[float, float]] = set()
-        for _ in range(MAX_REPAIRS):
+        for _ in range(MAX_STRETCHES):
             pending = [span for span in collapsed_spans(_words(tokens)) if span not in given_up]
             if not pending:
                 break
@@ -347,12 +369,13 @@ class ParakeetTranscriber:
                 if progress_callback is not None:
                     try:
                         progress_callback(len(audio), len(audio))
-                    except TranscriptionError:
+                    except TranscriptionCancelled:
                         logger.info("Cancelled while re-recognizing an unformatted stretch; keeping the first pass")
                         return tokens
                 candidate = self._tokens_in_chunks(audio, first, last, REPAIR_CHUNK_SECONDS, REPAIR_OVERLAP_SECONDS,
                                                    None)
-                if repair_acceptable(_words(tokens), _words(candidate), span_start, span_end):
+                if repair_acceptable(_words(tokens), _words(candidate), (span_start, span_end),
+                                     replaced_range(first / rate, last / rate, seconds)):
                     tokens = _splice(tokens, candidate, first / rate, last / rate, seconds)
                     logger.info(f"Recognized an unformatted stretch again ({span_start:.0f}–{span_end:.0f} s)")
                     break
