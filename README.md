@@ -1,186 +1,110 @@
-# Maramax 0.6.1
+# Maramax
 
-Local dictation for macOS on Apple Silicon. Parakeet recognizes speech on your
-Mac; an optional Qwen model provides an alternative final pass. Model weights
-download on first use. A complete cached standard model loads directly from disk
-without a network freshness check. Audio is not uploaded for recognition.
+Dictation for the Mac that never leaves the Mac.
 
-## Everyday dictation
+Press **Option+Space**, talk, press it again. The text lands on your clipboard,
+or is typed straight into the app you were using. Speech recognition runs on
+your Mac's GPU with NVIDIA's Parakeet model; no audio or text is sent anywhere.
 
-- Press **Option+Space** to start, then **Option+Space** or **Cmd+R** to finish.
-- A small bar shows the selected microphone, captured duration, and actual input
-  level without taking focus from your current app. Cmd+R is registered globally
-  only while recording from the compact bar; it is released afterward.
-- Results copy to the clipboard by default; turning **Copy the transcript to the
-  clipboard** off is honoured however a dictation is finished. **Settings → Paste
-  into the active app** enables insertion too, into the app you were last working
-  in. In compact mode, insertion is skipped if you switch to a different app while
-  dictating; the text stays copied. If the clipboard changes before insertion, or
-  you cancel while it is transcribing, nothing is pasted and the transcript
-  remains in history. Expanding the bar during an operation preserves its
-  original destination app.
-- Use the arrow in the bar or **Open Transcript** for the full transcript, history,
-  and file queue. Live transcription previews remain available in that window.
-- Disable **Use the compact dictation bar** to use the original window interaction.
-- Capture continues for a fifth of a second after you press stop, so a last
-  syllable still travelling through the driver or a Bluetooth link is not cut off.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/bar-dark.png">
+  <img alt="The Maramax dictation bar: a live level meter, the microphone in use, the elapsed time, and stop and expand buttons" src="docs/images/bar-light.png" width="440">
+</picture>
 
-**Settings…** opens native controls for these preferences and your word
-replacements. Enter a phrase the recognizer gets wrong and its desired spelling.
-Replacements match whole words or phrases without case sensitivity and apply
-once, preferring longer phrases. They apply to dictation and recording retries;
-the original transcript is retained in history and recording details. Imported
-media is transcribed without these replacements. No additional language model
-rewrites the text in this release. Standard editing shortcuts (Cmd+V, Cmd+C,
-Cmd+A, Cmd+Z, Cmd+W) work in Settings and the other windows.
+**[Download for Apple Silicon](https://github.com/maxim-golubev/maramax/releases/latest)** · [User guide](docs/guide.md) · [How it was tested](docs/validation.md)
 
-With **Use the high-accuracy model** on, the names and terms you entered as
-replacements are also given to that model as vocabulary before it listens
-(snippets, addresses, and lists are left out). On this Mac it is several times
-slower than the standard model (a five-minute dictation took about a minute
-instead of five seconds), so it stays off by default.
+## What it's like to use
 
-If the speech model cannot load, use **Retry Speech Model** after restoring your
-connection. **Quick Start…** explains recording, insertion, microphone selection,
-and recovery. A second copy of Maramax is blocked before it loads models or opens
-audio; quit the old copy before opening a different version.
+- **Fast.** On an M3 Pro a 20-second dictation is transcribed in about a third
+  of a second, and a four-minute one in under four.
+- **Out of the way.** A small bar shows the microphone, the time, and a live
+  level meter without taking focus from the app you are typing in.
+- **It doesn't lose what you said.** Every recording is saved before it is
+  transcribed, so a crash, a stuck Bluetooth driver, or a failed transcription
+  still leaves the audio to play back or retry.
+- **It learns your words.** Tell it how names and jargon it keeps mishearing
+  should be spelled.
+- **It keeps itself current.** Once a day it checks for a new version and
+  installs it when you say so.
 
-## Microphones and AirPods
+Also there if you want them: a second, larger recognizer (Qwen3-ASR 1.7B) that
+is better with unusual names, and batch transcription of audio and video files.
 
-Automatic mode prefers the Mac's built-in microphone when available, allowing
-headphones to remain an output device. It does not change the system input or
-output setting. Choose a specific microphone in **Settings → Microphone** to
-override automatic selection; that choice persists, and the Automatic entry names
-the microphone it would use right now. Disable **Prefer the Mac's own microphone
-in Automatic** to follow the system default instead. With the lid closed the
-built-in microphone is switched off in hardware, so the preference is skipped.
+## Install
 
-Maramax does not initialize PortAudio or open input at launch. Once the speech
-model is ready it starts its audio helper process on standby, without touching
-any device, so a recording pays only for the driver open rather than a process
-launch (about 125 ms saved per dictation on this Mac). Microphone startup and
-teardown run off the main UI thread. The bar distinguishes waiting for input,
-digital silence, and a stream that stopped delivering audio. Ordinary pauses
-after signal has arrived do not count as disconnections.
+1. Download `Maramax-<version>.zip` from
+   [Releases](https://github.com/maxim-golubev/maramax/releases/latest) and unzip it.
+2. Move `Maramax.app` to Applications and open it. It is signed for local use,
+   not notarized by Apple, so the first time macOS will refuse; open
+   **System Settings → Privacy & Security** and choose **Open Anyway**.
+3. The first launch downloads the speech model (2.5 GB). After that Maramax
+   starts in a few seconds and works offline.
 
-If the microphone disappears or stops delivering audio mid-dictation, Automatic
-mode reopens whichever input macOS now offers and continues the same recording;
-the result notes that the microphone changed. A microphone you selected
-explicitly is never swapped: the recording ends at once and what was captured is
-kept. If the audio driver itself gets stuck, the helper process is replaced, so
-the next dictation starts from a clean state.
+Requires a Mac with Apple Silicon. Allow microphone access when asked; turn on
+Accessibility only if you want results typed for you.
 
-Bluetooth microphones deliver one and a half to two and a half seconds of
-silence each time they connect; that is the headset switching into call mode and
-no app can shorten it. **Keep the microphone connected for** (Off, 30 seconds,
-2 minutes, 5 minutes) leaves the stream open after a dictation so the next one
-starts instantly. While it is open macOS shows the microphone indicator and
-AirPods stay in call-quality playback; audio heard while waiting is discarded
-inside the helper and never reaches the app. It is off by default, a change
-takes effect immediately (even for a dictation in progress), and changing the
-microphone closes a connection that was being kept open.
+## How it works
 
-Hardware behavior needs validation on the specific headset and macOS version;
-the tests use a simulated audio device and cannot establish that a Bluetooth
-problem is fixed.
+```mermaid
+flowchart LR
+  K[Option+Space] --> H["Audio helper process<br/>(owns the microphone)"]
+  H -- "PCM over a pipe" --> A[Maramax]
+  A --> W[("Saved WAV")]
+  W --> P["Parakeet TDT 0.6B<br/>MLX, on the GPU"]
+  P --> R[Your word replacements]
+  R --> C[Clipboard or paste]
+```
 
-## Recordings and recovery
+A speech model is the easy part. Most of the work went into these:
 
-**Recordings…** opens saved audio with playback, WAV export, and
-**Transcribe Again**. Audio is archived before recognition, including captures
-that produce no transcript. An empty recognizer result never deletes that audio,
-and neither does choosing **Clear History & Recordings…** while a dictation is
-still running behind its confirmation.
+- **Bluetooth audio drivers hang.** On macOS a call into the audio library can
+  block forever while AirPods switch modes. So the app never touches the driver
+  itself: a helper process owns the microphone, every start and stop has a
+  deadline, and a helper that stops answering is replaced while the audio it
+  already sent is kept. In Automatic mode, a microphone that disappears
+  mid-sentence is swapped for the next one and the recording carries on.
+- **Audio is saved first.** Captured audio is written to disk as it arrives and
+  archived before recognition starts, so nothing the model does can cost you a
+  recording.
+- **The model sometimes stops punctuating.** In long dictations Parakeet
+  occasionally writes a stretch entirely in lower case with no punctuation.
+  Tests on real recordings showed it depends on exactly where the audio window
+  starts, not on the decoder, so Maramax finds those stretches, transcribes
+  them again in shorter windows, and stitches the result back in, leaving every
+  transcript that was already fine unchanged.
+- **Long recordings stay in memory.** Dictations of any length are recognized
+  straight from memory in overlapping two-minute chunks, merged on the words
+  they share. No temporary files, no FFmpeg.
+- **Updates check who made them.** A new version is installed only if it is
+  signed with Maramax's own release certificate, which exists on one machine;
+  it is swapped in after the app quits, and the previous version is kept for
+  rollback.
 
-Recordings are ordinary local WAV files with JSON metadata under
-`~/Library/Application Support/Maramax/recordings`. Metadata includes microphone
-identity, input measurements, outcome, transcript, and timing. No extra encryption
-is applied by Maramax. The archive retains up to **20 recordings / 512 MB**, keeping
-the newest even if it alone exceeds that budget; older recordings are removed
-as new ones are saved. Export recordings you want to keep permanently.
+The app is about 7,400 lines of Python (PyObjC for the native interface, MLX
+for inference) with about 300 tests that need no microphone, screen, or model
+weights: a fake audio device drives the real helper process, and the native
+windows are built and measured off-screen.
 
-The live PCM recovery spill is still written during capture for crash recovery.
-At the next launch a leftover spill is moved into Recordings as an ordinary
-entry. **Recover Last Recording** retries audio that never reached the recognizer
-first, then the newest capture without a transcript.
-**Clear History & Recordings…** deletes both transcript history and retained audio
-after confirmation, and is unavailable during an active operation.
+## Build from source
 
-The original transcript for a replaced phrase is stored separately in
-`history-originals.json`, keeping `history.json` readable by 0.3.0. Both are
-cleared by the app's history command. Operational logs rotate at 2 MB with
-two backups under `logs/`; no transcript text is deliberately logged.
-
-Settings, history, and recording details written by a newer version keep their
-extra fields when an older version saves them, so rolling back does not erase
-anything. A settings or history file that cannot be read is renamed to
-`*.corrupt` instead of being overwritten.
-
-## Updates
-
-Maramax checks GitHub for a newer release once a day (turn it off in
-**Settings → General**); **Check for Updates…** or **Check Now** asks right
-away. An update is accepted only if it is signed with Maramax's own release
-certificate, is installed after Maramax quits, and the replaced version is kept
-for rollback under `~/Library/Application Support/Maramax/updates/previous`.
-The check sends nothing but the request and the installed version number.
-
-## Development
-
-Requires Python 3.12, macOS, Apple Silicon, and system PortAudio. FFmpeg is
-needed only to import media files; dictation of any length does not use it.
+Requires Python 3.12 and Homebrew's PortAudio (FFmpeg only for importing media files).
 
 ```sh
 brew install portaudio ffmpeg
 uv sync --extra dev
-./run.sh
+./run.sh                                  # run from source
+.venv/bin/python -m pytest -q             # tests
+bash build_app.sh                         # dist/Maramax.app, checked before it is kept
 ```
 
-The full app opens the microphone only on a recording request, but starting it
-loads the speech model. Tests use synthetic PCM and a fake audio backend, without
-opening microphones, playing sound, or loading model weights:
+## Credits
 
-```sh
-.venv/bin/python -m pytest -q
-.venv/bin/python -m ruff check src/ tests/
-.venv/bin/python -m mypy src/
-```
-
-Build the standalone app with `bash build_app.sh`. The build produces
-`dist/Maramax.app`; it does not install or launch the dictation app automatically.
-The build finishes by checking isolated bundled imports, certificates, the
-spectrogram front end, hidden panels, and temporary recording storage. This check
-opens no audio devices; a bundle that fails it is moved aside to
-`dist/Maramax.app.failed-check`.
-
-After validation, `.venv/bin/python packaging/create_release.py` creates a
-versioned app folder, launch guide, source hashes, ZIP, and checksum under
-`releases/`, preserving previous releases. See [the launch guide](docs/LAUNCH.md).
-
-To repeat the bundle check, optionally measuring recognition against a local
-audio file using already cached Parakeet weights:
-
-```sh
-.venv/bin/python packaging/check_bundle.py
-.venv/bin/python packaging/check_bundle.py --audio /absolute/path/speech.wav --repeats 10 --output /tmp/maramax-check.json
-```
-
-The optional recognition check never plays the file or downloads model weights.
-It measures PCM-to-transcript latency, model memory, Python threads, and process
-peak resident memory. It does not measure microphone startup or text insertion.
-See [the validation report](docs/validation.md) for measured results and remaining
-hardware checks.
-
-## Hardware validation before release
-
-After it is convenient to use audio, test with built-in input and explicitly
-selected AirPods: immediate speech after the shortcut, short and long recordings,
-repeated dictations, reconnects between recordings, disconnection while
-recording in Automatic mode (it should continue on the Mac's microphone), and
-back-to-back dictations with the microphone kept connected. Verify the actual selected input, passive focus behavior, Cmd+R being
-released afterward, optional insertion, playback, and recovery after force-quit.
-
-Compare `open_delay` (request to device open), `first_frame_delay`,
-`stop_seconds`, `stop_to_result_seconds`, `warm_start`, `audio_worker_resets`,
-and `active_threads` in recording metadata across repeated sessions. Measure real stop-to-insertion latency separately; the stored
-stop-to-result timing does not include the final UI/clipboard insertion.
+Maramax began as a fork of Osada Paranaliyanage's
+[parakeet-dictation](https://github.com/osadalakmal/parakeet-dictation), itself
+built on Ashwin P Chandran's
+[whisper-dictation](https://github.com/ashwin-pc/whisper-dictation). It has
+since been rewritten: all but a few dozen of its current lines are new.
+Recognition uses NVIDIA's Parakeet TDT 0.6B v2 through
+[parakeet-mlx](https://github.com/senstella/parakeet-mlx), and optionally
+Qwen3-ASR through [qwen3-asr-mlx](https://github.com/gabrimatic/qwen3-asr-mlx).
+MIT licensed.

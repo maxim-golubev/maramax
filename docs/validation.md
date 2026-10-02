@@ -445,3 +445,17 @@ Through the shipped code path on the 22 archived dictations: the two affected
 captures are fully formatted (word changes: "619" → "6:19" and one repeated
 "just" in the 75 s capture, none in the 588 s one); every other transcript is
 identical to what the app stored.
+
+## Hardware checks before a release
+
+After it is convenient to use audio, test with built-in input and explicitly
+selected AirPods: immediate speech after the shortcut, short and long recordings,
+repeated dictations, reconnects between recordings, disconnection while
+recording in Automatic mode (it should continue on the Mac's microphone), and
+back-to-back dictations with the microphone kept connected. Verify the actual selected input, passive focus behavior, Cmd+R being
+released afterward, optional insertion, playback, and recovery after force-quit.
+
+Compare `open_delay` (request to device open), `first_frame_delay`,
+`stop_seconds`, `stop_to_result_seconds`, `warm_start`, `audio_worker_resets`,
+and `active_threads` in recording metadata across repeated sessions. Measure real stop-to-insertion latency separately; the stored
+stop-to-result timing does not include the final UI/clipboard insertion.
