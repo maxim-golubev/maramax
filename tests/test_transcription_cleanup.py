@@ -2,8 +2,11 @@
 from types import SimpleNamespace
 import threading
 import time
+import zlib
 
+import numpy as np
 import pytest
+from parakeet_mlx.alignment import AlignedToken
 
 from parakeet_dictation import transcription
 from parakeet_dictation.app import DictationApp
@@ -179,7 +182,13 @@ def test_cache_files_from_different_revisions_are_not_mixed(tmp_path, monkeypatc
     assert transcription.cached_model_source("test/model") == "test/model"
 
 
-def recognizer(calls):
+def recognized(*words, gap=0.5):
+    """What the model returns for `words`, one token per word, `gap` apart."""
+    tokens = [AlignedToken(index, f" {word}", start=index * gap, duration=gap * 0.8) for index, word in enumerate(words)]
+    return SimpleNamespace(sentences=[SimpleNamespace(tokens=tokens)], tokens=tokens)
+
+
+def recognizer(calls, generate=None):
     """A ParakeetTranscriber whose model records what it was asked for."""
     transcriber = object.__new__(transcription.ParakeetTranscriber)
     transcriber.ready_event = threading.Event()
@@ -190,7 +199,7 @@ def recognizer(calls):
     transcriber._drafts_wedged = False
     transcriber.model = SimpleNamespace(
         preprocessor_config=SimpleNamespace(sample_rate=16000, hop_length=160, win_length=400, n_fft=512),
-        generate=lambda mel: calls.append(mel) or [SimpleNamespace(text=" spoken words ", sentences=[], tokens=[])],
+        generate=generate or (lambda mel: calls.append(mel) or [recognized("spoken", "words.")]),
     )
     return transcriber
 
@@ -201,7 +210,7 @@ def test_dictation_is_recognized_from_memory_without_a_temporary_file(monkeypatc
     monkeypatch.setattr(transcription.tempfile, "tempdir", str(tmp_path))
     progress = []
     text = recognizer(calls).transcribe_pcm(b"\x01\x00" * 16000, progress_callback=lambda *a: progress.append(a))
-    assert text == "spoken words"
+    assert text == "spoken words."
     assert calls == [16000]
     assert progress == [(16000, 16000)]
     assert not list(tmp_path.iterdir())
@@ -241,7 +250,7 @@ def test_audio_too_short_for_a_spectrogram_is_no_speech():
 def test_odd_length_capture_is_trimmed_not_rejected(monkeypatch):
     calls = []
     monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: len(audio))
-    assert recognizer(calls).transcribe_pcm(b"\x01\x00" * 1600 + b"\x07") == "spoken words"
+    assert recognizer(calls).transcribe_pcm(b"\x01\x00" * 1600 + b"\x07") == "spoken words."
     model = transcription.QwenTranscriber()
     model.model = SimpleNamespace(transcribe=lambda samples, **kwargs: SimpleNamespace(text=str(len(samples))))
     assert model.transcribe_pcm(b"\x01\x00" * 100 + b"\x07") == "100"
@@ -284,7 +293,78 @@ def test_offline_pass_waits_for_the_draft_stream_and_refuses_if_it_is_stuck(monk
     release.set()
     transcriber._drafts.join(timeout=2)
     assert transcriber.finish_drafts()
-    assert transcriber.transcribe_pcm(b"\x01\x00" * 1600) == "spoken words"
+    assert transcriber.transcribe_pcm(b"\x01\x00" * 1600) == "spoken words."
+
+
+def words(text, start=0.0, gap=0.5):
+    return [transcription.Word(start + index * gap, start + index * gap + 0.4, f" {word}")
+            for index, word in enumerate(text.split())]
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("So I think we should go. And then I said that we can do it later today.", []),
+    ("so i think we should go and then we said that we", [(0.0, 5.9)]),  # 12 words, lower-case i
+    ("so i think we should go and then we said that", []),              # 11 is not enough
+    ("so i’m sure we should go and then we said that we", [(0.0, 5.9)]),
+    (" ".join(["I think"] * 19) + " so.", []),                              # A run-on sentence keeps its I.
+    (" ".join(["I think"] * 20) + " so.", [(0.0, 19.9)]),                   # 40 words with no punctuation
+    ("Done. so i think we should go and then we said that we can. Done.", [(0.5, 6.4)]),
+])
+def test_unformatted_stretches_are_found_and_ordinary_sentences_are_not(text, expected):
+    assert transcription.collapsed_spans(words(text)) == expected
+
+
+FORMATTED = [(0.0, "Hello"), (0.5, "there.")] + [
+    (10.0 + index * 0.5, word) for index, word in
+    enumerate("So I think we should go. And then I said that we can do it later today.".split())
+] + [(30.0, "Thanks.")]
+
+
+def collapse(word):
+    return word.lower().strip(".,")
+
+
+def timed_audio_model(calls, collapses):
+    """A model that reads where its window starts from the audio itself (each
+    sample holds its position in tenths of a second) and answers with the
+    words spoken in that window. `collapses(window_seconds)` says whether it
+    leaves the stretch spoken between 10 and 20 s unformatted."""
+    def generate(audio):
+        start = round(float(audio[0]) * transcription.FULL_SCALE) / 10
+        length = len(audio) / 16000
+        calls.append((start, round(length, 1)))
+        spoken = [(at, word) for at, word in FORMATTED if start <= at < start + length]
+        if collapses(length):
+            spoken = [(at, collapse(word) if 10 <= at < 20 else word) for at, word in spoken]
+        tokens = [AlignedToken(zlib.crc32(word.encode()), f" {word}", start=at - start, duration=0.4)
+                  for at, word in spoken]
+        return [SimpleNamespace(sentences=[SimpleNamespace(tokens=tokens)], tokens=tokens)]
+    return generate
+
+
+FORTY_SECONDS = np.repeat(np.arange(400, dtype="<i2"), 1600).tobytes()
+
+
+def test_an_unformatted_stretch_is_recognized_again_and_spliced_in(monkeypatch):
+    calls, progress = [], []
+    monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: audio)
+    transcriber = recognizer(calls, timed_audio_model(calls, collapses=lambda seconds: seconds > 30))
+    text = transcriber.transcribe_pcm(FORTY_SECONDS, progress_callback=lambda *a: progress.append(a))
+    assert text == "Hello there. So I think we should go. And then I said that we can do it later today. Thanks."
+    # The whole capture, then the stretch with 5 s either side (10.0-18.4 s).
+    assert calls == [(0.0, 40.0), (5.0, 18.4)]
+    assert progress == [(640000, 640000)] * 2  # The repair can still be cancelled.
+
+
+def test_a_stretch_that_stays_unformatted_is_left_as_it_was(monkeypatch):
+    calls = []
+    monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: audio)
+    transcriber = recognizer(calls, timed_audio_model(calls, collapses=lambda seconds: True))
+    text = transcriber.transcribe_pcm(FORTY_SECONDS)
+    assert text == "Hello there. so i think we should go and then i said that we can do it later today Thanks."
+    # One window, then one starting half a repair chunk earlier (two 20 s
+    # chunks overlapping by 4 s), then it gives up.
+    assert calls == [(0.0, 40.0), (5.0, 18.4), (0.0, 20.0), (16.0, 7.4)]
 
 
 def test_high_accuracy_pass_receives_the_users_vocabulary():

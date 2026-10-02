@@ -1,4 +1,4 @@
-# Maramax 0.5.1 — ready for your first launch
+# Maramax 0.6.0 — ready for your first launch
 
 ## Open the new version
 
@@ -21,6 +21,24 @@ and open that copy. Run one version at a time. Both versions can read the shared
 history; the old app does not provide the new saved-recording browser. Avoid
 changing settings in the old version during rollback, as it may discard newer
 preferences it does not recognize.
+
+## Updates
+
+From this version on, Maramax updates itself. Once a day it asks GitHub whether
+a newer version has been published; when there is one, it offers it with
+**Install and Relaunch**, **Later**, or **Skip This Version**. **Check for
+Updates…** in the menu asks right away. Installing downloads about 200 MB,
+checks it against its published SHA-256 and signature, waits until you are not
+dictating, quits, swaps the app, and opens the new version. Settings, history,
+and recordings are untouched. The version it replaced is kept at
+`~/Library/Application Support/Maramax/updates/previous/Maramax.app`; to roll
+back, quit Maramax and open that copy. Turn the daily check off in
+**Settings → General → Check for updates automatically**.
+
+Because this build is signed for this Mac only (ad hoc), macOS treats each
+update as a new app: it may ask for microphone access again, and **Paste into
+the active app** needs Maramax switched on again under **System Settings →
+Privacy & Security → Accessibility**.
 
 ## Everyday use
 

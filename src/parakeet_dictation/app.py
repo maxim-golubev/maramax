@@ -12,7 +12,7 @@ import rumps
 from AppKit import NSApplication, NSMenu, NSMenuItem
 from PyObjCTools import AppHelper
 
-from . import recovery
+from . import __version__, recovery
 from .audio_format import seconds as pcm_seconds
 from .audio_format import whole_samples
 from .autopaste import PasteError, PasteTarget, accessibility_trusted, send_paste_keystroke
@@ -29,11 +29,12 @@ from .isolated_recorder import IsolatedAudioRecorder
 from .logger_config import logger
 from .main_thread import call_later
 from .overlay import Mode, OverlayController
-from .paths import app_support_dir, resource_path
+from .paths import app_bundle, app_support_dir, resource_path
 from .preferences import PreferencesController
 from .recordings import RecordingStatus, RecordingStore, recovery_candidate
 from .recordings_window import RecordingsController
 from .transcription import ParakeetTranscriber, QwenTranscriber, TranscriptionError
+from .update_offer import CHECK_TITLE, UpdateOffer
 
 _SETTING_LABELS = {
     "compact_dictation": "Use the compact dictation bar",
@@ -44,6 +45,7 @@ _SETTING_LABELS = {
     "live_preview": "Show a live preview in the full window",
     "high_accuracy": "Use the high-accuracy model",
     "use_corrections": "Apply my word replacements",
+    "check_for_updates": "Check for updates automatically",
 }
 _PASTE_LABEL = _SETTING_LABELS["paste_to_active_app"]
 
@@ -182,12 +184,14 @@ class DictationApp(rumps.App):
 
         self.status_item = rumps.MenuItem(f"Status: {self._resting_status}")
         self.record_menu = rumps.MenuItem("Start Dictation")
+        update_item = rumps.MenuItem(CHECK_TITLE)
         self.menu = [
             self.record_menu,
             rumps.MenuItem("Open Transcript"),
             rumps.MenuItem("Recordings…"),
             None,
             rumps.MenuItem("Settings…"),
+            update_item,
             ("More", [rumps.MenuItem(name) for name in (
                 "History", "Open Media Files…", "Copy Last Transcript", "Recover Last Recording",
                 "Retry Speech Model", "Clear History & Recordings…", "Quick Start…",
@@ -203,9 +207,17 @@ class DictationApp(rumps.App):
         self.overlay_controller.set_history_text(self._history_text())
         self.overlay_controller.set_intro_text(INTRO_TEXT)
 
+        self.updates = UpdateOffer(
+            menu_item=update_item, current_version=__version__, installed_app=app_bundle(),
+            updates_dir=self._support_dir / "updates", log_path=self._support_dir / "logs" / "update.log",
+            config=self.config, save_settings=self._save_settings, is_busy=lambda: self.is_busy,
+            quit_app=rumps.quit_application,
+        )
+
         self._install_edit_menu()
         self._start_model_watchdog()
         self._register_global_hotkeys()
+        self.updates.start()
         # Opening even a temporary mic at launch can change a Bluetooth
         # playback route. Capture is opened only after an explicit request.
 
@@ -1344,6 +1356,11 @@ class DictationApp(rumps.App):
         if self._preferences_window is None:
             self._preferences_window = PreferencesController.alloc().initWithDelegate_labels_(self, _SETTING_LABELS)
         self._preferences_window.show()
+
+    @rumps.clicked(CHECK_TITLE)
+    def menu_check_for_updates(self, sender):
+        del sender
+        self.updates.menu_clicked()
 
     @rumps.clicked("More", "History")
     def menu_show_history(self, sender):

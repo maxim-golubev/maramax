@@ -1,4 +1,4 @@
-# Maramax 0.5.1
+# Maramax 0.6.0
 
 Local dictation for macOS on Apple Silicon. Parakeet recognizes speech on your
 Mac; an optional Qwen model provides an alternative final pass. Model weights
@@ -115,6 +115,15 @@ Settings, history, and recording details written by a newer version keep their
 extra fields when an older version saves them, so rolling back does not erase
 anything. A settings or history file that cannot be read is renamed to
 `*.corrupt` instead of being overwritten.
+
+## Updates
+
+Maramax checks GitHub for a newer release once a day (turn it off in
+**Settings → General**) and **Check for Updates…** asks right away. An update is
+verified against its published SHA-256 and code signature, installed after
+Maramax quits, and the replaced version is kept for rollback under
+`~/Library/Application Support/Maramax/updates/previous`. The check sends
+nothing but the request itself.
 
 ## Development
 

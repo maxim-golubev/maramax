@@ -13,11 +13,13 @@ import time
 import wave
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 import mlx.core as mx
 import numpy as np
 from parakeet_mlx import from_pretrained
 from parakeet_mlx.alignment import (
+    AlignedToken,
     merge_longest_common_subsequence,
     merge_longest_contiguous,
     sentences_to_result,
@@ -37,8 +39,80 @@ OVERLAP_SECONDS = 15.0
 # How long a draft stream may take to let go of the encoder once told to stop.
 DRAFT_RELEASE_SECONDS = 30.0
 
+# Parakeet sometimes stops formatting partway through a dictation: lower-case
+# "i", no capitals, no punctuation, until the window ends. Which stretch it
+# happens to depends on exactly where the window starts, so such a stretch is
+# recognized again in short windows (which collapsed in none of the archived
+# cases) and spliced back in. Measured on archived dictations: docs/validation.md.
+COLLAPSE_WORDS = 40                 # this many words with no punctuation at all
+COLLAPSE_WORDS_WITH_LOWER_I = 12    # or this many, when one of them is a lower-case "i"
+REPAIR_CHUNK_SECONDS = 20.0
+REPAIR_OVERLAP_SECONDS = 4.0
+REPAIR_CONTEXT_SECONDS = 5.0        # of audio either side of the stretch
+MAX_REPAIRS = 6
+_PUNCTUATION = re.compile(r"[.,?!;:]")
+_LOWER_I = re.compile(r"i(?:['’][a-z]+)?")
+
+
 class TranscriptionError(RuntimeError):
     pass
+
+
+class Word(NamedTuple):
+    start: float  # seconds
+    end: float
+    text: str
+
+
+def collapsed_spans(words: list[Word]) -> list[tuple[float, float]]:
+    """Where the recognizer stopped formatting, as (start, end) seconds: a run
+    of words without punctuation that is very long, or that writes "I" in
+    lower case, which formatted output never does. Ordinary run-on sentences
+    keep their capital I and their commas well before the long limit."""
+    spans = []
+    run: list[Word] = []
+    for word in [*words, None]:
+        if word is not None and not _PUNCTUATION.search(word.text):
+            run.append(word)
+            continue
+        lower_i = any(_LOWER_I.fullmatch(w.text.strip()) for w in run)
+        if len(run) >= COLLAPSE_WORDS or (lower_i and len(run) >= COLLAPSE_WORDS_WITH_LOWER_I):
+            spans.append((run[0].start, run[-1].end))
+        run = []
+    return spans
+
+
+def _words(tokens: list[AlignedToken]) -> list[Word]:
+    """Tokens joined into words: a token that begins with a space starts one."""
+    words: list[Word] = []
+    for token in tokens:
+        if words and not token.text.startswith(" "):
+            last = words[-1]
+            words[-1] = Word(last.start, token.end, last.text + token.text)
+        else:
+            words.append(Word(token.start, token.end, token.text))
+    return words
+
+
+def _merge(left: list[AlignedToken], right: list[AlignedToken], overlap_seconds: float) -> list[AlignedToken]:
+    """Two overlapping token runs joined on their shared words, as the library does."""
+    try:
+        return merge_longest_contiguous(left, right, overlap_duration=overlap_seconds)
+    except RuntimeError:
+        # No run of matching words in the overlap: the looser alignment.
+        return merge_longest_common_subsequence(left, right, overlap_duration=overlap_seconds)
+
+
+def _splice(tokens: list[AlignedToken], replacement: list[AlignedToken], start: float, end: float,
+            seconds: float) -> list[AlignedToken]:
+    """`tokens` with what lies between `start` and `end` seconds taken from
+    `replacement`, joined on the words both have near each edge. An edge at
+    the start or end of the audio has nothing beyond it to join to: the
+    replacement runs to it."""
+    before = [token for token in tokens if token.start < start + REPAIR_OVERLAP_SECONDS] if start > 0 else []
+    after = [token for token in tokens if token.end > end - REPAIR_OVERLAP_SECONDS] if end < seconds else []
+    joined = _merge(before, replacement, REPAIR_OVERLAP_SECONDS) if before else replacement
+    return _merge(joined, after, REPAIR_OVERLAP_SECONDS) if after else joined
 
 
 def cached_model_source(model_id: str) -> str:
@@ -158,21 +232,17 @@ class ParakeetTranscriber:
         # less than one analysis hop cannot form a spectrogram frame.
         if len(samples) < config.hop_length:
             return ""
-        result = None
+        tokens = None
         try:
             audio = mx.array(samples).astype(mx.float32) / FULL_SCALE
-            chunk = int(CHUNK_SECONDS * config.sample_rate)
-            if len(audio) <= chunk:
-                if progress_callback is not None:
-                    progress_callback(len(audio), len(audio))
-                result = self._recognize(audio)
-            else:
-                result = self._recognize_in_chunks(audio, chunk, progress_callback)
-            return (result.text or "").strip()
+            seconds = len(audio) / config.sample_rate
+            tokens = self._tokens_in_chunks(audio, 0.0, seconds, CHUNK_SECONDS, OVERLAP_SECONDS, progress_callback)
+            tokens = self._repair_collapses(audio, tokens, progress_callback)
+            return sentences_to_result(tokens_to_sentences(tokens, DecodingConfig().sentence)).text.strip()
         finally:
             # Cancellation and inference errors need cleanup too, otherwise
             # repeated failed sessions can retain Metal's cached allocations.
-            del result
+            del tokens
             gc.collect()
             mx.clear_cache()
 
@@ -191,36 +261,55 @@ class ParakeetTranscriber:
             audio = mx.pad(audio, [(0, overread)])
         return self.model.generate(get_logmel(audio, config))[0]
 
-    def _recognize_in_chunks(self, audio: mx.array, chunk: int, progress_callback: Callable | None):
-        """Overlapping chunks merged on their shared words: the procedure of
-        parakeet_mlx's own transcribe() (0.5.x), run on samples already in
-        memory so a long dictation needs neither a file nor FFmpeg."""
+    def _tokens_in_chunks(self, audio: mx.array, start: float, end: float, chunk_seconds: float,
+                          overlap_seconds: float, progress_callback: Callable | None) -> list[AlignedToken]:
+        """The tokens of audio[start:end] (seconds), timed from the start of
+        `audio`. Audio longer than a chunk is cut into overlapping chunks
+        merged on their shared words: the procedure of parakeet_mlx's own
+        transcribe() (0.5.x), run on samples already in memory so a long
+        dictation needs neither a file nor FFmpeg."""
         assert self.model is not None
         config = self.model.preprocessor_config
-        overlap = int(OVERLAP_SECONDS * config.sample_rate)
-        tokens: list = []
-        for start in range(0, len(audio), chunk - overlap):
-            end = min(start + chunk, len(audio))
+        first, last = int(start * config.sample_rate), min(len(audio), int(end * config.sample_rate))
+        chunk = int(chunk_seconds * config.sample_rate)
+        step = chunk if last - first <= chunk else chunk - int(overlap_seconds * config.sample_rate)
+        tokens: list[AlignedToken] = []
+        for piece_start in range(first, last, step):
+            piece_end = min(piece_start + chunk, last)
             if progress_callback is not None:
-                progress_callback(end, len(audio))
-            if end - start < config.hop_length:
+                progress_callback(piece_end, len(audio))
+            if piece_end - piece_start < config.hop_length:
                 break
-            piece = self._recognize(audio[start:end])
-            offset = start / config.sample_rate
+            piece = self._recognize(audio[piece_start:piece_end])
+            offset = piece_start / config.sample_rate
             for sentence in piece.sentences:
                 for token in sentence.tokens:
                     token.start += offset
                     token.end = token.start + token.duration
-            if not tokens:
-                tokens = piece.tokens
-                continue
-            try:
-                tokens = merge_longest_contiguous(tokens, piece.tokens, overlap_duration=OVERLAP_SECONDS)
-            except RuntimeError:
-                # No run of matching words in the overlap; fall back to the
-                # looser alignment, as the library does.
-                tokens = merge_longest_common_subsequence(tokens, piece.tokens, overlap_duration=OVERLAP_SECONDS)
-        return sentences_to_result(tokens_to_sentences(tokens, DecodingConfig().sentence))
+            tokens = _merge(tokens, piece.tokens, overlap_seconds) if tokens else piece.tokens
+        return tokens
+
+    def _repair_collapses(self, audio: mx.array, tokens: list[AlignedToken],
+                          progress_callback: Callable | None) -> list[AlignedToken]:
+        """Recognize each stretch the model left unformatted again, in short
+        windows, and splice it in when that comes out formatted. A window
+        that collapses too is tried once more starting earlier; failing that,
+        the stretch stays as it was."""
+        assert self.model is not None
+        seconds = len(audio) / self.model.preprocessor_config.sample_rate
+        # The first pass already reported 100 %; the callback is still
+        # called so a cancel can interrupt the repair.
+        checkpoint = None if progress_callback is None else (lambda _done, _total: progress_callback(len(audio), len(audio)))
+        for span_start, span_end in collapsed_spans(_words(tokens))[:MAX_REPAIRS]:
+            for lead in (REPAIR_CONTEXT_SECONDS, REPAIR_CONTEXT_SECONDS + REPAIR_CHUNK_SECONDS / 2):
+                start, end = max(0.0, span_start - lead), min(seconds, span_end + REPAIR_CONTEXT_SECONDS)
+                candidate = self._tokens_in_chunks(audio, start, end, REPAIR_CHUNK_SECONDS, REPAIR_OVERLAP_SECONDS,
+                                                   checkpoint)
+                if candidate and not collapsed_spans(_words(candidate)):
+                    tokens = _splice(tokens, candidate, start, end, seconds)
+                    logger.info(f"Recognized an unformatted stretch again ({span_start:.0f}–{span_end:.0f} s)")
+                    break
+        return tokens
 
     # -- Draft stream --
 

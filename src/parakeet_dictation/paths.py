@@ -1,4 +1,4 @@
-"""Where things are on this machine: bundled resources, the data directory, command-line tools, CA certificates."""
+"""Where things are on this machine: the app bundle and its resources, the data directory, command-line tools, CA certificates."""
 
 from __future__ import annotations
 
@@ -20,6 +20,13 @@ RUNTIME_BIN_CANDIDATES = (
 
 def app_support_dir() -> Path:
     return Path.home() / "Library" / "Application Support" / "Maramax"
+
+
+def app_bundle() -> Path | None:
+    """The .app this process runs from (RESOURCEPATH is its Contents/Resources),
+    or None when it runs from source."""
+    resources = os.getenv("RESOURCEPATH")
+    return Path(resources).parents[1] if resources else None
 
 
 def ensure_ssl_certs() -> None:

@@ -42,6 +42,7 @@ def check(args: argparse.Namespace) -> dict:
         "parakeet_dictation.app", "parakeet_dictation.recorder", "parakeet_dictation.audio_worker",
         "parakeet_dictation.recordings_window", "mlx.core", "parakeet_mlx", "parakeet_mlx.alignment",
         "parakeet_dictation.preferences", "parakeet_dictation.instance",
+        "parakeet_dictation.updater", "parakeet_dictation.update_offer",
         "qwen3_asr_mlx", "pyaudio", "soundfile", "scipy", "numpy",
         "tokenizers", "huggingface_hub", "httpx", "certifi", "AppKit",
     ]

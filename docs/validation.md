@@ -337,3 +337,53 @@ shifted the queue selection.
 The four checks listed for 0.5.0 stand. Add: with AirPods, let a dictation run
 while they disconnect (the result should say the microphone changed), and
 confirm that the next dictation after any microphone failure starts normally.
+
+## 0.6.0 self-update and unformatted transcripts — October 2, 2026
+
+All 269 tests, Ruff, and mypy pass. No microphone was opened and nothing was
+played; recognition was measured on the 20 dictations already in the archive.
+
+### Transcripts that lose their capitals and punctuation
+
+8 of the last 100 transcripts in history contain a stretch written as
+"so i would like you to make it sure that it actually goes through bold if…":
+lower-case "i", no capitals, no punctuation, for 40 to 324 words, mostly in long
+dictations. Two of those are still in the archive (75 s and 588 s, both AirPods).
+
+What it is: the encoder, not the decoder and not chunking. The 75 s capture is a
+single window; resetting the decoder's state where the stretch begins
+reproduced the same words exactly. Recognizing the same audio in a slightly
+different window usually comes out formatted, sometimes not: of six 40 s windows
+over the two stretches three collapsed, of six 20 s windows none did.
+
+What was tried, on all 20 archived dictations:
+
+| Approach | Fixed both | Side effects |
+| --- | --- | --- |
+| Beam search (2, 3, 5) | No: fixed the 75 s one; beam 5 made the 588 s one worse (4 → 12 lower-case "i") | 1.4–3× slower everywhere |
+| 20 s chunks for everything | No | New collapses in two dictations that had none |
+| Local attention | No | — |
+| Detect the stretch, recognize it again in 20 s windows, splice it in | Yes | Nothing else changed |
+
+The last is what 0.6.0 does. A stretch is a run of at least 12 words without
+punctuation that contains a lower-case "i", or of at least 40. It is recognized
+again with 5 s of context in 20 s windows overlapping by 4 s (and once more
+starting 10 s earlier if that collapses too), and merged back with the library's
+own alignment. Results through the shipped code path: the two affected captures
+came out fully formatted, with three changed words in the 75 s one ("619" →
+"6:19", "issues and execution" → "issues in execution", one repeated "just"
+dropped) and none in the 588 s one; the other 18 transcripts are byte-identical.
+The repair cost 1.3 s and 0.3 s on the two captures and nothing on the others.
+On the 100 history transcripts the detector would have tried a repair in 20.
+
+### Self-update
+
+The updater was exercised with file URLs and a fake bundle: a newer tag is
+offered, the same or older is not, a release without exactly one `.zip` and
+`.zip.sha256` is reported, a corrupted archive or an app with another bundle
+identifier or version is refused before anything moves. The swap script itself
+was run against temporary folders (including paths with spaces and an
+apostrophe, which the first version mishandled): it installs the new app,
+keeps the old one, removes the download, opens the result, and puts the old app
+back if the new one cannot be placed. The hand-off waits until the app has been
+idle on two looks 3 s apart. Live results of the first real update are below.

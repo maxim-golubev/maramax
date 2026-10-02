@@ -33,6 +33,8 @@ _HELP = {
                      "and a 4.1 GB download on first use.",
     "prefer_builtin_mic": "Records with the Mac so AirPods stay in high-quality playback. "
                           "Skipped while the lid is closed, when the Mac’s microphone is switched off.",
+    "check_for_updates": "Once a day Maramax asks GitHub whether a newer version has been published, "
+                         "and offers it. Nothing else is sent, and installing always asks first.",
     "use_corrections": "Fixes words the recognizer keeps getting wrong, such as names. "
                        "Whole words and phrases, ignoring capitalization. "
                        "The original text stays in History and Recordings.",
@@ -41,6 +43,7 @@ _SECTIONS = (
     ("Dictation", ("compact_dictation", "auto_start_recording", "live_preview")),
     ("Result", ("auto_copy_to_clipboard", "paste_to_active_app")),
     ("Speech model", ("high_accuracy",)),
+    ("Updates", ("check_for_updates",)),
 )
 _KEEP_READY_CHOICES = (0, 30, 120, 300)
 _DEFAULT_NOTE = "Each replacement is applied once per match; replacements never chain."

@@ -28,6 +28,9 @@ class AppConfig:
     keep_mic_ready_seconds: int = 0
     use_corrections: bool = True
     replacements: list[dict[str, str]] = field(default_factory=list)
+    check_for_updates: bool = True
+    # A release the user chose "Skip This Version" for; automatic checks do not offer it again.
+    skipped_update_version: str | None = None
     # Settings written by a newer version, kept so saving here (for example
     # after rolling back) does not erase them.
     unrecognized: dict = field(default_factory=dict, repr=False)
@@ -62,9 +65,9 @@ class AppConfig:
             if name == "replacements":
                 config.replacements = normalize_rules(value)
                 continue
-            if name == "input_device":
+            if name in ("input_device", "skipped_update_version"):
                 if value is None or (isinstance(value, str) and value.strip()):
-                    config.input_device = value
+                    setattr(config, name, value)
                 continue
             if name == "keep_mic_ready_seconds":
                 if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_KEEP_MIC_READY_SECONDS:
