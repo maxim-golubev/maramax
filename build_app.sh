@@ -39,28 +39,35 @@ BUNDLE_DYNLOAD="$BUNDLE_SITE_PACKAGES/lib-dynload"
 VENV_SITE_PACKAGES="$ROOT_DIR/.venv/lib/python$PYTHON_SHORT_VERSION/site-packages"
 BUNDLE_ZIP="$BUNDLE_RESOURCES/lib/python${PYTHON_SHORT_VERSION//./}.zip"
 
-# ── Remove mlx/scipy/charset_normalizer stubs from the py2app zip ──
-# py2app may create .pyc stubs in pythonXY.zip that shadow real packages.
-# We strip them and rely on the full packages copied below.
+# ── Rewrite the py2app zip: no stubs, and the same bytes for the same code ──
+# py2app may create .pyc stubs in pythonXY.zip that shadow real packages; they
+# are stripped and the full packages copied below are used instead. py2app
+# also stamps the build time into every .pyc header and zip entry, which made
+# this 50 MB file differ in every build and every update delta. The zip holds
+# no .py sources for those timestamps to be checked against, so they are
+# zeroed and the entry dates fixed.
 if [ -f "$BUNDLE_ZIP" ]; then
   python - "$BUNDLE_ZIP" <<'PY'
-import sys, zipfile, tempfile, shutil, os
+import sys, zipfile, shutil, os
 src = sys.argv[1]
 prefixes = ("mlx/", "scipy/", "charset_normalizer/")
 tmp = src + ".tmp"
 removed = 0
 with zipfile.ZipFile(src, "r") as zin, zipfile.ZipFile(tmp, "w") as zout:
+    names = set(zin.namelist())
     for item in zin.infolist():
         if any(item.filename.startswith(p) or item.filename == p.rstrip("/") for p in prefixes):
             removed += 1
             continue
-        zout.writestr(item, zin.read(item.filename))
-if removed:
-    shutil.move(tmp, src)
-    print(f"Stripped {removed} stub entries from {os.path.basename(src)}")
-else:
-    os.unlink(tmp)
-    print(f"No stubs to strip from {os.path.basename(src)}")
+        data = zin.read(item.filename)
+        if (item.filename.endswith(".pyc") and len(data) >= 16 and data[4:8] == b"\0\0\0\0"
+                and item.filename[:-1] not in names):
+            data = data[:8] + b"\0\0\0\0" + data[12:]  # A timestamp .pyc: drop the build time.
+        entry = zipfile.ZipInfo(item.filename, date_time=(1980, 1, 1, 0, 0, 0))
+        entry.compress_type, entry.external_attr = item.compress_type, item.external_attr
+        zout.writestr(entry, data)
+shutil.move(tmp, src)
+print(f"Rewrote {os.path.basename(src)} reproducibly; stripped {removed} stub entries")
 PY
 fi
 

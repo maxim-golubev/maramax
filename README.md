@@ -11,7 +11,7 @@ your Mac's GPU with NVIDIA's Parakeet model; no audio or text is sent anywhere.
   <img alt="The Maramax dictation bar: a live level meter, the microphone in use, the elapsed time, and stop and expand buttons" src="docs/images/bar-light.png" width="440">
 </picture>
 
-**[Download for Apple Silicon](https://github.com/maxim-golubev/maramax/releases/latest)** · [User guide](docs/guide.md) · [How it was tested](docs/validation.md)
+**[Download for Apple Silicon](https://github.com/maxim-golubev/maramax/releases/latest)** · [User guide](docs/guide.md)
 
 ## What it's like to use
 
@@ -57,33 +57,30 @@ flowchart LR
 
 A speech model is the easy part. Most of the work went into these:
 
-- **Bluetooth audio drivers hang.** On macOS a call into the audio library can
-  block forever while AirPods switch modes. So the app never touches the driver
-  itself: a helper process owns the microphone, every start and stop has a
-  deadline, and a helper that stops answering is replaced while the audio it
-  already sent is kept. In Automatic mode, a microphone that disappears
-  mid-sentence is swapped for the next one and the recording carries on.
-- **Audio is saved first.** Captured audio is written to disk as it arrives and
-  archived before recognition starts, so nothing the model does can cost you a
-  recording.
-- **The model sometimes stops punctuating.** In long dictations Parakeet
-  occasionally writes a stretch entirely in lower case with no punctuation.
-  Tests on real recordings showed it depends on exactly where the audio window
-  starts, not on the decoder, so Maramax finds those stretches, transcribes
-  them again in shorter windows, and stitches the result back in, leaving every
-  transcript that was already fine unchanged.
-- **Long recordings stay in memory.** Dictations of any length are recognized
-  straight from memory in overlapping two-minute chunks, merged on the words
-  they share. No temporary files, no FFmpeg.
-- **Updates check who made them.** A new version is installed only if it is
-  signed with Maramax's own release certificate, which exists on one machine;
-  it is swapped in after the app quits, and the previous version is kept for
-  rollback.
+- **Bluetooth audio drivers hang.** A call into the macOS audio stack can block
+  forever while AirPods switch modes, so the app never makes one: a helper
+  process owns the microphone, every start and stop has a deadline, and a
+  helper that stops answering is replaced without losing the audio it sent.
+  In Automatic mode, if the microphone disappears mid-sentence, the recording
+  carries on with the next one.
+- **Audio is saved before anything else.** It is written to disk as it arrives
+  and archived before recognition starts, so nothing the model does can cost
+  you a recording.
+- **The model sometimes stops punctuating.** In long dictations Parakeet can
+  write a stretch in lower case with no punctuation. Experiments on real
+  recordings traced it to where the encoder's audio window starts, so Maramax
+  finds those stretches, transcribes them again in shorter windows, and
+  stitches them back, changing nothing else.
+- **Updates are small and checked.** An update downloads only the files that
+  changed, rebuilds the app from a copy of the installed one, and installs it
+  only if it carries Maramax's own release signature. The previous version is
+  kept.
 
-The app is about 7,700 lines of Python (PyObjC for the native interface, MLX
-for inference) with about 300 tests that need no microphone, screen, or model
+About 7,700 lines of Python (PyObjC for the native interface, MLX for
+inference) and over 300 tests that need no microphone, screen, or model
 weights: a fake audio device drives the real helper process, and the native
 windows are built and measured off-screen.
+[What was measured](docs/validation.md)
 
 ## Build from source
 

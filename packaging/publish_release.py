@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tomllib
 
-from create_release import release_paths
+from create_release import checksum_path, release_paths
 
 
 class PublishError(RuntimeError):
@@ -60,7 +60,12 @@ def main() -> None:
                       capture_output=True).returncode == 0:
         raise PublishError(f"The tag {tag} already exists on GitHub; bump the version")
 
-    subprocess.run(["gh", "release", "create", tag, str(archive), str(checksum), "--target", commit,
+    deltas = sorted(archive.parent.glob(f"Maramax-{version}-from-*.delta"))
+    for delta in deltas:
+        if not checksum_path(delta).is_file():
+            raise PublishError(f"{delta.name} has no checksum; run create_release.py again")
+    uploads = [str(path) for asset in (archive, *deltas) for path in (asset, checksum_path(asset))]
+    subprocess.run(["gh", "release", "create", tag, *uploads, "--target", commit,
                     "--title", f"Maramax {version}", "--notes-file", str(args.notes_file), "--latest"],
                    cwd=root, check=True)
 

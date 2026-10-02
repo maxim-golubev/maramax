@@ -7,6 +7,10 @@ code signature, which must come from the certificate pinned below, held only
 by the machine that builds releases. Nothing from a download runs, and
 nothing installed is touched, until both checks pass.
 
+A release may also carry a delta from the previous version: only the files
+that changed. The app is then rebuilt from a copy of the installed one, and
+the same signature check proves the result exact.
+
 The new app is first placed beside the installed one, so that once Maramax
 has quit, a small shell script only renames within that folder. It keeps
 the replaced version and leaves a one-word outcome for the next launch.
@@ -28,6 +32,8 @@ import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+from .logger_config import logger
 
 LATEST_RELEASE_URL = "https://api.github.com/repos/maxim-golubev/maramax/releases/latest"
 # The release certificate (packaging/create_signing_identity.sh). An update
@@ -54,14 +60,37 @@ class InstallResult(enum.StrEnum):
     NOT_PLACED = "not-placed"          # the old app was put back
 
 
+class UpdateCancelled(UpdateError):
+    """The user stopped the download."""
+
+
+@dataclass(frozen=True)
+class Asset:
+    """One downloadable file of a release, with the URL of its SHA-256."""
+    name: str
+    url: str
+    size: int
+    checksum_url: str
+
+
 @dataclass(frozen=True)
 class Release:
     version: str
     notes: str
     page_url: str
-    archive_url: str
-    archive_size: int
-    checksum_url: str
+    archive: Asset          # the whole app
+    delta: Asset | None     # only what changed since the version installed here, when published
+
+
+# A delta holds the files that differ between two signed bundles under
+# files/, and the paths that no longer exist in deleted.txt.
+_DELTA_FILES = "files"
+_DELTA_DELETED = "deleted.txt"
+
+
+def delta_name(from_version: str, to_version: str) -> str:
+    # A ZIP, but not named .zip: 0.6.1 accepts a release only with exactly one .zip.
+    return f"Maramax-{to_version}-from-{from_version}.delta"
 
 
 def version_key(version: str) -> tuple[int, ...]:
@@ -76,6 +105,19 @@ def version_key(version: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+def _asset(tag: str, assets: dict[str, dict], name: str) -> Asset:
+    archive, checksum = assets[name], assets.get(f"{name}.sha256")
+    if checksum is None:
+        raise UpdateError(f"Release {tag} has {name} without {name}.sha256")
+    for item in (archive, checksum):
+        if item.get("state", "uploaded") != "uploaded" or not isinstance(item.get("browser_download_url"), str):
+            raise UpdateError(f"Release {tag} is still being published ({item['name']} is not uploaded yet)")
+    size = archive.get("size")
+    if not isinstance(size, int) or size <= 0:
+        raise UpdateError(f"Release {tag} does not say how large {name} is")
+    return Asset(name, archive["browser_download_url"], size, checksum["browser_download_url"])
+
+
 def newer_release(current_version: str, payload: dict) -> Release | None:
     """The release described by GitHub's `payload` if it is newer than
     `current_version`, else None."""
@@ -84,25 +126,19 @@ def newer_release(current_version: str, payload: dict) -> Release | None:
         raise UpdateError("GitHub's latest release has no tag")
     if version_key(tag) <= version_key(current_version):
         return None
+    version = tag.strip().removeprefix("v")
     assets = {asset["name"]: asset for asset in payload.get("assets", [])
               if isinstance(asset, dict) and isinstance(asset.get("name"), str)}
-    archives = [name for name in assets if name.endswith(".zip") and f"{name}.sha256" in assets]
+    archives = [name for name in assets if name.endswith(".zip")]
     if len(archives) != 1:
-        raise UpdateError(f"Release {tag} should have one .zip with a matching .zip.sha256; it has {sorted(assets)}")
-    archive, checksum = assets[archives[0]], assets[f"{archives[0]}.sha256"]
-    for asset in (archive, checksum):
-        if asset.get("state", "uploaded") != "uploaded" or not isinstance(asset.get("browser_download_url"), str):
-            raise UpdateError(f"Release {tag} is still being published ({asset['name']} is not uploaded yet)")
-    size = archive.get("size")
-    if not isinstance(size, int) or size <= 0:
-        raise UpdateError(f"Release {tag} does not say how large {archive['name']} is")
+        raise UpdateError(f"Release {tag} should have one app .zip; it has {sorted(assets)}")
+    delta = delta_name(current_version, version)
     return Release(
-        version=tag.strip().removeprefix("v"),
+        version=version,
         notes=str(payload.get("body") or "").strip(),
         page_url=str(payload.get("html_url", "")),
-        archive_url=archive["browser_download_url"],
-        archive_size=size,
-        checksum_url=checksum["browser_download_url"],
+        archive=_asset(tag, assets, archives[0]),
+        delta=_asset(tag, assets, delta) if delta in assets else None,
     )
 
 
@@ -163,63 +199,182 @@ def _bundle_info(app: Path) -> dict:
         raise UpdateError(f"{app} is not a readable app bundle: {exc}") from exc
 
 
+Progress = Callable[[int, int], None]   # bytes received, bytes expected
+
+
 def download(release: Release, current_version: str, installed_app: Path, staging: Path,
-             progress: Callable[[float], None]) -> Path:
-    """Fetch, verify, and unpack `release` under `staging`, then place the
-    new app beside `installed_app`, ready for install_after_exit(). Returns
-    where it was placed. `progress` receives 0.0–1.0. Nothing is left in
-    `staging` when it fails."""
+             progress: Progress, cancelled: Callable[[], bool]) -> Path:
+    """Fetch and verify `release` under `staging` (only what changed, when a
+    delta from this version is published; the whole app otherwise, or if the
+    delta does not produce a verified app), then place the new app beside
+    `installed_app`, ready for install_after_exit(). Returns where it was
+    placed. Raises UpdateCancelled once `cancelled()` is true. Nothing is
+    left in `staging` when it fails."""
     try:
-        if staging.exists():
-            shutil.rmtree(staging)  # An earlier, unfinished download.
-        staging.mkdir(parents=True)
-        new_app = _fetch_verified(release, current_version, installed_app, staging, progress)
+        new_app = None
+        if release.delta is not None:
+            try:
+                _reset(staging)
+                new_app = _from_delta(release, release.delta, current_version, installed_app, staging,
+                                      progress, cancelled)
+            except UpdateCancelled:
+                raise
+            except (UpdateError, OSError) as exc:
+                logger.warning(f"The update delta did not produce a verified app ({exc}); downloading the whole app")
+        if new_app is None:
+            _reset(staging)
+            new_app = _from_archive(release, current_version, installed_app, staging, progress, cancelled)
         return _place_beside(new_app, installed_app)
     except OSError as exc:
         shutil.rmtree(staging, ignore_errors=True)
         raise UpdateError(f"Could not prepare Maramax {release.version}: {exc}") from exc
     except UpdateError:
-        # The failure is reported; what was downloaded is no use any more.
+        # Reported by the caller; what was downloaded is no use any more.
         shutil.rmtree(staging, ignore_errors=True)
         raise
 
 
-def _fetch_verified(release: Release, current_version: str, installed_app: Path, staging: Path,
-                    progress: Callable[[float], None]) -> Path:
+def _reset(staging: Path) -> None:
+    if staging.exists():
+        shutil.rmtree(staging)  # An earlier, unfinished download.
+    staging.mkdir(parents=True)
+
+
+def _fetch(asset: Asset, current_version: str, destination: Path, progress: Progress,
+           cancelled: Callable[[], bool]) -> None:
+    """Download `asset` to `destination` and check it against its SHA-256."""
     try:
-        with _open(release.checksum_url, current_version) as response:
+        with _open(asset.checksum_url, current_version) as response:
             expected = parse_checksum(response.read(4096).decode("utf-8", "replace"))
-        archive = staging / "update.zip"
         digest = hashlib.sha256()
         received = 0
-        with _open(release.archive_url, current_version) as response, archive.open("wb") as file:
+        with _open(asset.url, current_version) as response, destination.open("wb") as file:
             while block := response.read(_DOWNLOAD_BLOCK):
+                if cancelled():
+                    raise UpdateCancelled("The download was cancelled")
                 file.write(block)
                 digest.update(block)
                 received += len(block)
-                progress(min(1.0, received / release.archive_size))
+                progress(received, asset.size)
     except (urllib.error.URLError, TimeoutError) as exc:
-        raise UpdateError(f"Could not download Maramax {release.version}: {exc}") from exc
+        raise UpdateError(f"Could not download {asset.name}: {exc}") from exc
     if digest.hexdigest() != expected:
-        raise UpdateError(f"The download of Maramax {release.version} does not match its published SHA-256")
+        raise UpdateError(f"The download of {asset.name} does not match its published SHA-256")
 
+
+def _from_archive(release: Release, current_version: str, installed_app: Path, staging: Path,
+                  progress: Progress, cancelled: Callable[[], bool]) -> Path:
+    archive = staging / "update.zip"
+    _fetch(release.archive, current_version, archive, progress, cancelled)
     unpacked = staging / "unpacked"
     _run(["ditto", "-x", "-k", str(archive), str(unpacked)], f"unpack Maramax {release.version}")
     archive.unlink()
     apps = [*unpacked.glob("*/*.app"), *unpacked.glob("*.app")]
     if len(apps) != 1:
         raise UpdateError(f"Expected one app in the Maramax {release.version} archive, found {len(apps)}")
-    new_app = apps[0]
+    _verify(apps[0], installed_app, release.version)
+    return apps[0]
+
+
+def _from_delta(release: Release, delta: Asset, current_version: str, installed_app: Path, staging: Path,
+                progress: Progress, cancelled: Callable[[], bool]) -> Path:
+    """The new app rebuilt from a copy of the installed one plus the delta.
+    The signature check then proves every file is what was signed: a strict
+    verify fails on any sealed file that is changed, missing, or extra."""
+    archive = staging / "delta.zip"
+    _fetch(delta, current_version, archive, progress, cancelled)
+    unpacked = staging / "delta"
+    _run(["ditto", "-x", "-k", str(archive), str(unpacked)], f"unpack the Maramax {release.version} delta")
+    archive.unlink()
+    new_app = staging / "assembled" / installed_app.name
+    new_app.parent.mkdir()
+    # A clone on APFS: instant, and no extra space until files differ.
+    if subprocess.run(["cp", "-cR", str(installed_app), str(new_app)], capture_output=True).returncode != 0:
+        shutil.rmtree(new_app, ignore_errors=True)
+        _run(["ditto", str(installed_app), str(new_app)], f"copy {installed_app} to rebuild it")
+    apply_delta(unpacked, new_app)
+    _verify(new_app, installed_app, release.version)
+    return new_app
+
+
+def _verify(new_app: Path, installed_app: Path, version: str) -> None:
     info, installed = _bundle_info(new_app), _bundle_info(installed_app)
     identifier = installed.get("CFBundleIdentifier")
     if not isinstance(identifier, str) or info.get("CFBundleIdentifier") != identifier:
         raise UpdateError(f"The downloaded app is {info.get('CFBundleIdentifier')!r}, not {identifier!r}")
-    if version_key(str(info.get("CFBundleShortVersionString", ""))) != version_key(release.version):
+    if version_key(str(info.get("CFBundleShortVersionString", ""))) != version_key(version):
         raise UpdateError(f"The downloaded app says it is version {info.get('CFBundleShortVersionString')}, "
-                          f"but the release is {release.version}")
+                          f"but the release is {version}")
     _run(["codesign", "--verify", "--deep", "--strict", f"-R={signer_requirement(identifier)}", str(new_app)],
-         f"confirm that Maramax {release.version} was signed by Maramax's release certificate")
-    return new_app
+         f"confirm that Maramax {version} was signed by Maramax's release certificate")
+
+
+def _bundle_entries(app: Path) -> dict[str, tuple[str, str]]:
+    """Every file and symlink in a bundle, by path relative to it: its kind and content."""
+    entries = {}
+    for directory, _, names in os.walk(app):
+        for name in names:
+            path = Path(directory) / name
+            relative = str(path.relative_to(app))
+            if path.is_symlink():
+                entries[relative] = ("link", os.readlink(path))
+            else:
+                with path.open("rb") as file:
+                    entries[relative] = ("file", hashlib.file_digest(file, "sha256").hexdigest())
+    return entries
+
+
+def make_delta(old_app: Path, new_app: Path, delta_dir: Path) -> tuple[int, int]:
+    """Write into `delta_dir` what turns `old_app` into `new_app`. Returns
+    how many paths it adds or changes, and how many it deletes. Used by
+    packaging/create_release.py; apply_delta() reads the same layout."""
+    old, new = _bundle_entries(old_app), _bundle_entries(new_app)
+    changed = sorted(path for path, entry in new.items() if old.get(path) != entry)
+    deleted = sorted(path for path in old if path not in new)
+    files = delta_dir / _DELTA_FILES
+    for relative in changed:
+        source, target = new_app / relative, files / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            target.symlink_to(os.readlink(source))
+        else:
+            shutil.copy2(source, target)
+    (delta_dir / _DELTA_DELETED).write_text("".join(f"{path}\n" for path in deleted))
+    return len(changed), len(deleted)
+
+
+def _inside(root: Path, relative: str) -> Path:
+    """`root / relative`, refusing anything that would land outside `root`."""
+    parts = Path(relative).parts
+    if not parts or Path(relative).is_absolute() or ".." in parts:
+        raise UpdateError(f"The update delta names a path outside the app: {relative!r}")
+    return root.joinpath(*parts)
+
+
+def apply_delta(delta_dir: Path, app: Path) -> None:
+    """Turn `app` (a copy of the installed one) into the new version."""
+    try:
+        deleted = (delta_dir / _DELTA_DELETED).read_text().splitlines()
+    except FileNotFoundError as exc:
+        raise UpdateError(f"The update delta has no {_DELTA_DELETED}") from exc
+    for relative in filter(None, deleted):
+        path = _inside(app, relative)
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+    files = delta_dir / _DELTA_FILES
+    for directory, _, names in os.walk(files):
+        for name in names:
+            source = Path(directory) / name
+            target = _inside(app, str(source.relative_to(files)))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink() or target.is_file():
+                target.unlink()
+            if source.is_symlink():
+                target.symlink_to(os.readlink(source))
+            else:
+                shutil.copy2(source, target)
 
 
 def _place_beside(new_app: Path, installed_app: Path) -> Path:

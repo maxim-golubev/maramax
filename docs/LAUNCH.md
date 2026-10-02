@@ -1,4 +1,4 @@
-# Maramax 0.6.1 — ready for your first launch
+# Maramax 0.6.2 — ready for your first launch
 
 ## Open the new version
 
@@ -29,9 +29,11 @@ been published; when there is one, it offers it with **Install and Relaunch**,
 **Later**, or **Skip This Version** (Return means Later, so a keystroke meant
 for another app never installs anything). **Check for Updates…** in the menu,
 or **Check Now** in Settings → General, asks right away; the top of Settings
-shows the version you have. Installing downloads about 200 MB, accepts it only
-if it is signed with Maramax's own release certificate, waits until you are
-not dictating, quits, swaps the app, and opens the new version. Settings,
+shows the version you have. **Install and Relaunch** shows the download's
+progress in a small window (only the files that changed are downloaded when
+possible), accepts the update only if it is signed with Maramax's own release
+certificate, waits until you are not dictating, and restarts Maramax as the
+new version. Settings,
 history, and recordings are untouched, and if anything goes wrong the next
 launch says so. The version it replaced is kept at
 `~/Library/Application Support/Maramax/updates/previous/Maramax.app`; to roll

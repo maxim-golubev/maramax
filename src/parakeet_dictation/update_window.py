@@ -1,0 +1,122 @@
+"""The window that shows an update downloading, then Maramax restarting."""
+
+from __future__ import annotations
+
+import objc
+from AppKit import (
+    NSApplication, NSBackingStoreBuffered, NSButton, NSColor, NSFont, NSFontWeightSemibold, NSMakeRect, NSPanel,
+    NSProgressIndicator, NSProgressIndicatorStyleBar, NSTextField, NSWindowStyleMaskTitled,
+)
+from Foundation import NSObject
+
+WIDTH = 440
+HEIGHT = 136
+MARGIN = 20
+
+
+def download_size(size: int) -> str:
+    """A byte count as people read it: '200 MB', '3.4 MB', '840 KB'."""
+    megabytes = size / (1024 * 1024)
+    if megabytes >= 10:
+        return f"{round(megabytes)} MB"
+    if megabytes >= 1:
+        return f"{megabytes:.1f} MB"
+    return f"{max(1, round(size / 1024))} KB"
+
+
+def progress_detail(received: int, expected: int) -> str:
+    if received >= expected:
+        return "Checking the download…"
+    return f"{download_size(received)} of {download_size(expected)}"
+
+
+class UpdateProgressWindow(NSObject):
+    def initWithCancel_(self, on_cancel):
+        self = objc.super(UpdateProgressWindow, self).init()
+        if self is None:
+            return None
+        self.on_cancel = on_cancel
+        self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, WIDTH, HEIGHT), NSWindowStyleMaskTitled, NSBackingStoreBuffered, False)
+        self.panel.setTitle_("Updating Maramax")
+        self.panel.setReleasedWhenClosed_(False)
+        self.panel.setHidesOnDeactivate_(False)
+        content = self.panel.contentView()
+        inner = WIDTH - 2 * MARGIN
+        self.title = NSTextField.labelWithString_("")
+        self.title.setFont_(NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold))
+        self.title.setFrame_(NSMakeRect(MARGIN, HEIGHT - 40, inner, 18))
+        self.bar = NSProgressIndicator.alloc().initWithFrame_(NSMakeRect(MARGIN, HEIGHT - 68, inner, 20))
+        self.bar.setStyle_(NSProgressIndicatorStyleBar)
+        self.bar.setMinValue_(0.0)
+        self.bar.setMaxValue_(1.0)
+        self.detail = NSTextField.labelWithString_("")
+        self.detail.setFont_(NSFont.systemFontOfSize_(11))
+        self.detail.setTextColor_(NSColor.secondaryLabelColor())
+        self.detail.setFrame_(NSMakeRect(MARGIN, HEIGHT - 90, inner, 16))
+        self.cancel = NSButton.buttonWithTitle_target_action_("Cancel", self, "cancel:")
+        self.cancel.setKeyEquivalent_("\x1b")
+        size = self.cancel.fittingSize()
+        self.cancel.setFrame_(NSMakeRect(WIDTH - MARGIN - size.width, 12, size.width, size.height))
+        for view in (self.title, self.bar, self.detail, self.cancel):
+            content.addSubview_(view)
+        return self
+
+    @objc.python_method
+    def show(self, version):
+        self.title.setStringValue_(f"Downloading Maramax {version}…")
+        self.detail.setStringValue_("Starting the download…")
+        self._determinate(0.0)
+        self.cancel.setEnabled_(True)
+        if not self.panel.isVisible():
+            self.panel.center()
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        self.panel.makeKeyAndOrderFront_(None)
+
+    @objc.python_method
+    def show_progress(self, received, expected):
+        self.detail.setStringValue_(progress_detail(received, expected))
+        if received >= expected:
+            self._indeterminate()
+        else:
+            self._determinate(received / expected)
+
+    @objc.python_method
+    def show_ready(self, version, busy):
+        self.title.setStringValue_(f"Maramax {version} is ready")
+        self.detail.setStringValue_("Maramax restarts as soon as you finish dictating." if busy
+                                    else "Maramax restarts in a moment.")
+        self._indeterminate()
+
+    @objc.python_method
+    def bring_forward(self):
+        if self.panel.isVisible():
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            self.panel.makeKeyAndOrderFront_(None)
+
+    @objc.python_method
+    def show_restarting(self):
+        self.title.setStringValue_("Restarting Maramax…")
+        self.detail.setStringValue_("It opens again in a moment.")
+        self.cancel.setEnabled_(False)
+        self._indeterminate()
+
+    @objc.python_method
+    def close(self):
+        self.bar.stopAnimation_(None)
+        self.panel.orderOut_(None)
+
+    @objc.python_method
+    def _determinate(self, fraction):
+        self.bar.stopAnimation_(None)
+        self.bar.setIndeterminate_(False)
+        self.bar.setDoubleValue_(fraction)
+
+    @objc.python_method
+    def _indeterminate(self):
+        self.bar.setIndeterminate_(True)
+        self.bar.startAnimation_(None)
+
+    def cancel_(self, sender):
+        del sender
+        self.on_cancel()

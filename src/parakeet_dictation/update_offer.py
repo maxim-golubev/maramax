@@ -5,6 +5,7 @@ from __future__ import annotations
 import enum
 import os
 import re
+import shutil
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -17,6 +18,7 @@ from . import updater
 from .config import AppConfig
 from .logger_config import logger
 from .main_thread import call_later
+from .update_window import UpdateProgressWindow, download_size
 
 CHECK_TITLE = "Check for Updates…"
 # The first automatic check comes a minute after launch, out of its way.
@@ -25,6 +27,8 @@ CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 # An install quits the app, so it waits until nothing has been running for
 # this long: a finished dictation still pastes and shows its outcome.
 IDLE_BEFORE_INSTALL_SECONDS = 3.0
+# Long enough to read "Restarting Maramax…" before the window goes.
+RESTART_NOTICE_SECONDS = 0.8
 MAX_NOTES_CHARS = 600
 
 
@@ -93,19 +97,13 @@ def should_prompt(*, asked: bool, version: str, skipped_version: str | None, bus
     return asked or (version != skipped_version and not busy)
 
 
-def download_size(size: int) -> str:
-    """A byte count as the prompt says it: '200 MB', '840 KB'."""
-    if size >= 1024 * 1024:
-        return f"{round(size / (1024 * 1024))} MB"
-    return f"{max(1, round(size / 1024))} KB"
-
-
 def release_message(release: updater.Release, current_version: str) -> str:
     notes = plain_notes(release.notes)
     if len(notes) > MAX_NOTES_CHARS:
         notes = notes[: MAX_NOTES_CHARS - 1].rstrip() + "…"
+    size = (release.delta or release.archive).size
     message = (f"You have version {current_version}. Installing downloads about "
-               f"{download_size(release.archive_size)}, replaces Maramax, and opens the new version. "
+               f"{download_size(size)}, replaces Maramax, and opens the new version. "
                "Your settings, history, and recordings stay as they are.")
     return f"{message}\n\n{notes}" if notes else message
 
@@ -132,6 +130,8 @@ class UpdateOffer:
         self._has_checked = False           # a check has succeeded since launch
         self._problem: str | None = None    # why the last check failed, until one succeeds
         self._updated_to: str | None = None  # this launch follows an update that installed
+        self._cancel = threading.Event()     # one per download, so a cancel cannot outlive it
+        self._window: UpdateProgressWindow | None = None
 
     def start(self) -> None:
         """Report how the last update went, then begin the automatic checks
@@ -171,7 +171,10 @@ class UpdateOffer:
     def check_requested(self) -> None:
         """The menu item or Settings' Check Now: offer what is known, else ask GitHub."""
         if self._step is not Step.IDLE:
-            return  # The title already says what is happening.
+            # The title already says what is happening; the window shows more.
+            if self._window is not None:
+                self._window.bring_forward()
+            return
         if self._release is not None:
             self._offer(self._release)
         else:
@@ -269,21 +272,41 @@ class UpdateOffer:
         except updater.UpdateError as exc:
             rumps.alert(title=f"Maramax {release.version} cannot be installed here", message=str(exc))
             return
+        self._cancel = threading.Event()
+        if self._window is None:
+            self._window = UpdateProgressWindow.alloc().initWithCancel_(self.cancel_requested)
+        self._window.show(release.version)
         self._set_step(Step.DOWNLOADING, 0)
-        threading.Thread(target=self._download_worker, args=(release, installed_app), daemon=True).start()
+        threading.Thread(target=self._download_worker, args=(release, installed_app, self._cancel),
+                         daemon=True).start()
 
-    def _download_worker(self, release: updater.Release, installed_app: Path) -> None:
-        shown = [-1]
+    def cancel_requested(self) -> None:
+        """The progress window's Cancel: stop the download, or the install
+        that is waiting for the app to be idle."""
+        self._cancel.set()
+        if self._window is not None:
+            self._window.close()
 
-        def progress(fraction: float) -> None:
-            percent = int(fraction * 100)
-            if percent != shown[0]:
-                shown[0] = percent
-                AppHelper.callAfter(self._set_step, Step.DOWNLOADING, percent)
+    def _downloading(self, received: int, expected: int) -> None:
+        if self._step is not Step.DOWNLOADING:
+            return  # A report that arrived after the download ended.
+        self._set_step(Step.DOWNLOADING, min(100, received * 100 // expected))
+        if self._window is not None:
+            self._window.show_progress(received, expected)
+
+    def _download_worker(self, release: updater.Release, installed_app: Path, cancel: threading.Event) -> None:
+        shown = [-1, -1]
+
+        def progress(received: int, expected: int) -> None:
+            # A report per whole percent, and the last one, keep the main thread unflooded.
+            percent = received * 100 // expected
+            if (percent, expected) != tuple(shown) or received >= expected:
+                shown[:] = [percent, expected]
+                AppHelper.callAfter(self._downloading, received, expected)
 
         try:
             staged_app = updater.download(release, self._current, installed_app, self._updates_dir / "download",
-                                          progress)
+                                          progress, cancel.is_set)
             problem = None
         except updater.UpdateError as exc:
             staged_app, problem = None, str(exc)
@@ -295,7 +318,15 @@ class UpdateOffer:
 
     def _downloaded(self, release: updater.Release, installed_app: Path, staged_app: Path | None,
                     problem: str | None) -> None:
+        if self._cancel.is_set():
+            logger.info(f"Update to {release.version} cancelled")
+            self._set_step(Step.IDLE)
+            if staged_app is not None:
+                self._discard(staged_app)
+            return
         if staged_app is None:
+            if self._window is not None:
+                self._window.close()
             logger.error(f"Update to {release.version} failed: {problem}")
             self._set_step(Step.IDLE)
             rumps.alert(title=f"Maramax {release.version} could not be installed",
@@ -308,8 +339,15 @@ class UpdateOffer:
     def _install_when_idle(self, installed_app: Path, staged_app: Path, idle_before: bool) -> None:
         """Quit and install once the app has been idle on two looks in a row,
         with no dialog or file panel open."""
+        if self._cancel.is_set():
+            logger.info("Update cancelled before it was installed")
+            self._set_step(Step.IDLE)
+            self._discard(staged_app)
+            return
         idle = not self._is_busy() and NSApplication.sharedApplication().modalWindow() is None
         if not (idle and idle_before):
+            if self._window is not None:
+                self._window.show_ready(self._release.version if self._release else "", busy=not idle)
             call_later(IDLE_BEFORE_INSTALL_SECONDS, self._install_when_idle, installed_app, staged_app, idle)
             return
         try:
@@ -322,7 +360,17 @@ class UpdateOffer:
         except updater.UpdateError as exc:
             logger.error(str(exc))
             self._set_step(Step.IDLE)
+            if self._window is not None:
+                self._window.close()
             rumps.alert(title="The update could not be installed", message=str(exc))
             return
         logger.info("Quitting so the update can be installed")
-        self._quit_app()
+        if self._window is not None:
+            self._window.show_restarting()
+        call_later(RESTART_NOTICE_SECONDS, self._quit_app)
+
+    @staticmethod
+    def _discard(staged_app: Path) -> None:
+        # Thousands of files: off the main thread.
+        threading.Thread(target=shutil.rmtree, args=(staged_app,), kwargs={"ignore_errors": True},
+                         daemon=True).start()

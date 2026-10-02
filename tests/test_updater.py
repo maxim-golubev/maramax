@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from parakeet_dictation import update_offer, updater
+from parakeet_dictation import update_offer, update_window, updater
 from parakeet_dictation.config import AppConfig
 
 
@@ -37,8 +37,19 @@ def release_payload(tag="v0.5.2", assets=("Maramax-0.5.2.zip", "Maramax-0.5.2.zi
 def test_a_newer_tag_is_an_update(tag, expected):
     release = updater.newer_release("0.5.1", release_payload(tag=tag))
     assert release is not None and release.version == expected
-    assert release.archive_url.endswith(".zip") and release.checksum_url.endswith(".zip.sha256")
-    assert release.notes == "Fixes." and release.archive_size == 2048
+    assert release.archive.url.endswith(".zip") and release.archive.checksum_url.endswith(".zip.sha256")
+    assert release.notes == "Fixes." and release.archive.size == 2048 and release.delta is None
+
+
+def test_a_delta_from_the_installed_version_is_picked_up_and_older_clients_see_one_zip():
+    names = ("Maramax-0.5.2.zip", "Maramax-0.5.2.zip.sha256",
+             "Maramax-0.5.2-from-0.5.1.delta", "Maramax-0.5.2-from-0.5.1.delta.sha256",
+             "Maramax-0.5.2-from-0.5.0.delta", "Maramax-0.5.2-from-0.5.0.delta.sha256")
+    release = updater.newer_release("0.5.1", release_payload(assets=names))
+    assert release.delta is not None and release.delta.name == "Maramax-0.5.2-from-0.5.1.delta"
+    assert updater.newer_release("0.4.0", release_payload(assets=names)).delta is None
+    # What 0.6.1's updater requires of a release: exactly one asset ending in .zip.
+    assert [name for name in names if name.endswith(".zip")] == ["Maramax-0.5.2.zip"]
 
 
 @pytest.mark.parametrize("tag", ["v0.5.1", "v0.5.0", "0.4.9", "v0.5", "v0.5.1.0"])
@@ -65,7 +76,8 @@ def without_url():
 
 @pytest.mark.parametrize("payload, message", [
     (release_payload(tag="nightly"), "not a version number"),
-    (release_payload(assets=("Maramax-0.5.2.zip",)), "one .zip with a matching"),
+    (release_payload(assets=("Maramax-0.5.2.zip",)), "without Maramax-0.5.2.zip.sha256"),
+    (release_payload(assets=("a.zip", "a.zip.sha256", "b.zip", "b.zip.sha256")), "one app .zip"),
     ({"assets": []}, "no tag"),
     (still_uploading(), "still being published"),
     (without_url(), "still being published"),
@@ -142,8 +154,8 @@ def published(tmp_path, identifier="com.maramax.dictation", version="0.5.2", tam
         archive.write_bytes(archive.read_bytes() + b"x")
     checksum = tmp_path / f"{archive.name}.sha256"
     checksum.write_text(f"{digest}  {archive.name}\n")
-    return updater.Release(version=version, notes="", page_url="", archive_url=archive.as_uri(),
-                           archive_size=archive.stat().st_size, checksum_url=checksum.as_uri())
+    return updater.Release(version=version, notes="", page_url="", delta=None, archive=updater.Asset(
+        archive.name, archive.as_uri(), archive.stat().st_size, checksum.as_uri()))
 
 
 @pytest.fixture
@@ -164,7 +176,8 @@ def codesign(monkeypatch):
 def test_a_verified_download_is_placed_beside_the_installed_app(tmp_path, codesign):
     installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
     progress = []
-    staged = updater.download(published(tmp_path), "0.5.1", installed, tmp_path / "staging", progress.append)
+    staged = updater.download(published(tmp_path), "0.5.1", installed, tmp_path / "staging",
+                              lambda received, expected: progress.append(received / expected), lambda: False)
     assert staged == installed.parent / updater.STAGED_NAME and version_of(staged) == "0.5.2"
     assert progress[-1] == 1.0
     assert codesign == [["codesign", "--verify", "--deep", "--strict",
@@ -179,7 +192,7 @@ def test_a_verified_download_is_placed_beside_the_installed_app(tmp_path, codesi
 def test_a_download_that_is_not_this_app_is_refused_and_cleared(tmp_path, codesign, kwargs, message):
     installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
     with pytest.raises(updater.UpdateError, match=message):
-        updater.download(published(tmp_path, **kwargs), "0.5.1", installed, tmp_path / "staging", lambda f: None)
+        updater.download(published(tmp_path, **kwargs), "0.5.1", installed, tmp_path / "staging", lambda *a: None, lambda: False)
     assert codesign == []
     assert not (tmp_path / "staging").exists()
     assert not (installed.parent / updater.STAGED_NAME).exists()
@@ -190,7 +203,7 @@ def test_a_download_whose_app_reports_another_version_is_refused(tmp_path, codes
     release = published(tmp_path, version="0.5.2")
     mislabelled = updater.Release(**{**release.__dict__, "version": "0.5.3"})
     with pytest.raises(updater.UpdateError, match="says it is version 0.5.2"):
-        updater.download(mislabelled, "0.5.1", installed, tmp_path / "staging", lambda f: None)
+        updater.download(mislabelled, "0.5.1", installed, tmp_path / "staging", lambda *a: None, lambda: False)
 
 
 def test_a_signature_from_another_certificate_is_refused(tmp_path, monkeypatch):
@@ -203,7 +216,7 @@ def test_a_signature_from_another_certificate_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(updater, "_run", unsigned)
     installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
     with pytest.raises(updater.UpdateError, match="release certificate"):
-        updater.download(published(tmp_path), "0.5.1", installed, tmp_path / "staging", lambda f: None)
+        updater.download(published(tmp_path), "0.5.1", installed, tmp_path / "staging", lambda *a: None, lambda: False)
     assert not (installed.parent / updater.STAGED_NAME).exists()
 
 
@@ -358,10 +371,13 @@ def test_settings_says_where_updates_stand(step, version, checked, problem, upda
 
 
 @pytest.mark.parametrize("size, expected", [
-    (2048, "2 KB"), (100, "1 KB"), (840 * 1024, "840 KB"), (210_252_034, "201 MB"), (1024 * 1024, "1 MB"),
+    (2048, "2 KB"), (100, "1 KB"), (840 * 1024, "840 KB"), (210_252_034, "201 MB"), (1024 * 1024, "1.0 MB"),
+    (3_565_158, "3.4 MB"),
 ])
 def test_download_sizes_read_naturally(size, expected):
-    assert update_offer.download_size(size) == expected
+    assert update_window.download_size(size) == expected
+    assert update_window.progress_detail(size // 2, size) == f"{update_window.download_size(size // 2)} of {expected}"
+    assert update_window.progress_detail(size, size) == "Checking the download…"
 
 
 def test_every_failed_install_has_something_to_say():
@@ -375,7 +391,24 @@ def test_release_notes_are_shown_without_markdown():
     assert update_offer.plain_notes(notes) == "New\nUpdates itself. See the guide and START HERE.md."
 
 
+class FakeWindow:
+    shown: list = []
+
+    @classmethod
+    def alloc(cls):
+        return cls()
+
+    def initWithCancel_(self, on_cancel):
+        self.on_cancel = on_cancel
+        return self
+
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: FakeWindow.shown.append((name, args))
+
+
 def offer(monkeypatch, tmp_path, answer=None, busy=False):
+    FakeWindow.shown = []
+    monkeypatch.setattr(update_offer, "UpdateProgressWindow", FakeWindow)
     alerts = []
     monkeypatch.setattr(update_offer.rumps, "alert", lambda **kwargs: alerts.append(kwargs) or 1)
     monkeypatch.setattr(update_offer, "NSApplication",
@@ -450,7 +483,9 @@ def test_an_install_waits_for_two_idle_looks_then_quits(monkeypatch, tmp_path):
     assert not installs
     tick()                      # Idle twice in a row.
     assert installs[0]["previous_app"] == tmp_path / "updates" / "previous" / "Maramax.app"
-    assert installs[0]["result_path"] == tmp_path / "updates" / "last-install" and quits
+    assert installs[0]["result_path"] == tmp_path / "updates" / "last-install" and not quits
+    tick()                      # "Restarting Maramax…" has been on screen; now quit.
+    assert quits
 
 
 def test_an_open_dialog_holds_the_install(monkeypatch, tmp_path):
@@ -486,6 +521,129 @@ def test_the_next_launch_reports_how_the_last_update_went(monkeypatch, tmp_path)
     alert = next(function for delay, function in later if delay == 5)
     alert()
     assert alerts[0]["title"] == "The update was not installed" and "restored" in alerts[0]["message"]
+
+
+def test_install_and_relaunch_shows_progress_then_restarting(monkeypatch, tmp_path):
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
+    later = []
+    monkeypatch.setattr(update_offer, "call_later", lambda delay, function, *args: later.append((function, args)))
+    monkeypatch.setattr(update_offer.updater, "install_after_exit", lambda **kwargs: None)
+    monkeypatch.setattr(update_offer.threading, "Thread", lambda **kwargs: SimpleNamespace(start=lambda: None))
+    controller._installed_app = tmp_path / "Applications" / "Maramax.app"
+    controller._installed_app.parent.mkdir()
+    release = updater.newer_release("0.5.1", release_payload())
+    controller._release = release
+    controller._download(release)
+    controller._downloading(1024, 2048)
+    assert item.title == "Downloading Maramax 0.5.2… 50%"
+    controller._downloaded(release, controller._installed_app, tmp_path / updater.STAGED_NAME, None)
+    while later:
+        function, args = later.pop(0)
+        function(*args)
+    steps = [name for name, _ in FakeWindow.shown]
+    assert steps[0] == "show" and "show_progress" in steps and "show_ready" in steps
+    assert steps[-1] == "show_restarting"
+
+
+def test_cancel_stops_the_download_quietly_and_discards_it(monkeypatch, tmp_path):
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
+    discarded = []
+    monkeypatch.setattr(update_offer.UpdateOffer, "_discard", staticmethod(discarded.append))
+    release = updater.newer_release("0.5.1", release_payload())
+    controller._release = release
+    controller._window = FakeWindow()
+    controller._set_step(update_offer.Step.DOWNLOADING, 10)
+    controller.cancel_requested()
+    controller._downloaded(release, tmp_path / "Maramax.app", None, "The download was cancelled")
+    assert alerts == [] and item.title == "Install Maramax 0.5.2…"
+    # A cancel after the download finished, while the install waits for idle:
+    controller._set_step(update_offer.Step.INSTALLING)
+    controller._install_when_idle(tmp_path / "Maramax.app", tmp_path / updater.STAGED_NAME, idle_before=True)
+    assert discarded == [tmp_path / updater.STAGED_NAME] and controller.can_check()
+
+
+# -- Deltas: only what changed --
+
+def two_versions(tmp_path):
+    old = fake_bundle(tmp_path / "old", version="0.5.1")
+    (old / "Contents" / "Resources" / "lib").mkdir(parents=True)
+    (old / "Contents" / "Resources" / "lib" / "big.bin").write_bytes(b"x" * 50_000)
+    (old / "Contents" / "Resources" / "gone.txt").write_text("removed in the new version")
+    (old / "Contents" / "Resources" / "current").symlink_to("lib")
+    new = fake_bundle(tmp_path / "new", version="0.5.2")
+    (new / "Contents" / "Resources" / "lib").mkdir(parents=True)
+    (new / "Contents" / "Resources" / "lib" / "big.bin").write_bytes(b"x" * 50_000)
+    (new / "Contents" / "Resources" / "added.txt").write_text("new")
+    (new / "Contents" / "Resources" / "current").symlink_to("lib")
+    return old, new
+
+
+def test_a_delta_carries_only_what_changed_and_rebuilds_the_new_version_exactly(tmp_path):
+    old, new = two_versions(tmp_path)
+    delta = tmp_path / "delta"
+    delta.mkdir()
+    assert updater.make_delta(old, new, delta) == (2, 1)   # Info.plist and added.txt; gone.txt removed.
+    assert not (delta / "files" / "Contents" / "Resources" / "lib" / "big.bin").exists()
+    rebuilt = tmp_path / "rebuilt" / "Maramax.app"
+    rebuilt.parent.mkdir()
+    subprocess.run(["cp", "-cR", str(old), str(rebuilt)], check=True)
+    updater.apply_delta(delta, rebuilt)
+    assert updater._bundle_entries(rebuilt) == updater._bundle_entries(new)
+
+
+@pytest.mark.parametrize("bad_path", ["../outside.txt", "/etc/hosts", "Contents/../../outside.txt"])
+def test_a_delta_cannot_reach_outside_the_app(tmp_path, bad_path):
+    delta = tmp_path / "delta"
+    (delta / "files").mkdir(parents=True)
+    (delta / "deleted.txt").write_text(bad_path + "\n")
+    app = fake_bundle(tmp_path / "app")
+    with pytest.raises(updater.UpdateError, match="outside the app"):
+        updater.apply_delta(delta, app)
+
+
+def published_with_delta(tmp_path, old_app, new_app, corrupt=False):
+    release = published(tmp_path, version="0.5.2")
+    work = tmp_path / "delta-work"
+    work.mkdir()
+    updater.make_delta(old_app, new_app, work)
+    if corrupt:
+        (work / "files" / "Contents" / "Info.plist").write_bytes(plistlib.dumps(
+            {"CFBundleIdentifier": "com.maramax.dictation", "CFBundleShortVersionString": "9.9"}))
+    delta = tmp_path / "Maramax-0.5.2-from-0.5.1.delta"
+    subprocess.run(["ditto", "-c", "-k", str(work), str(delta)], check=True)
+    digest = hashlib.sha256(delta.read_bytes()).hexdigest()
+    (tmp_path / f"{delta.name}.sha256").write_text(f"{digest}  {delta.name}\n")
+    return updater.Release(**{**release.__dict__, "delta": updater.Asset(
+        delta.name, delta.as_uri(), delta.stat().st_size, (tmp_path / f"{delta.name}.sha256").as_uri())})
+
+
+def test_an_update_downloads_only_the_delta_when_one_is_published(tmp_path, codesign):
+    old, new = two_versions(tmp_path)
+    installed = (tmp_path / "Applications").mkdir() or old.rename(tmp_path / "Applications" / "Maramax.app")
+    release = published_with_delta(tmp_path, installed, new)
+    fetched = []
+    staged = updater.download(release, "0.5.1", installed, tmp_path / "staging",
+                              lambda received, expected: fetched.append(expected), lambda: False)
+    assert set(fetched) == {release.delta.size}
+    assert updater._bundle_entries(staged) == updater._bundle_entries(new)
+    assert version_of(installed) == "0.5.1"    # The installed app was only copied.
+
+
+def test_a_delta_that_does_not_verify_falls_back_to_the_whole_app(tmp_path, codesign):
+    old, new = two_versions(tmp_path)
+    installed = (tmp_path / "Applications").mkdir() or old.rename(tmp_path / "Applications" / "Maramax.app")
+    release = published_with_delta(tmp_path, installed, new, corrupt=True)
+    fetched = []
+    staged = updater.download(release, "0.5.1", installed, tmp_path / "staging",
+                              lambda received, expected: fetched.append(expected), lambda: False)
+    assert release.archive.size in fetched and version_of(staged) == "0.5.2"
+
+
+def test_a_cancelled_download_leaves_nothing_behind(tmp_path, codesign):
+    installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
+    with pytest.raises(updater.UpdateCancelled):
+        updater.download(published(tmp_path), "0.5.1", installed, tmp_path / "staging", lambda *a: None, lambda: True)
+    assert not (tmp_path / "staging").exists() and not (installed.parent / updater.STAGED_NAME).exists()
 
 
 def test_skipped_version_and_update_checks_persist(tmp_path):

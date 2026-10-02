@@ -42,7 +42,7 @@ def check(args: argparse.Namespace) -> dict:
         "parakeet_dictation.app", "parakeet_dictation.recorder", "parakeet_dictation.audio_worker",
         "parakeet_dictation.recordings_window", "mlx.core", "parakeet_mlx", "parakeet_mlx.alignment",
         "parakeet_dictation.preferences", "parakeet_dictation.instance",
-        "parakeet_dictation.updater", "parakeet_dictation.update_offer",
+        "parakeet_dictation.updater", "parakeet_dictation.update_offer", "parakeet_dictation.update_window",
         "qwen3_asr_mlx", "pyaudio", "soundfile", "scipy", "numpy",
         "tokenizers", "huggingface_hub", "httpx", "certifi", "AppKit",
     ]
@@ -101,7 +101,9 @@ def check(args: argparse.Namespace) -> dict:
         preferences = PreferencesController.alloc().initWithDelegate_labels_(delegate, _SETTING_LABELS)
         recordings = RecordingsController.alloc().initWithDelegate_store_(delegate, store)
         overlay = OverlayController.alloc().initWithDelegate_(delegate)
-        for controller in (preferences, recordings, overlay):
+        from parakeet_dictation.update_window import UpdateProgressWindow
+        update_window = UpdateProgressWindow.alloc().initWithCancel_(lambda: None)
+        for controller in (preferences, recordings, overlay, update_window):
             assert not controller.panel.isVisible()
         assert recordings.sound is None
         pcm = b"\x01\x00" * 16000
