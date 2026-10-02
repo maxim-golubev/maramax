@@ -63,7 +63,7 @@ measured off-screen, and the update swap script runs against temporary folders.
    by Apple, so the first time macOS blocks it: open **System Settings →
    Privacy & Security** and choose **Open Anyway**.
 3. The first launch downloads the speech model (2.5 GB). After that Maramax
-   starts in a few seconds and works offline, and keeps itself up to date.
+   starts in a few seconds and works offline.
 
 Allow microphone access when asked; turn on Accessibility only if you want the
 text pasted for you. Also there: your own replacement list for names and jargon
