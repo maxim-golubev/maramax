@@ -68,6 +68,11 @@ def write_delta(old_version: str, old_app: Path, new_app: Path, delta: Path, ide
     with tempfile.TemporaryDirectory(prefix="maramax-delta-") as directory:
         work = Path(directory)
         changed, deleted = bundle_delta.make(old_app, new_app, work / "delta")
+        # 0.6.2's updater reads its deletions from deleted.txt, not from the
+        # manifest; with it, 0.6.2 can use this delta too (and still checks
+        # the pinned signature on the result). Remove once 0.6.2 is gone.
+        removed = json.loads((work / "delta" / "manifest.json").read_text())["deleted"]
+        (work / "delta" / "deleted.txt").write_text("".join(f"{path}\n" for path in removed))
         rebuilt = work / "rebuilt" / new_app.name
         rebuilt.parent.mkdir()
         subprocess.run(["cp", "-cR", str(old_app), str(rebuilt)], check=True)
