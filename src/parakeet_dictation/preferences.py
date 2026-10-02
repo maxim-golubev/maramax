@@ -28,9 +28,9 @@ _HELP = {
     "auto_start_recording": f"Turn off to open the window first and start with {STOP.label}.",
     "live_preview": "Draft text while you speak. The final transcript always replaces it.",
     "auto_copy_to_clipboard": "",
-    "paste_to_active_app": "Types the result where your cursor is. macOS asks for Accessibility permission once.",
-    "high_accuracy": "Qwen3-ASR 1.7B. Better with names and unusual words, and it reads your word replacements "
-                     "as vocabulary. Several times slower on long dictations, about 6 GB of memory, "
+    "paste_to_active_app": "Pastes the result where your cursor is. macOS asks for Accessibility permission once.",
+    "high_accuracy": "Qwen3-ASR 1.7B, a larger model that reads your word replacements as vocabulary. "
+                     "Several times slower on long dictations, about 6 GB of memory, "
                      "and a 4.1 GB download on first use.",
     "prefer_builtin_mic": "Records with the Mac so AirPods stay in high-quality playback. "
                           "Skipped while the lid is closed, when the Mac’s microphone is switched off.",
@@ -40,11 +40,13 @@ _HELP = {
                        "Whole words and phrases, ignoring capitalization. "
                        "The original text stays in History and Recordings.",
 }
+_SPEECH_MODEL = "Speech model"
+_UPDATES = "Updates"
 _SECTIONS = (
     ("Dictation", ("compact_dictation", "auto_start_recording", "live_preview")),
     ("Result", ("auto_copy_to_clipboard", "paste_to_active_app")),
-    ("Speech model", ("high_accuracy",)),
-    ("Updates", ("check_for_updates",)),
+    (_SPEECH_MODEL, ("high_accuracy",)),
+    (_UPDATES, ("check_for_updates",)),
 )
 _KEEP_READY_CHOICES = (0, 30, 120, 300)
 _DEFAULT_NOTE = "Each replacement is applied once per match; replacements never chain."
@@ -195,11 +197,11 @@ class PreferencesController(NSObject):
         sections = {title: [self._header(title)] + [self._option(name) for name in names] for title, names in _SECTIONS}
         self.model_status = self._help("")
         self.model_retry = self._button("Retry", "retryModel:")
-        sections["Speech model"].append(self._stack([self.model_status, self.model_retry], horizontal=True,
+        sections[_SPEECH_MODEL].append(self._stack([self.model_status, self.model_retry], horizontal=True,
                                                     spacing=ROW_GAP))
         self.update_check = self._button("Check Now", "checkForUpdates:")
         self.update_status = self._help("", CONTENT_WIDTH - 120)
-        sections["Updates"].append(self._stack([self.update_check, self.update_status], horizontal=True,
+        sections[_UPDATES].append(self._stack([self.update_check, self.update_status], horizontal=True,
                                                spacing=ROW_GAP))
         name = NSTextField.labelWithString_("Maramax")
         name.setFont_(NSFont.systemFontOfSize_weight_(15, NSFontWeightSemibold))

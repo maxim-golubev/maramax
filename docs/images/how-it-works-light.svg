@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="250" viewBox="0 0 980 250" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#59636e"/></marker></defs>
+<rect x="10" y="30" width="130" height="54" rx="10" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.5"/>
+<text x="75.0" y="62.0" text-anchor="middle" font-size="14" font-weight="400" fill="#1f2328">Option+Space</text>
+<rect x="190" y="30" width="130" height="54" rx="10" fill="#ddf4ff" stroke="#54aeff" stroke-width="1.5"/>
+<text x="255.0" y="62.0" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">Maramax</text>
+<rect x="430" y="30" width="210" height="54" rx="10" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.5"/>
+<text x="535.0" y="53.0" text-anchor="middle" font-size="14" font-weight="400" fill="#1f2328">Parakeet TDT 0.6B v2</text>
+<text x="535.0" y="71.0" text-anchor="middle" font-size="12" font-weight="400" fill="#59636e">MLX, on the GPU</text>
+<rect x="680" y="30" width="150" height="54" rx="10" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.5"/>
+<text x="755.0" y="62.0" text-anchor="middle" font-size="14" font-weight="400" fill="#1f2328">Word replacements</text>
+<rect x="860" y="30" width="110" height="54" rx="10" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.5"/>
+<text x="915.0" y="53.0" text-anchor="middle" font-size="14" font-weight="400" fill="#1f2328">Clipboard</text>
+<text x="915.0" y="71.0" text-anchor="middle" font-size="12" font-weight="400" fill="#59636e">or paste</text>
+<rect x="120" y="170" width="270" height="54" rx="10" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.5"/>
+<text x="255.0" y="193.0" text-anchor="middle" font-size="14" font-weight="400" fill="#1f2328">Audio helper process</text>
+<text x="255.0" y="211.0" text-anchor="middle" font-size="12" font-weight="400" fill="#59636e">owns the microphone</text>
+<rect x="500" y="170" width="200" height="54" rx="10" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1.5"/>
+<text x="600.0" y="193.0" text-anchor="middle" font-size="14" font-weight="400" fill="#1f2328">Saved WAV</text>
+<text x="600.0" y="211.0" text-anchor="middle" font-size="12" font-weight="400" fill="#59636e">before recognition</text>
+<line x1="140" y1="57" x2="186" y2="57" stroke="#59636e" stroke-width="1.5" marker-end="url(#head)"/>
+<line x1="320" y1="57" x2="426" y2="57" stroke="#59636e" stroke-width="1.5" marker-end="url(#head)"/>
+<text x="373" y="49" text-anchor="middle" font-size="12" fill="#59636e">from memory</text>
+<line x1="640" y1="57" x2="676" y2="57" stroke="#59636e" stroke-width="1.5" marker-end="url(#head)"/>
+<line x1="830" y1="57" x2="856" y2="57" stroke="#59636e" stroke-width="1.5" marker-end="url(#head)"/>
+<line x1="236" y1="84" x2="236" y2="166" stroke="#59636e" stroke-width="1.5" marker-end="url(#head)"/>
+<text x="228" y="133" text-anchor="end" font-size="12" fill="#59636e">record / stop</text>
+<line x1="276" y1="170" x2="276" y2="88" stroke="#59636e" stroke-width="1.5" marker-end="url(#head)"/>
+<text x="284" y="133" text-anchor="start" font-size="12" fill="#59636e">audio, over a pipe</text>
+<line x1="320" y1="76" x2="550" y2="166" stroke="#59636e" stroke-width="1.5" marker-end="url(#head)"/>
+<text x="470" y="128" text-anchor="start" font-size="12" fill="#59636e">archived first</text>
+</svg>

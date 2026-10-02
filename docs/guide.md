@@ -8,8 +8,9 @@ Everything the app does and where it keeps things. For a first launch, see [the 
 - A small bar shows the selected microphone, captured duration, and actual input
   level without taking focus from your current app. Cmd+R is registered globally
   only while recording from the compact bar; it is released afterward.
-- Results copy to the clipboard by default; turning **Copy the transcript to the
-  clipboard** off is honoured however a dictation is finished. **Settings → Paste
+- Results copy to the clipboard by default. With **Paste into the active app** off,
+  turning **Copy the transcript to the clipboard** off is honoured however a
+  dictation is finished (pasting needs the clipboard). **Settings → Paste
   into the active app** enables insertion too, into the app you were last working
   in. In compact mode, insertion is skipped if you switch to a different app while
   dictating; the text stays copied. If the clipboard changes before insertion, or
@@ -33,9 +34,9 @@ Cmd+A, Cmd+Z, Cmd+W) work in Settings and the other windows.
 
 With **Use the high-accuracy model** on, the names and terms you entered as
 replacements are also given to that model as vocabulary before it listens
-(snippets, addresses, and lists are left out). On this Mac it is several times
-slower than the standard model (a five-minute dictation took about a minute
-instead of five seconds), so it stays off by default.
+(snippets, addresses, and lists are left out). On an M3 Pro it is several times
+slower than the standard model (for dictations over two minutes, a median of
+19.5 s against 2.3 s), so it stays off by default.
 
 If the speech model cannot load, use **Retry Speech Model** after restoring your
 connection. **Quick Start…** explains recording, insertion, microphone selection,
@@ -55,7 +56,7 @@ built-in microphone is switched off in hardware, so the preference is skipped.
 Maramax does not initialize PortAudio or open input at launch. Once the speech
 model is ready it starts its audio helper process on standby, without touching
 any device, so a recording pays only for the driver open rather than a process
-launch (about 125 ms saved per dictation on this Mac). Microphone startup and
+launch (about 125 ms saved per dictation on an M3 Pro). Microphone startup and
 teardown run off the main UI thread. The bar distinguishes waiting for input,
 digital silence, and a stream that stopped delivering audio. Ordinary pauses
 after signal has arrived do not count as disconnections.
@@ -69,7 +70,7 @@ the next dictation starts from a clean state.
 
 Bluetooth microphones deliver one and a half to two and a half seconds of
 silence each time they connect; that is the headset switching into call mode and
-no app can shorten it. **Keep the microphone connected for** (Off, 30 seconds,
+macOS gives apps no way to shorten it. **Keep the microphone connected for** (Off, 30 seconds,
 2 minutes, 5 minutes) leaves the stream open after a dictation so the next one
 starts instantly. While it is open macOS shows the microphone indicator and
 AirPods stay in call-quality playback; audio heard while waiting is discarded
@@ -96,7 +97,7 @@ is applied by Maramax. The archive retains up to **20 recordings / 512 MB**, kee
 the newest even if it alone exceeds that budget; older recordings are removed
 as new ones are saved. Export recordings you want to keep permanently.
 
-The live PCM recovery spill is still written during capture for crash recovery.
+The live PCM recovery spill is written during capture for crash recovery.
 At the next launch a leftover spill is moved into Recordings as an ordinary
 entry. **Recover Last Recording** retries audio that never reached the recognizer
 first, then the newest capture without a transcript.
