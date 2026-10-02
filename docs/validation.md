@@ -221,3 +221,119 @@ disabled: it loaded from the cache in 1.8 s and transcribed the 10.4 s sample in
    continue on the Mac's microphone and the result should say it switched.
 4. Dictate with the lid closed and the Mac-microphone preference on: the AirPods
    should be used.
+
+## 0.5.1 independent audit and restructuring — October 1, 2026
+
+0.5.0 shipped after a single-author review. For 0.5.1 the code was audited by
+independent reviewers who had not seen the author's reasoning: four correctness
+audits (audio layer, controller, native UI, recognition/storage/packaging) and
+one review against the owner's Clean Code standard, then a second round by two
+fresh reviewers over the fixes. All 226 tests, Ruff, and mypy pass; the bundle
+builds and passes its check. As before, no microphone was opened and nothing was
+played: hardware behaviour is still verified only with a simulated audio device.
+
+### What the first round found in 0.5.0, and what was done
+
+High severity:
+
+- **A stuck Bluetooth close left the reused audio helper permanently broken.**
+  PortAudio keeps its device list until every session is shut down; a wedged
+  session can never be, so every later recording in that process looked for the
+  device that had vanished. The helper now exits whenever its audio session
+  could not be released cleanly, and the app starts a fresh one. Covered by a
+  test with a helper whose session leaks.
+- **The high-accuracy model could output its own vocabulary list.** Reproduced
+  with the real model on four noise-only clips (room noise, hum, key clicks, a
+  short tap): each returned the "Vocabulary: …" context verbatim, which would
+  have been copied and pasted. The app now treats an answer that repeats the
+  context as "no text", so the standard engine decides; the same four clips then
+  give no text and real speech is unaffected. Only plain names and terms are
+  admitted to the context (no snippets, addresses, lists, or numbers).
+
+Audio loss or wrong destination:
+
+- Confirming "Clear History & Recordings" after a dictation had started behind
+  the dialog deleted that dictation's audio. The busy check is now repeated
+  after the dialog.
+- Cancelling during transcription still pasted the result into the other app
+  when the transcript completed anyway. It is no longer pasted.
+- With a Maramax window in front, auto-paste could target an app the user had
+  left earlier. The target is now the last app activated other than Maramax.
+- A disk-full error while spilling audio ended the recording early. Spilling
+  now stops and the recording continues in memory.
+
+Reliability:
+
+- A stream that opened but never delivered was reopened at 4 s and then
+  declared missing at 5 s anyway; a failed reopen was shown as "Recording";
+  a cancel could abort the following dictation in two more ways than the one
+  fixed in 0.5.0; a helper that was slow to die could strand the recorder.
+- Every failed, empty, or cancelled dictation was kept twice and came back as
+  "Unsaved recording found" at the next launch. The audio now lives in one
+  place, settled before recognition starts.
+- Dictations over two minutes needed FFmpeg. All dictation is now recognized
+  from memory; outputs matched the stored transcripts on all 20 archived
+  dictations (5–588 s, six of them chunked).
+- Meters, the disconnect watchdog, and the bar's auto-hide stopped while any
+  dialog was open (confirmed in isolation: `AppHelper.callLater` does not fire
+  in the modal run-loop mode; a common-modes timer does).
+- A file written by a newer version lost its transcript, history entry, or
+  settings when an older version saved it; an unreadable settings or history
+  file was overwritten. Unknown fields are now carried through, and unreadable
+  files are renamed aside.
+- `kill` was ignored while the app sat idle.
+
+Interface (measured off-screen):
+
+- The bar's status text was cut off in most finished states. The bar is wider
+  and a finished bar puts the outcome and its explanation on separate lines.
+- Queue Remove and the arrows acted on an invisible cursor (Remove with nothing
+  clicked removed the last file). The chosen file is now highlighted, and the
+  buttons are disabled until one is chosen; a filename containing an emoji no
+  longer shifts the choice by a line.
+- Settings and Recordings disappeared when another app was clicked; windows
+  jumped back to the centre whenever they were shown; the reopened transcript
+  window had a blank status.
+- Visible edges of controls sat 2–6 pt off the margins because frames, not
+  alignment rectangles, were lined up. Measured after the change: left and
+  right edges at the margins in every state of the transcript window and in
+  Recordings, one centre line per row, and a 24 pt bottom margin on all three
+  Settings tabs.
+
+Structure (Clean Code review): one `Phase` value replaced four boolean flags;
+the audio format, the helper protocol's names, shortcut names, recording and
+queue statuses, and capture health each have one definition; the recorder's
+unused spill code and other dead code were deleted; import-time work was
+removed (importing the package no longer reads the environment or configures
+logging, and the app process no longer loads PortAudio); decisions that were
+buried in the controller are pure functions with table tests. `app.py` went
+from 1,547 lines to 1,387.
+
+### Second round
+
+Two fresh reviewers re-audited the result. They confirmed the fixes above, with
+these exceptions, all since addressed: two controller calls no longer matched
+the bar's signature after a late change (would have raised on a failed
+microphone start); the helper-retry had a race the tests hit about once in 14
+runs (now 0 in 20); a draft stream was left running after a silent capture;
+dying during recognition could still duplicate a recording; emoji filenames
+shifted the queue selection.
+
+### Known and left as is
+
+- Auto-paste sends the physical V key, which is not Cmd+V on Dvorak-style
+  layouts.
+- The reader side of the helper protocol still uses field names as plain
+  strings.
+- `app.py` remains the largest module. The reviewers' advice, which matches the
+  standard, was to stop at the phase model and the extracted decisions rather
+  than split it into files that hide nothing.
+- With both "Copy the transcript to the clipboard" and "Paste into the active
+  app" off, a dictation finished with the hotkey now leaves the text only in
+  History and the transcript window. 0.5.0 copied it regardless of the setting.
+
+### Still to verify on real hardware
+
+The four checks listed for 0.5.0 stand. Add: with AirPods, let a dictation run
+while they disconnect (the result should say the microphone changed), and
+confirm that the next dictation after any microphone failure starts normally.

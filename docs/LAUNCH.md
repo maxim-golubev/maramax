@@ -1,4 +1,4 @@
-# Maramax 0.5.0 — ready for your first launch
+# Maramax 0.5.1 — ready for your first launch
 
 ## Open the new version
 
@@ -49,7 +49,8 @@ time macOS shows the microphone indicator and AirPods stay in call-quality
 playback, which is why it is off until you choose a duration.
 
 If a microphone disconnects while you dictate, Automatic continues on the next
-available input and tells you that it switched.
+available input and tells you that it switched. A microphone you chose yourself
+is never swapped; the dictation ends there with what was captured.
 
 If you switch apps during compact dictation, automatic insertion is skipped and
 the transcript stays copied. If the clipboard changes before insertion, Maramax
@@ -84,7 +85,7 @@ Diagnostic logs rotate at 2 MB with two backups. They record operational errors
 and measurements; normal transcript text is not deliberately logged. Errors may
 include media filenames or microphone names. Models remain in the Hugging Face
 cache after history is cleared. Media-file import uses the system FFmpeg tool,
-which is already available on this Mac.
+which is already available on this Mac; dictation itself does not need it.
 
 ## Your first live check
 
