@@ -201,8 +201,9 @@ def main() -> None:
     env.pop("PYTHONPATH", None)
     env.update(PYTHONHOME=str(resources), RESOURCEPATH=str(resources),
                PYTHONNOUSERSITE="1", HF_HUB_OFFLINE="1", HF_HUB_DISABLE_TELEMETRY="1",
-               TOKENIZERS_PARALLELISM="false")
-    command = [str(args.bundle / "Contents" / "MacOS" / "python"), "-S",
+               TOKENIZERS_PARALLELISM="false", PYTHONDONTWRITEBYTECODE="1")
+    # -B: the bundle is signed, and bytecode written into it would break the seal.
+    command = [str(args.bundle / "Contents" / "MacOS" / "python"), "-S", "-B",
                str(Path(__file__).resolve()), "--worker", "--bundle", str(args.bundle),
                "--repeats", str(args.repeats)]
     if args.audio:
@@ -210,6 +211,11 @@ def main() -> None:
     if args.output:
         command.extend(["--output", str(args.output)])
     subprocess.run(command, env=env, cwd=resources, check=True, timeout=300)
+    # Whatever the check ran, the bundle must still be exactly what was signed.
+    sealed = subprocess.run(["codesign", "--verify", "--deep", "--strict", str(args.bundle)],
+                            capture_output=True, text=True)
+    if sealed.returncode != 0:
+        sys.exit(f"The bundle check changed the bundle; its signature no longer holds: {sealed.stderr.strip()}")
 
 
 if __name__ == "__main__":
