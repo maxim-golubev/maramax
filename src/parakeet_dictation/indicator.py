@@ -24,6 +24,11 @@ MARGIN = 18
 BUTTON = 30
 BUTTON_GAP = 8
 METER_BARS = 7
+# How far the expand arrow is shifted down-left, as a share of its reach. At 0
+# its outline is centred but the heavier arrowhead makes it look high and to
+# the right; at 0.22 it visibly sat low and left. At 0.10 the outline and the
+# ink are each off centre by under half a point, in opposite directions.
+EXPAND_OPTICAL_SHIFT = 0.10
 FINISHED_HINT = "Open Maramax for the transcript and recordings"
 
 
@@ -129,8 +134,8 @@ class RoundIconButton(NSButton):
         else:  # Glyph.EXPAND: an arrow to the upper right
             up = -reach if self.isFlipped() else reach  # Controls draw with y pointing down.
             # The arrowhead puts more ink in the upper right, so the shape is
-            # nudged the other way to sit centred to the eye, not the box.
-            cx, cy = cx - reach * 0.22, cy - up * 0.22
+            # shifted a little the other way (EXPAND_OPTICAL_SHIFT).
+            cx, cy = cx - reach * EXPAND_OPTICAL_SHIFT, cy - up * EXPAND_OPTICAL_SHIFT
             path.moveToPoint_((cx - reach, cy - up))
             path.lineToPoint_((cx + reach, cy + up))
             path.moveToPoint_((cx - reach * 0.35, cy + up))

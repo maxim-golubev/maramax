@@ -196,3 +196,27 @@ while not fired and time.monotonic() < end:
     loop.runMode_beforeDate_("NSModalPanelRunLoopMode", NSDate.dateWithTimeIntervalSinceNow_(0.02))
 assert fired == ["meter tick"]
 ''')
+
+
+def test_the_bar_glyphs_sit_centred_in_their_circles():
+    run(r'''
+from AppKit import NSAppearance, NSMakeRect
+from parakeet_dictation.indicator import Glyph, RoundIconButton
+for kind in (Glyph.EXPAND, Glyph.CLOSE):
+    button = RoundIconButton.alloc().initWithFrame_(NSMakeRect(0, 0, 30, 30))
+    button.set_kind(kind, "x")
+    button.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameAqua"))
+    rep = button.bitmapImageRepForCachingDisplayInRect_(button.bounds())
+    button.cacheDisplayInRect_toBitmapImageRep_(button.bounds(), rep)
+    w, h = rep.pixelsWide(), rep.pixelsHigh()
+    # The disc is about 10 % opaque; the glyph's ink is nearly solid.
+    ink = [(x, y, rep.colorAtX_y_(x, y).alphaComponent()) for y in range(h) for x in range(w)
+           if rep.colorAtX_y_(x, y).alphaComponent() > 0.5]
+    xs, ys = [p[0] for p in ink], [p[1] for p in ink]
+    total = sum(p[2] for p in ink)
+    outline = ((min(xs) + max(xs) + 1) / 2 - w / 2, (min(ys) + max(ys) + 1) / 2 - h / 2)
+    weight = (sum(p[0] * p[2] for p in ink) / total + 0.5 - w / 2, sum(p[1] * p[2] for p in ink) / total + 0.5 - h / 2)
+    # Within a pixel of the centre (half a point on this 2x render), both ways.
+    assert all(abs(v) <= 1.0 for v in outline), (kind, outline)
+    assert all(abs(v) <= 1.3 for v in weight), (kind, weight)
+''')
