@@ -41,9 +41,10 @@ A speech model is the easy part. Most of the work went into these:
   windows, and splices them back only if the wording still matches (at least
   90 % of the words).
 - **Updates are signed and small.** An update is accepted only with Maramax's
-  own release signature, downloads only the files that changed, rebuilds the
-  app from a copy of the installed one, and proves the result exact with that
-  signature before swapping it in. The previous version is kept.
+  own release signature and downloads only the files that changed (1.2 MB for
+  0.6.3, against 210 MB for the whole app). It rebuilds the app from a copy of
+  the installed one, proves the result identical to the release before
+  swapping it in, and keeps the previous version.
 
 Over 300 tests run without a microphone, a screen, or model weights: a fake
 audio device drives the real helper process, the native windows are built and

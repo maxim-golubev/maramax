@@ -514,3 +514,18 @@ covered the diagram on GitHub), qualifies what was tested only with a fake
 audio device, and credits the forked projects with a measured share. The
 architecture has its own document, `docs/architecture.md`; the launch
 guide no longer describes the author's own Mac.
+
+### Live results
+
+- **0.6.0 → 0.6.1**, through 0.6.0's prompt: the whole app (210 MB, about four
+  minutes on this connection) downloaded, verified, swapped, and relaunched; the
+  previous version kept. 0.6.1 → 0.6.2 went the same way through 0.6.1's code.
+- **0.6.2 → 0.6.3**, through 0.6.2's updater code against the published release:
+  the delta (1,168,147 bytes; 21 paths changed, 14 removed) downloaded and
+  verified in 3.3 s, the rebuilt app matched the release and its pinned
+  signature, and Maramax relaunched as 0.6.3 two seconds after quitting. Before
+  publishing, the same delta was applied by 0.6.2's code and by 0.6.3's to
+  clones of the installed app; both produced the release exactly.
+- A bundle check run with `--audio` compiled modules into the signed bundle and
+  broke its seal; `create_release.py` refused it. The check now runs without
+  writing bytecode and verifies the seal when it finishes.
