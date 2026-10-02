@@ -1,10 +1,14 @@
-# Maramax 0.4.0 validation — September 4, 2026
+# Maramax validation log
+
+What was verified for each version, newest last.
+
+## 0.4.0 — September 4, 2026
 
 The candidate at `dist/Maramax.app` builds and passes the checks below. The
 installed app was not replaced, no microphone was opened, and no sound was
 played. Live AirPods validation remains outstanding.
 
-## Verified
+### Verified
 
 - 127 automated tests pass, including 50 consecutive simulated recording sessions
   that release each worker, stream, and recovery file. Callbacks from previous
@@ -32,7 +36,7 @@ played. Live AirPods validation remains outstanding.
   paths pass; actual Qwen inference was not tested. The optional engine is off in
   the user's current settings and its weights are not cached.
 
-## Recognition measurements
+### Recognition measurements
 
 Machine: Apple M3 Pro, 36 GiB memory, macOS 15.7.9. Engine:
 `mlx-community/parakeet-tdt-0.6b-v2`. Speech was synthesized directly to files by
@@ -66,7 +70,7 @@ Raw results and source hashes (`source-sha256.json`) are under `docs/validation/
 These measurements come from the final 0.4.0 build. The versioned release also
 contains source hashes and a launch guide; its ZIP has a separate SHA-256 file.
 
-## Next live checks
+### Next live checks
 
 Run these when microphone use and potential Bluetooth playback changes are
 convenient. Use the candidate with the prior app quit so their hotkeys do not
@@ -225,7 +229,7 @@ disabled: it loaded from the cache in 1.8 s and transcribed the 10.4 s sample in
 ## 0.5.1 independent audit and restructuring — October 1, 2026
 
 0.5.0 shipped after a single-author review. For 0.5.1 the code was audited by
-independent reviewers who had not seen the author's reasoning: four correctness
+fresh code-review agents that had not seen the author's reasoning: four correctness
 audits (audio layer, controller, native UI, recognition/storage/packaging) and
 one review against the owner's Clean Code standard, then a second round by two
 fresh reviewers over the fixes. All 226 tests, Ruff, and mypy pass; the bundle
@@ -311,7 +315,7 @@ from 1,547 lines to 1,387.
 
 ### Second round
 
-Two fresh reviewers re-audited the result. They confirmed the fixes above, with
+Two fresh review agents re-audited the result. They confirmed the fixes above, with
 these exceptions, all since addressed: two controller calls no longer matched
 the bar's signature after a late change (would have raised on a failed
 microphone start); the helper-retry had a race the tests hit about once in 14
@@ -386,11 +390,11 @@ was run against temporary folders (including paths with spaces and an
 apostrophe, which the first version mishandled): it installs the new app,
 keeps the old one, removes the download, opens the result, and puts the old app
 back if the new one cannot be placed. The hand-off waits until the app has been
-idle on two looks 3 s apart. Live results of the first real update are below.
+idle on two looks 3 s apart. The first live update (0.6.0 to 0.6.1) is recorded under 0.6.3 below.
 
 ## 0.6.1 independent audit of 0.6.0 — October 2, 2026
 
-Two fresh reviewers audited 0.6.0 without the author's reasoning: one the
+Two fresh code-review agents audited 0.6.0 without the author's reasoning: one the
 updater, one the transcription repair and the whole change against the Clean
 Code standard. All 302 tests, Ruff, and mypy pass after the fixes below.
 
@@ -459,3 +463,54 @@ Compare `open_delay` (request to device open), `first_frame_delay`,
 `stop_seconds`, `stop_to_result_seconds`, `warm_start`, `audio_worker_resets`,
 and `active_threads` in recording metadata across repeated sessions. Measure real stop-to-insertion latency separately; the stored
 stop-to-result timing does not include the final UI/clipboard insertion.
+
+## 0.6.3 audit of deltas, the progress window, and the docs — October 2, 2026
+
+Two fresh code-review agents audited 0.6.2 (one the delta updates and the
+progress window, one the design, the documentation, and the README); a final
+review by the author followed their fixes. All 327 tests, Ruff, and mypy pass.
+
+### Updates
+
+- **A delta did not see directories or directory symlinks**, so a release that
+  removed a Python package would have left empty folders behind (which Python
+  then imports as namespace packages) in an app the strict signature check
+  still accepts. Deltas now live in `bundle_delta.py`, carry the full tree of
+  the new bundle (every directory, file, and symlink with its permissions), and
+  the rebuilt app must equal it before the signature is even checked.
+- A delta could carry quarantine from a browser-installed copy into the update;
+  the rebuilt app's extended attributes are now cleared. A path through a
+  symlink, or a symlink passed off as a file, is refused.
+- A dictation started during the 0.8 s "Restarting Maramax…" notice would have
+  been cut off by the quit. The app now looks again after the notice and goes
+  back to waiting; a quit that does not happen within 15 s is reported.
+- A broken delta asset blocked the whole update, and two parser errors skipped
+  the fallback; any problem with a delta now falls back to the whole app.
+- `create_release.py` proves each delta by rebuilding the release from the
+  previous one and checking the signature, and lists exactly what
+  `publish_release.py` may upload, with digests.
+- The signing step's restore of the keychain search list could be skipped by an
+  error at the wrong moment. It now retries, keeps a record on disk until the
+  list is proved restored, refuses to run while such a record exists, and locks
+  the signing keychain afterwards. (In 0.6.1 an interactive signing test by the
+  author, not the build script, had written the search list back as one
+  malformed entry; it was repaired the same day.)
+
+### Transcription
+
+- The repair checked the wording only inside the unformatted stretch, while a
+  retry window can replace up to about ten seconds of formatted text before it.
+  Both are now checked, separately, against what the splice actually replaces.
+- A cancel is its own exception, so the repair stops only for a cancel.
+
+On the 22 archived dictations the result is unchanged from 0.6.2: the two
+affected captures repaired, every other transcript identical.
+
+### Documentation
+
+The README leads with what the app does and its engineering problems, shows an
+animation and a diagram rendered from the app's own views (Mermaid's controls
+covered the diagram on GitHub), qualifies what was tested only with a fake
+audio device, and credits the forked projects with a measured share. The
+architecture has its own document, `docs/architecture.md`; the launch
+guide no longer describes the author's own Mac.
