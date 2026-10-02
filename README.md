@@ -80,7 +80,7 @@ A speech model is the easy part. Most of the work went into these:
   it is swapped in after the app quits, and the previous version is kept for
   rollback.
 
-The app is about 7,400 lines of Python (PyObjC for the native interface, MLX
+The app is about 7,700 lines of Python (PyObjC for the native interface, MLX
 for inference) with about 300 tests that need no microphone, screen, or model
 weights: a fake audio device drives the real helper process, and the native
 windows are built and measured off-screen.
