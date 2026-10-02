@@ -13,6 +13,7 @@ from AppKit import (
 )
 from Foundation import NSObject
 
+from . import __version__
 from .corrections import MAX_HEARD_CHARS, MAX_REPLACEMENT_CHARS, MAX_RULES, normalize_rules
 from .hotkeys import STOP
 
@@ -191,11 +192,21 @@ class PreferencesController(NSObject):
 
     @objc.python_method
     def _general_page(self):
-        groups = [[self._header(title)] + [self._option(name) for name in names] for title, names in _SECTIONS]
+        sections = {title: [self._header(title)] + [self._option(name) for name in names] for title, names in _SECTIONS}
         self.model_status = self._help("")
         self.model_retry = self._button("Retry", "retryModel:")
-        groups[-1].append(self._stack([self.model_status, self.model_retry], horizontal=True, spacing=ROW_GAP))
-        return self._page(groups)
+        sections["Speech model"].append(self._stack([self.model_status, self.model_retry], horizontal=True,
+                                                    spacing=ROW_GAP))
+        self.update_check = self._button("Check Now", "checkForUpdates:")
+        self.update_status = self._help("", CONTENT_WIDTH - 120)
+        sections["Updates"].append(self._stack([self.update_check, self.update_status], horizontal=True,
+                                               spacing=ROW_GAP))
+        name = NSTextField.labelWithString_("Maramax")
+        name.setFont_(NSFont.systemFontOfSize_weight_(15, NSFontWeightSemibold))
+        version = NSTextField.labelWithString_(f"Version {__version__}")
+        version.setTextColor_(NSColor.secondaryLabelColor())
+        about = [self._stack([name, version], horizontal=True, spacing=ROW_GAP)]
+        return self._page([about, *sections.values()])
 
     @objc.python_method
     def _microphone_page(self):
@@ -281,6 +292,7 @@ class PreferencesController(NSObject):
             button.setState_(int(getattr(config, name)))
         self.model_status.setStringValue_(self._model_message())
         self.model_retry.setHidden_(self.delegate.transcriber.load_error is None)
+        self.show_update_status()
 
         # A hand-edited duration stays visible instead of snapping to a preset.
         self._keep_ready_values = sorted({*_KEEP_READY_CHOICES, config.keep_mic_ready_seconds})
@@ -307,6 +319,17 @@ class PreferencesController(NSObject):
         self.remove.setEnabled_(bool(self.rules))
         # The model status line can grow to two lines.
         self._fit_window_to_page()
+
+    @objc.python_method
+    def show_update_status(self):
+        updates = self.delegate.updates
+        self.update_status.setStringValue_(updates.status_text())
+        self.update_check.setEnabled_(updates.can_check())
+
+    def checkForUpdates_(self, sender):
+        del sender
+        self.delegate.updates.check_requested()
+        self.show_update_status()
 
     @objc.python_method
     def _sync_device_picker_enabled(self):

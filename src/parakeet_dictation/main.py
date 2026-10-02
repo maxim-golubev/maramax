@@ -49,8 +49,9 @@ def main():
     from PyObjCTools import MachSignals
 
     # Also recognize older installed versions that predate the instance lock.
+    # One that is exiting (the copy an update just replaced) does not count.
     others = NSRunningApplication.runningApplicationsWithBundleIdentifier_(BUNDLE_ID)
-    if any(app.processIdentifier() != os.getpid() for app in others):
+    if any(app.processIdentifier() != os.getpid() and not app.isTerminated() for app in others):
         rumps.alert(title="Maramax is already running", message="Quit the other copy from its menu bar before opening this version.")
         return
 

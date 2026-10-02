@@ -107,7 +107,30 @@ for check_path in \
   fi
 done
 
-codesign --force --sign - "$ROOT_DIR/dist/Maramax.app"
+# ── Sign ──
+# With the release certificate (packaging/create_signing_identity.sh) when it
+# is on this machine: installed copies accept only such a build as an update.
+# Otherwise ad hoc, which runs here but cannot be published.
+SIGNING_DIR="${MARAMAX_SIGNING_DIR:-$HOME/.maramax-signing}"
+SIGNING_KEYCHAIN="$SIGNING_DIR/signing.keychain-db"
+if [ -f "$SIGNING_KEYCHAIN" ]; then
+  SIGNER_SHA1="$(PYTHONPATH="$ROOT_DIR/src" python -c 'from parakeet_dictation.updater import SIGNER_CERTIFICATE_SHA1; print(SIGNER_CERTIFICATE_SHA1)')"
+  security unlock-keychain -p "$(cat "$SIGNING_DIR/keychain-password")" "$SIGNING_KEYCHAIN"
+  # codesign finds identities only in the search list; the signing keychain
+  # is on it just for this call.
+  ORIGINAL_KEYCHAINS=()
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line%\"}"; ORIGINAL_KEYCHAINS+=("${line#\"}")
+  done < <(security list-keychains -d user)
+  trap 'security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}"' EXIT
+  security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" "$SIGNING_KEYCHAIN"
+  codesign --force --sign "$SIGNER_SHA1" "$ROOT_DIR/dist/Maramax.app"
+  security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}"
+  trap - EXIT
+else
+  echo "WARNING: no signing keychain at $SIGNING_KEYCHAIN; signing ad hoc. This build cannot be published." >&2
+  codesign --force --sign - "$ROOT_DIR/dist/Maramax.app"
+fi
 
 # Exercise the installed dependencies and native view without starting the app,
 # opening a microphone, registering shortcuts, or loading model weights.

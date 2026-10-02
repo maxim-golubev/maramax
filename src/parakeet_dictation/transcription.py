@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import gc
 import os
 import re
@@ -44,14 +45,21 @@ DRAFT_RELEASE_SECONDS = 30.0
 # happens to depends on exactly where the window starts, so such a stretch is
 # recognized again in short windows (which collapsed in none of the archived
 # cases) and spliced back in. Measured on archived dictations: docs/validation.md.
-COLLAPSE_WORDS = 40                 # this many words with no punctuation at all
-COLLAPSE_WORDS_WITH_LOWER_I = 12    # or this many, when one of them is a lower-case "i"
+COLLAPSE_WORDS_WITH_LOWER_I = 12    # words without punctuation, one of them a lower-case "i"
+COLLAPSE_WORDS = 40                 # or this many without punctuation or any capital letter
 REPAIR_CHUNK_SECONDS = 20.0
 REPAIR_OVERLAP_SECONDS = 4.0
-REPAIR_CONTEXT_SECONDS = 5.0        # of audio either side of the stretch
+# Audio either side of the stretch. It must exceed the overlap, so the seams
+# fall in formatted text, outside the stretch.
+REPAIR_CONTEXT_SECONDS = 5.0
+REPAIR_RETRY_LEAD_SECONDS = 15.0    # a window that collapsed too is tried once more, starting this early
+# A repair may change capitals and punctuation, not what was said.
+MIN_WORD_AGREEMENT = 0.9
 MAX_REPAIRS = 6
 _PUNCTUATION = re.compile(r"[.,?!;:]")
 _LOWER_I = re.compile(r"i(?:['’][a-z]+)?")
+_CAPITAL = re.compile(r"[A-Z]")
+_TIMING_SLACK_SECONDS = 0.5
 
 
 class TranscriptionError(RuntimeError):
@@ -66,9 +74,9 @@ class Word(NamedTuple):
 
 def collapsed_spans(words: list[Word]) -> list[tuple[float, float]]:
     """Where the recognizer stopped formatting, as (start, end) seconds: a run
-    of words without punctuation that is very long, or that writes "I" in
-    lower case, which formatted output never does. Ordinary run-on sentences
-    keep their capital I and their commas well before the long limit."""
+    of words without punctuation that writes "I" in lower case, which
+    formatted output never does, or a long one with no capital letter at all.
+    A run-on sentence that is still formatted keeps its capital I and passes."""
     spans = []
     run: list[Word] = []
     for word in [*words, None]:
@@ -76,10 +84,29 @@ def collapsed_spans(words: list[Word]) -> list[tuple[float, float]]:
             run.append(word)
             continue
         lower_i = any(_LOWER_I.fullmatch(w.text.strip()) for w in run)
-        if len(run) >= COLLAPSE_WORDS or (lower_i and len(run) >= COLLAPSE_WORDS_WITH_LOWER_I):
+        uncapitalized = not any(_CAPITAL.search(w.text) for w in run)
+        if (lower_i and len(run) >= COLLAPSE_WORDS_WITH_LOWER_I) or (uncapitalized and len(run) >= COLLAPSE_WORDS):
             spans.append((run[0].start, run[-1].end))
         run = []
     return spans
+
+
+def word_agreement(original: list[Word], candidate: list[Word]) -> float:
+    """How much of the wording two recognitions share (0–1), ignoring case and punctuation."""
+    def bare(words: list[Word]) -> list[str]:
+        return [re.sub(r"[\W_]+", "", word.text.casefold()) for word in words]
+    return difflib.SequenceMatcher(a=bare(original), b=bare(candidate), autojunk=False).ratio()
+
+
+def repair_acceptable(original: list[Word], candidate: list[Word], start: float, end: float) -> bool:
+    """Whether `candidate` may replace the stretch from `start` to `end`
+    seconds: formatted throughout and saying the same words. Word times move
+    a little between recognitions, so the comparison reaches slightly past
+    both ends."""
+    def near(words: list[Word]) -> list[Word]:
+        return [word for word in words if start - _TIMING_SLACK_SECONDS <= word.start < end + _TIMING_SLACK_SECONDS]
+    return (bool(candidate) and not collapsed_spans(candidate)
+            and word_agreement(near(original), near(candidate)) >= MIN_WORD_AGREEMENT)
 
 
 def _words(tokens: list[AlignedToken]) -> list[Word]:
@@ -235,8 +262,7 @@ class ParakeetTranscriber:
         tokens = None
         try:
             audio = mx.array(samples).astype(mx.float32) / FULL_SCALE
-            seconds = len(audio) / config.sample_rate
-            tokens = self._tokens_in_chunks(audio, 0.0, seconds, CHUNK_SECONDS, OVERLAP_SECONDS, progress_callback)
+            tokens = self._tokens_in_chunks(audio, 0, len(audio), CHUNK_SECONDS, OVERLAP_SECONDS, progress_callback)
             tokens = self._repair_collapses(audio, tokens, progress_callback)
             return sentences_to_result(tokens_to_sentences(tokens, DecodingConfig().sentence)).text.strip()
         finally:
@@ -261,16 +287,17 @@ class ParakeetTranscriber:
             audio = mx.pad(audio, [(0, overread)])
         return self.model.generate(get_logmel(audio, config))[0]
 
-    def _tokens_in_chunks(self, audio: mx.array, start: float, end: float, chunk_seconds: float,
+    def _tokens_in_chunks(self, audio: mx.array, first: int, last: int, chunk_seconds: float,
                           overlap_seconds: float, progress_callback: Callable | None) -> list[AlignedToken]:
-        """The tokens of audio[start:end] (seconds), timed from the start of
-        `audio`. Audio longer than a chunk is cut into overlapping chunks
-        merged on their shared words: the procedure of parakeet_mlx's own
-        transcribe() (0.5.x), run on samples already in memory so a long
-        dictation needs neither a file nor FFmpeg."""
+        """The tokens of audio[first:last] (sample indices), timed from the
+        start of `audio`. Audio longer than a chunk is cut into overlapping
+        chunks merged on their shared words: the procedure of parakeet_mlx's
+        own transcribe() (0.5.x), run on samples already in memory so a long
+        dictation needs neither a file nor FFmpeg. Unlike the library's loop
+        it stops at the chunk that reaches the end; one more would lie wholly
+        inside that chunk's overlap, and merging it can repeat words."""
         assert self.model is not None
         config = self.model.preprocessor_config
-        first, last = int(start * config.sample_rate), min(len(audio), int(end * config.sample_rate))
         chunk = int(chunk_seconds * config.sample_rate)
         step = chunk if last - first <= chunk else chunk - int(overlap_seconds * config.sample_rate)
         tokens: list[AlignedToken] = []
@@ -287,26 +314,46 @@ class ParakeetTranscriber:
                     token.start += offset
                     token.end = token.start + token.duration
             tokens = _merge(tokens, piece.tokens, overlap_seconds) if tokens else piece.tokens
+            if piece_end == last:
+                break
         return tokens
 
     def _repair_collapses(self, audio: mx.array, tokens: list[AlignedToken],
                           progress_callback: Callable | None) -> list[AlignedToken]:
         """Recognize each stretch the model left unformatted again, in short
-        windows, and splice it in when that comes out formatted. A window
-        that collapses too is tried once more starting earlier; failing that,
-        the stretch stays as it was."""
+        windows, and splice it in when that comes out formatted with the same
+        words. A window that fails is tried once more starting earlier;
+        failing that, the stretch stays as it was. A cancel ends the repair
+        and keeps what is recognized: the first pass is a whole transcript."""
         assert self.model is not None
-        seconds = len(audio) / self.model.preprocessor_config.sample_rate
-        # The first pass already reported 100 %; the callback is still
-        # called so a cancel can interrupt the repair.
-        checkpoint = None if progress_callback is None else (lambda _done, _total: progress_callback(len(audio), len(audio)))
-        for span_start, span_end in collapsed_spans(_words(tokens))[:MAX_REPAIRS]:
-            for lead in (REPAIR_CONTEXT_SECONDS, REPAIR_CONTEXT_SECONDS + REPAIR_CHUNK_SECONDS / 2):
-                start, end = max(0.0, span_start - lead), min(seconds, span_end + REPAIR_CONTEXT_SECONDS)
-                candidate = self._tokens_in_chunks(audio, start, end, REPAIR_CHUNK_SECONDS, REPAIR_OVERLAP_SECONDS,
-                                                   checkpoint)
-                if candidate and not collapsed_spans(_words(candidate)):
-                    tokens = _splice(tokens, candidate, start, end, seconds)
+        rate = self.model.preprocessor_config.sample_rate
+        seconds = len(audio) / rate
+        # Recognition is deterministic, so a window is never recognized
+        # twice; a short capture's first pass already was its only window.
+        tried = {(0, len(audio))} if len(audio) <= int(REPAIR_CHUNK_SECONDS * rate) else set()
+        given_up: set[tuple[float, float]] = set()
+        for _ in range(MAX_REPAIRS):
+            pending = [span for span in collapsed_spans(_words(tokens)) if span not in given_up]
+            if not pending:
+                break
+            span_start, span_end = pending[0]
+            given_up.add((span_start, span_end))  # Replaced by new spans if a splice succeeds.
+            for lead in (REPAIR_CONTEXT_SECONDS, REPAIR_RETRY_LEAD_SECONDS):
+                first = int(max(0.0, span_start - lead) * rate)
+                last = min(len(audio), int((span_end + REPAIR_CONTEXT_SECONDS) * rate))
+                if (first, last) in tried:
+                    continue
+                tried.add((first, last))
+                if progress_callback is not None:
+                    try:
+                        progress_callback(len(audio), len(audio))
+                    except TranscriptionError:
+                        logger.info("Cancelled while re-recognizing an unformatted stretch; keeping the first pass")
+                        return tokens
+                candidate = self._tokens_in_chunks(audio, first, last, REPAIR_CHUNK_SECONDS, REPAIR_OVERLAP_SECONDS,
+                                                   None)
+                if repair_acceptable(_words(tokens), _words(candidate), span_start, span_end):
+                    tokens = _splice(tokens, candidate, first / rate, last / rate, seconds)
                     logger.info(f"Recognized an unformatted stretch again ({span_start:.0f}–{span_end:.0f} s)")
                     break
         return tokens

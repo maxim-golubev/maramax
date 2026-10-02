@@ -96,6 +96,7 @@ def check(args: argparse.Namespace) -> dict:
             config=AppConfig(), is_busy=False,
             transcriber=SimpleNamespace(load_error=None, status_message=lambda: "Speech model ready"),
             qwen=SimpleNamespace(status_message=lambda: "High-accuracy model ready"),
+            updates=SimpleNamespace(status_text=lambda: "Not checked yet.", can_check=lambda: True),
         )
         preferences = PreferencesController.alloc().initWithDelegate_labels_(delegate, _SETTING_LABELS)
         recordings = RecordingsController.alloc().initWithDelegate_store_(delegate, store)

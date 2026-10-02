@@ -211,7 +211,7 @@ class DictationApp(rumps.App):
             menu_item=update_item, current_version=__version__, installed_app=app_bundle(),
             updates_dir=self._support_dir / "updates", log_path=self._support_dir / "logs" / "update.log",
             config=self.config, save_settings=self._save_settings, is_busy=lambda: self.is_busy,
-            quit_app=rumps.quit_application,
+            quit_app=rumps.quit_application, on_change=self._show_update_status,
         )
 
         self._install_edit_menu()
@@ -399,6 +399,11 @@ class DictationApp(rumps.App):
     def _refresh_preferences(self) -> None:
         if self._preferences_window is not None:
             self._preferences_window.refresh()
+
+    def _show_update_status(self) -> None:
+        # Only the update line: a download reports every percent.
+        if self._preferences_window is not None:
+            self._preferences_window.show_update_status()
 
     # -- Recording --
 
@@ -1360,7 +1365,7 @@ class DictationApp(rumps.App):
     @rumps.clicked(CHECK_TITLE)
     def menu_check_for_updates(self, sender):
         del sender
-        self.updates.menu_clicked()
+        self.updates.check_requested()
 
     @rumps.clicked("More", "History")
     def menu_show_history(self, sender):

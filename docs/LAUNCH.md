@@ -1,4 +1,4 @@
-# Maramax 0.6.0 — ready for your first launch
+# Maramax 0.6.1 — ready for your first launch
 
 ## Open the new version
 
@@ -24,21 +24,25 @@ preferences it does not recognize.
 
 ## Updates
 
-From this version on, Maramax updates itself. Once a day it asks GitHub whether
-a newer version has been published; when there is one, it offers it with
-**Install and Relaunch**, **Later**, or **Skip This Version**. **Check for
-Updates…** in the menu asks right away. Installing downloads about 200 MB,
-checks it against its published SHA-256 and signature, waits until you are not
-dictating, quits, swaps the app, and opens the new version. Settings, history,
-and recordings are untouched. The version it replaced is kept at
+Maramax updates itself. Once a day it asks GitHub whether a newer version has
+been published; when there is one, it offers it with **Install and Relaunch**,
+**Later**, or **Skip This Version** (Return means Later, so a keystroke meant
+for another app never installs anything). **Check for Updates…** in the menu,
+or **Check Now** in Settings → General, asks right away; the top of Settings
+shows the version you have. Installing downloads about 200 MB, accepts it only
+if it is signed with Maramax's own release certificate, waits until you are
+not dictating, quits, swaps the app, and opens the new version. Settings,
+history, and recordings are untouched, and if anything goes wrong the next
+launch says so. The version it replaced is kept at
 `~/Library/Application Support/Maramax/updates/previous/Maramax.app`; to roll
-back, quit Maramax and open that copy. Turn the daily check off in
-**Settings → General → Check for updates automatically**.
+back, quit Maramax and move that copy into Applications. Turn the daily check
+off in **Settings → General → Check for updates automatically**.
 
-Because this build is signed for this Mac only (ad hoc), macOS treats each
-update as a new app: it may ask for microphone access again, and **Paste into
-the active app** needs Maramax switched on again under **System Settings →
-Privacy & Security → Accessibility**.
+Builds from 0.6.1 on share one signing identity, so macOS keeps Maramax's
+microphone and Accessibility permissions across updates. Coming from 0.6.0 it
+asks once: allow the microphone again, and switch Maramax on again under
+**System Settings → Privacy & Security → Accessibility** if you use
+**Paste into the active app**.
 
 ## Everyday use
 

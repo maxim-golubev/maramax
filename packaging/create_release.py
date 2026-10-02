@@ -12,15 +12,27 @@ import sys
 import tomllib
 
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from parakeet_dictation.updater import signer_requirement  # noqa: E402  (stdlib only; the updater's own rule)
+
+
 class ReleaseError(RuntimeError):
     pass
 
 
+def release_paths(root: Path, version: str) -> tuple[Path, Path, Path]:
+    """Where a release's folder, ZIP, and ZIP checksum are written."""
+    destination = root / "releases" / f"Maramax-{version}"
+    archive = destination.parent / f"{destination.name}.zip"
+    return destination, archive, archive.with_suffix(".zip.sha256")
+
+
 def main() -> None:
-    root = Path(__file__).resolve().parents[1]
+    root = ROOT
     version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
     bundle = root / "dist" / "Maramax.app"
-    destination = root / "releases" / f"Maramax-{version}"
+    destination, archive, checksum = release_paths(root, version)
     if destination.exists():
         # Previous releases are never overwritten; a half-made one from a
         # failed run has to be removed by hand, deliberately.
@@ -29,7 +41,12 @@ def main() -> None:
     info = plistlib.loads((bundle / "Contents" / "Info.plist").read_bytes())
     if info["CFBundleShortVersionString"] != version:
         raise ReleaseError(f"Bundle is version {info['CFBundleShortVersionString']}, pyproject.toml says {version}")
-    subprocess.run(["codesign", "--verify", "--deep", "--strict", str(bundle)], check=True)
+    # Installed copies accept only an update signed with the release certificate.
+    signed = subprocess.run(["codesign", "--verify", "--deep", "--strict",
+                             f"-R={signer_requirement(info['CFBundleIdentifier'])}", str(bundle)])
+    if signed.returncode != 0:
+        raise ReleaseError("The bundle is not signed with the release certificate; build it where "
+                           "~/.maramax-signing exists (packaging/create_signing_identity.sh)")
     # --version exits before creating the GUI, models, or an audio backend.
     output = subprocess.check_output([str(bundle / "Contents" / "MacOS" / "Maramax"), "--version"], text=True)
     if output.strip() != f"maramax {version}":
@@ -50,15 +67,17 @@ def main() -> None:
     destination.mkdir(parents=True)
     subprocess.run(["ditto", str(bundle), str(destination / "Maramax.app")], check=True)
     shutil.copyfile(root / "docs" / "LAUNCH.md", destination / "START HERE.md")
+    commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
+    dirty = bool(subprocess.check_output(["git", "-C", str(root), "status", "--porcelain"], text=True).strip())
+    # publish_release.py publishes only a build of a clean, pushed commit.
     (destination / "build-info.json").write_text(json.dumps({
-        "version": version, "architecture": "arm64", "signing": "local ad-hoc",
-        "source_sha256": hashes,
+        "version": version, "architecture": "arm64", "signing": "Maramax release certificate",
+        "commit": commit, "dirty": dirty, "source_sha256": hashes,
     }, indent=2) + "\n")
-    archive = destination.parent / f"{destination.name}.zip"
     subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", str(destination), str(archive)], check=True)
     with archive.open("rb") as archive_file:
         digest = hashlib.file_digest(archive_file, "sha256").hexdigest()
-    archive.with_suffix(".zip.sha256").write_text(f"{digest}  {archive.name}\n")
+    checksum.write_text(f"{digest}  {archive.name}\n")
     print(destination)
     print(archive)
 

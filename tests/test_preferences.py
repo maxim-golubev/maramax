@@ -21,6 +21,7 @@ delegate = SimpleNamespace(
     config=config, is_busy=False,
     transcriber=SimpleNamespace(load_error=None, status_message=lambda: "Speech model ready"),
     qwen=SimpleNamespace(status_message=lambda: "Loading the high-accuracy model…"),
+    updates=SimpleNamespace(status_text=lambda: "This is the newest version.", can_check=lambda: True),
 )
 def replace_word_rules(rules):
     config.replacements = rules
@@ -88,6 +89,20 @@ assert "\n" not in rule_title({"heard": "sig", "replacement": "a\nb"})
 config.high_accuracy = True
 panel.refresh()
 assert str(panel.model_status.stringValue()) == "Speech model ready. Loading the high-accuracy model."
+# The version is at the top of General; Check Now asks the updater and shows what it says.
+from parakeet_dictation import __version__
+def labels(view):
+    found = [str(view.stringValue())] if hasattr(view, "stringValue") and view.isKindOfClass_(__import__("AppKit").NSTextField) else []
+    return found + [text for child in view.subviews() for text in labels(child)]
+general = labels(panel.pages[0])
+assert general[:2] == ["Maramax", f"Version {__version__}"], general[:3]
+assert str(panel.update_status.stringValue()) == "This is the newest version." and panel.update_check.isEnabled()
+checks = []
+delegate.updates = SimpleNamespace(status_text=lambda: "Checking for updates…", can_check=lambda: False,
+                                   check_requested=lambda: checks.append("check"))
+panel.checkForUpdates_(None)
+assert checks == ["check"]
+assert str(panel.update_status.stringValue()) == "Checking for updates…" and not panel.update_check.isEnabled()
 # Clicking another app must not make a window of a Dock-less app vanish.
 assert not panel.panel.hidesOnDeactivate()
 assert not panel.panel.isVisible() and not panel.shows_microphones()

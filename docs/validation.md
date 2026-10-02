@@ -387,3 +387,61 @@ apostrophe, which the first version mishandled): it installs the new app,
 keeps the old one, removes the download, opens the result, and puts the old app
 back if the new one cannot be placed. The hand-off waits until the app has been
 idle on two looks 3 s apart. Live results of the first real update are below.
+
+## 0.6.1 independent audit of 0.6.0 — October 2, 2026
+
+Two fresh reviewers audited 0.6.0 without the author's reasoning: one the
+updater, one the transcription repair and the whole change against the Clean
+Code standard. All 302 tests, Ruff, and mypy pass after the fixes below.
+
+### Updates
+
+- **Trust (both reviewers).** 0.6.0 accepted any app that matched the release's
+  own SHA-256 and carried a valid signature, which an ad-hoc signature always
+  is: whoever could publish a GitHub release could replace every installed
+  copy. Releases are now signed with a self-signed certificate that exists only
+  in a keychain on the build machine, and the updater requires that exact
+  certificate (`codesign -R`). Because 0.6.0 trusts any signature, it accepts
+  0.6.1; from 0.6.1 on only the pinned certificate is accepted. The same stable
+  identity lets macOS keep the microphone and Accessibility permissions across
+  updates.
+- **A swap across volumes could leave a half-copied app** (reproduced by the
+  reviewer on a 4 MB disk image). The new app is now placed beside the
+  installed one before Maramax quits, so the swap is two renames in one
+  folder; every step is checked and an app without an `Info.plist` is never
+  opened.
+- **A failed swap was silent.** The script now leaves an outcome that the next
+  launch reports.
+- **The automatic prompt's default button installed.** Return now means
+  Later, and the prompt comes to the front instead of opening behind windows.
+  An install also waits while any dialog or file panel is open.
+- Smaller: a 404 no longer reads as "up to date"; rate limiting says so; an
+  asset still uploading or without a URL is reported; `0.6` equals `0.6.0`;
+  the rollback copy and read-only locations are refused before downloading;
+  a failed download is deleted; release notes are shown without Markdown;
+  sizes under 1 MB are shown in KB; the relaunch waits a second for
+  LaunchServices and ignores an instance that is exiting; `publish_release.py`
+  publishes only a clean build of the pushed HEAD and never reuses a tag.
+
+### Unformatted-stretch repair
+
+- **The 40-word rule fired on formatted run-on sentences** (11 of the 100 history
+  transcripts have one), and each firing replaced correct text with a
+  different recognition. A long run now counts only if it has no capital
+  letter at all; with a lower-case "i" the 12-word rule stands. A repair is
+  accepted only if it keeps at least 90 % of the words. On history the
+  detector now flags exactly the 8 transcripts with a lower-case "i".
+- **A short last chunk could repeat words** ("AKA, aka"): when a window ended
+  less than one overlap after a chunk boundary, the loop recognized a piece
+  lying wholly inside the previous chunk's overlap. It now stops at the chunk
+  that reaches the end, for the 120 s first pass as well.
+- **A cancel during the repair discarded a finished transcript.** It now keeps
+  the first pass.
+- No window is recognized twice, spans are found again after each splice, and
+  chunks are cut at sample indices (seconds lost a sample for about 1 % of
+  lengths).
+
+Through the shipped code path on the 22 archived dictations: the two affected
+captures are fully formatted (word changes: "619" → "6:19" and one repeated
+"just" in the 75 s capture, none in the 588 s one); every other transcript is
+identical to what the app stored.

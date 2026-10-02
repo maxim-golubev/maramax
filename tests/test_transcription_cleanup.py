@@ -306,8 +306,9 @@ def words(text, start=0.0, gap=0.5):
     ("so i think we should go and then we said that we", [(0.0, 5.9)]),  # 12 words, lower-case i
     ("so i think we should go and then we said that", []),              # 11 is not enough
     ("so i’m sure we should go and then we said that we", [(0.0, 5.9)]),
-    (" ".join(["I think"] * 19) + " so.", []),                              # A run-on sentence keeps its I.
-    (" ".join(["I think"] * 20) + " so.", [(0.0, 19.9)]),                   # 40 words with no punctuation
+    (" ".join(["I think"] * 30) + " so.", []),                    # A long run-on sentence that keeps its I.
+    (" ".join(["we think"] * 19) + " so.", []),                   # 39 words without punctuation or capitals
+    (" ".join(["we think"] * 20) + " so.", [(0.0, 19.9)]),        # 40
     ("Done. so i think we should go and then we said that we can. Done.", [(0.5, 6.4)]),
 ])
 def test_unformatted_stretches_are_found_and_ordinary_sentences_are_not(text, expected):
@@ -354,6 +355,44 @@ def test_an_unformatted_stretch_is_recognized_again_and_spliced_in(monkeypatch):
     # The whole capture, then the stretch with 5 s either side (10.0-18.4 s).
     assert calls == [(0.0, 40.0), (5.0, 18.4)]
     assert progress == [(640000, 640000)] * 2  # The repair can still be cancelled.
+
+
+def test_a_repair_that_changes_the_words_is_not_accepted():
+    original = words("so i think we should go and then we said that we can")
+    reworded = words("So, I thought we could go. And then she said that we can.")
+    same = words("So I think we should go. And then we said that we can.")
+    assert transcription.repair_acceptable(original, same, 0.0, 6.4)
+    assert not transcription.repair_acceptable(original, reworded, 0.0, 6.4)
+    assert not transcription.repair_acceptable(original, original, 0.0, 6.4)  # Still unformatted.
+
+
+def test_a_cancel_during_the_repair_keeps_the_finished_first_pass(monkeypatch):
+    calls, progress = [], []
+    monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: audio)
+    transcriber = recognizer(calls, timed_audio_model(calls, collapses=lambda seconds: seconds > 30))
+
+    def cancel_after_first_pass(*position):
+        progress.append(position)
+        if len(progress) > 1:
+            raise transcription.TranscriptionError("Cancelled")
+
+    text = transcriber.transcribe_pcm(FORTY_SECONDS, progress_callback=cancel_after_first_pass)
+    assert text == "Hello there. so i think we should go and then i said that we can do it later today Thanks."
+    assert calls == [(0.0, 40.0)]
+
+
+def test_no_chunk_lies_wholly_inside_the_previous_ones_overlap(monkeypatch):
+    calls = []
+    monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: len(audio))
+    # 220 s: 0-120, then 105-220 reaches the end. The library's loop would
+    # add 210-220, wholly inside that chunk's overlap.
+    recognizer(calls).transcribe_pcm(b"\x01\x00" * (16000 * 220))
+    assert calls == [16000 * 120, 16000 * 115]
+
+
+def test_repair_seams_fall_outside_the_stretch():
+    assert transcription.REPAIR_CONTEXT_SECONDS > transcription.REPAIR_OVERLAP_SECONDS
+    assert transcription.REPAIR_RETRY_LEAD_SECONDS > transcription.REPAIR_CONTEXT_SECONDS
 
 
 def test_a_stretch_that_stays_unformatted_is_left_as_it_was(monkeypatch):
