@@ -11,8 +11,8 @@
 
 set -euo pipefail
 
-SIGNING_DIR="${MARAMAX_SIGNING_DIR:-$HOME/.maramax-signing}"
-KEYCHAIN="$SIGNING_DIR/signing.keychain-db"
+source "$(dirname "$0")/signing.sh"
+KEYCHAIN="$SIGNING_KEYCHAIN"
 if [ -e "$KEYCHAIN" ]; then
   echo "A signing keychain already exists at $KEYCHAIN; it is never replaced." >&2
   exit 1
@@ -46,7 +46,7 @@ openssl pkcs12 -export -legacy -inkey "$WORK/key.pem" -in "$WORK/certificate.pem
        -out "$WORK/identity.p12" -passout "pass:$P12_PASSWORD"
 
 KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
-( umask 077 && printf '%s' "$KEYCHAIN_PASSWORD" > "$SIGNING_DIR/keychain-password" )
+( umask 077 && printf '%s' "$KEYCHAIN_PASSWORD" > "$SIGNING_PASSWORD_FILE" )
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 security set-keychain-settings "$KEYCHAIN"   # No automatic lock timeout.
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"

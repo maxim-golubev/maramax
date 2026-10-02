@@ -18,7 +18,10 @@ import subprocess
 import sys
 import tomllib
 
-from create_release import checksum_path, release_paths
+from create_release import ROOT, assets_path, checksum_path, release_paths
+
+sys.path.insert(0, str(ROOT / "src"))
+from parakeet_dictation.updater import UpdateError, parse_checksum  # noqa: E402
 
 
 class PublishError(RuntimeError):
@@ -34,16 +37,28 @@ def main() -> None:
     parser.add_argument("--notes-file", type=Path, required=True, help="Markdown shown in the update prompt")
     args = parser.parse_args()
 
-    root = Path(__file__).resolve().parents[1]
+    root = ROOT
     version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
-    destination, archive, checksum = release_paths(root, version)
-    for path in (archive, checksum, destination / "build-info.json", args.notes_file):
+    destination, archive, _ = release_paths(root, version)
+    listing = assets_path(root, version)
+    for path in (listing, destination / "build-info.json", args.notes_file):
         if not path.is_file():
             raise PublishError(f"{path} does not exist; run create_release.py first")
-    with archive.open("rb") as archive_file:
-        digest = hashlib.file_digest(archive_file, "sha256").hexdigest()
-    if checksum.read_text().split()[:1] != [digest]:
-        raise PublishError(f"{checksum.name} does not match {archive.name}")
+    assets = json.loads(listing.read_text())
+    if archive.name not in assets:
+        raise PublishError(f"{listing.name} does not list {archive.name}")
+    uploads = []
+    for name, expected in assets.items():
+        asset = archive.parent / name
+        try:
+            with asset.open("rb") as file:
+                digest = hashlib.file_digest(file, "sha256").hexdigest()
+            published = parse_checksum(checksum_path(asset).read_text())
+        except (OSError, UpdateError) as exc:
+            raise PublishError(f"{name} or its checksum cannot be read: {exc}") from exc
+        if not digest == expected == published:
+            raise PublishError(f"{name} is not the file create_release.py made; run it again")
+        uploads += [str(asset), str(checksum_path(asset))]
 
     if _git(root, "status", "--porcelain"):
         raise PublishError("The checkout has uncommitted changes; commit and push first")
@@ -60,11 +75,6 @@ def main() -> None:
                       capture_output=True).returncode == 0:
         raise PublishError(f"The tag {tag} already exists on GitHub; bump the version")
 
-    deltas = sorted(archive.parent.glob(f"Maramax-{version}-from-*.delta"))
-    for delta in deltas:
-        if not checksum_path(delta).is_file():
-            raise PublishError(f"{delta.name} has no checksum; run create_release.py again")
-    uploads = [str(path) for asset in (archive, *deltas) for path in (asset, checksum_path(asset))]
     subprocess.run(["gh", "release", "create", tag, *uploads, "--target", commit,
                     "--title", f"Maramax {version}", "--notes-file", str(args.notes_file), "--latest"],
                    cwd=root, check=True)

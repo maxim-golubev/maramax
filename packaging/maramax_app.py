@@ -3,6 +3,10 @@
 from pathlib import Path
 import sys
 
+# The bundle is signed: writing bytecode into it at run time would break the
+# seal that updates are checked against.
+sys.dont_write_bytecode = True
+
 
 def _prepend_path(path: Path) -> None:
     value = str(path)
