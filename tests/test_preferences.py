@@ -47,6 +47,27 @@ panel.selectDevice_(None)
 assert calls[-1] == "AirPods"
 panel.update_input_devices([], "Disconnected mic")
 assert panel.device_picker.titleOfSelectedItem() == "Disconnected mic"
+panel.update_input_devices([InputDevice(0, "MacBook Pro Microphone", True)], None, "MacBook Pro Microphone")
+assert panel.device_picker.titleOfSelectedItem() == "Automatic — MacBook Pro Microphone"
+panel.selectDevice_(None)
+assert calls[-1] is None
+delegate.handle_keep_ready_selected = lambda seconds: calls.append(seconds) or setattr(config, "keep_mic_ready_seconds", seconds)
+assert panel.keep_ready.titleOfSelectedItem() == "Off"
+panel.keep_ready.selectItemWithTitle_("2 minutes")
+panel.selectKeepReady_(None)
+assert calls[-1] == 120
+panel.refresh()
+assert panel.keep_ready.titleOfSelectedItem() == "2 minutes"
+config.keep_mic_ready_seconds = 45  # Hand-edited settings stay visible instead of snapping to a preset.
+panel.refresh()
+assert panel.keep_ready.titleOfSelectedItem() == "45 seconds"
+assert panel.model_retry.isHidden()
+assert set(panel.options) == set(_SETTING_LABELS)
+# Every page fits the window: nothing is laid out past the bottom edge.
+content = panel.panel.contentView()
+content.layoutSubtreeIfNeeded()
+for page in panel.pages:
+    assert page.frame().origin.y >= 0, page.frame()
 assert not panel.panel.isVisible()
 '''
     subprocess.run([sys.executable, "-c", script, str(tmp_path)], check=True, capture_output=True, text=True, timeout=20)

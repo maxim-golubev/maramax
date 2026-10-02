@@ -36,6 +36,9 @@ class IsolatedAudioRecorder:
                  command: list[str] | None = None, start_timeout=8.0, stop_timeout=3.0):
         self._recovery_dir = recovery_dir or app_support_dir()
         self.prefer_builtin = prefer_builtin
+        # Seconds the helper keeps the device open after a recording so the
+        # next one starts instantly. 0 closes it immediately.
+        self.keep_warm_seconds = 0
         self._selected_device_name: str | None = None
         self._command = command or worker_command()
         self._start_timeout = start_timeout
@@ -45,17 +48,25 @@ class IsolatedAudioRecorder:
         self._cancel_start = threading.Event()
         self._ready = threading.Event()
         self._done = threading.Event()
+        # Set while the helper is waiting for a request (idle, or holding a
+        # warm stream); clear while it records or winds a device down.
+        self._accepting = threading.Event()
         self._process: subprocess.Popen[str] | None = None
         self._reader: threading.Thread | None = None
         self._spill: IO[bytes] | None = None
         self._closed = False
         self._overflows = 0
         self._started = False
+        self._answered = False
+        self._in_flight = False
         self.recording = False
+        self.warm_start = False
         self.last_error: Exception | None = None
         self.reset_count = 0
         self.frames: list[bytes] = []
         self.meter = CaptureMeter()
+        # What Automatic resolved to at the last device enumeration.
+        self.automatic_device_name: str | None = None
 
     @property
     def recovery_dir(self):
@@ -76,19 +87,26 @@ class IsolatedAudioRecorder:
     def is_recording(self):
         return self.recording
 
-    def _spawn(self, operation):
-        process = subprocess.Popen(self._command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL, text=True, bufsize=1)
-        assert process.stdin is not None
-        try:
-            process.stdin.write(json.dumps({"operation": operation, "device": self._selected_device_name,
-                                            "prefer_builtin": self.prefer_builtin}) + "\n")
-            process.stdin.flush()
-        except OSError:
-            self._kill(process)
-            self._close_pipes(process)
-            raise
+    # -- Helper process --
+
+    def _popen(self):
+        return subprocess.Popen(self._command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+
+    def _spawn(self):
+        """Callers hold _operation_lock."""
+        process = self._popen()
+        self._process = process
+        self._accepting.set()
+        self._reader = threading.Thread(target=self._read, args=(process,), daemon=True)
+        self._reader.start()
         return process
+
+    @staticmethod
+    def _write(process, text):
+        assert process.stdin is not None
+        process.stdin.write(text + "\n")
+        process.stdin.flush()
 
     @staticmethod
     def _close_pipes(process):
@@ -105,6 +123,70 @@ class IsolatedAudioRecorder:
             process.kill()
         process.wait(timeout=2)
 
+    def _retire_process(self):
+        """Stop the helper and its reader. Callers hold _operation_lock."""
+        process, reader = self._process, self._reader
+        self._process = None
+        self._reader = None
+        self._accepting.clear()
+        if process is None:
+            return
+        if process.poll() is None:
+            self.reset_count += 1
+        self._kill(process)
+        if reader is not None:
+            reader.join(timeout=2)
+            if reader.is_alive():
+                # A reader stuck in a disk write still owns the spill handle.
+                self._closed = True
+                raise RuntimeError("Audio reader could not stop safely")
+        self._close_pipes(process)
+
+    def _helper(self):
+        """A helper ready for a request, reusing the standby one when it is."""
+        process = self._process
+        if process is not None:
+            # A helper still closing the previous device gets a moment; a
+            # wedged one is replaced instead of delaying this recording.
+            deadline = time.monotonic() + 1.0
+            while process.poll() is None and time.monotonic() < deadline:
+                if self._accepting.wait(timeout=0.02):
+                    return process
+            self._retire_process()
+        return self._spawn()
+
+    def prepare(self):
+        """Launch the helper ahead of the next recording so starting pays only
+        for the driver open. No audio device is touched."""
+        if not self._operation_lock.acquire(blocking=False):
+            return
+        try:
+            if self._closed or self.recording:
+                return
+            process = self._process
+            if process is None or process.poll() is not None:
+                if process is not None:
+                    self._retire_process()
+                self._spawn()
+        except (OSError, RuntimeError):
+            pass  # start() reports a helper that cannot be launched.
+        finally:
+            self._operation_lock.release()
+
+    def release_device(self):
+        """Close a microphone that is being kept ready between dictations."""
+        if not self._operation_lock.acquire(timeout=2):
+            return
+        try:
+            process = self._process
+            if process is not None and process.poll() is None and not self._in_flight:
+                try:
+                    self._write(process, json.dumps({"operation": "release"}))
+                except (OSError, ValueError):
+                    pass
+        finally:
+            self._operation_lock.release()
+
     def list_input_devices(self):
         if self.recording or not self._operation_lock.acquire(blocking=False):
             return None
@@ -112,30 +194,44 @@ class IsolatedAudioRecorder:
         try:
             if self.recording or self._closed:
                 return None
-            process = self._spawn("list")
-            # Keep stdin open: EOF means the parent disappeared.
-            result = []
+            # A separate one-shot helper: a wedged enumeration must not
+            # poison the standby process the next recording will use.
+            process = self._popen()
+            self._write(process, json.dumps({"operation": "list", "prefer_builtin": self.prefer_builtin}))
+            result: list[dict] = []
+            answered = threading.Event()
+
             def read():
                 assert process.stdout is not None
-                for line in process.stdout:
-                    result.append(json.loads(line))
+                try:
+                    for line in process.stdout:
+                        message = json.loads(line)
+                        if message.get("event") in ("devices", "error"):
+                            result.append(message)
+                            answered.set()
+                            return
+                except (ValueError, OSError):
+                    pass
+                finally:
+                    answered.set()
+
             reader = threading.Thread(target=read, daemon=True)
             reader.start()
-            try:
-                process.wait(timeout=4)
-            except subprocess.TimeoutExpired:
-                self._kill(process)
-            reader.join(timeout=1)
+            answered.wait(timeout=4)
             for message in result:
                 if message.get("event") == "devices":
+                    self.automatic_device_name = message.get("automatic")
                     return [InputDevice(*item) for item in message["devices"]]
+            return None
+        except OSError:
             return None
         finally:
             if process is not None:
-                if process.poll() is None:
-                    self._kill(process)
+                self._kill(process)
                 self._close_pipes(process)
             self._operation_lock.release()
+
+    # -- Recording --
 
     def start(self):
         deadline = time.monotonic() + self._start_timeout
@@ -143,45 +239,90 @@ class IsolatedAudioRecorder:
             self.last_error = TimeoutError("Microphone is busy — try again")
             return False
         try:
-            if self._closed or self.recording:
+            if self._closed:
+                self.last_error = RuntimeError("Maramax is shutting down")
                 return False
-            self.last_error = None
-            self.frames = []
-            self.meter = CaptureMeter()
-            self._overflows = 0
-            self._ready.clear()
-            self._done.clear()
-            self._started = False
+            if self.recording:
+                self.last_error = RuntimeError("A recording is already in progress")
+                return False
             self.preserve_recovery(only_if_larger=True)
-            try:
-                self._recovery_dir.mkdir(parents=True, exist_ok=True)
-                self._spill = recovery.in_progress_path(self._recovery_dir).open("wb")
-            except OSError:
-                self._spill = None  # Memory capture and final archive can still succeed.
-            self._process = self._spawn("record")
-            self._reader = threading.Thread(target=self._read, args=(self._process,), daemon=True)
-            self._reader.start()
-            while not self._ready.wait(timeout=0.02):
-                if self._cancel_start.is_set() or time.monotonic() >= deadline:
-                    break
-            if self._cancel_start.is_set():
-                self.last_error = RuntimeError("Microphone connection cancelled")
-            elif not self._ready.is_set():
-                self.last_error = TimeoutError("Microphone connection timed out and was reset — try again")
-            elif self._started and self.last_error is None:
-                self.recording = True
-                return True
-            self._reset_process()
-            self._close_spill()
+            request = json.dumps({"operation": "record", "device": self._selected_device_name,
+                                  "prefer_builtin": self.prefer_builtin,
+                                  "keep_warm": self.keep_warm_seconds})
+            for attempt in range(2):
+                # Taking the helper first also reaps a finished one, so its
+                # reader cannot signal into the state that is reset below.
+                process = self._helper()
+                self.last_error = None
+                with self._data_lock:
+                    self.frames = []
+                    self.meter = CaptureMeter()
+                    self._overflows = 0
+                self._ready.clear()
+                self._done.clear()
+                self._started = False
+                self._answered = False
+                self.warm_start = False
+                self._accepting.clear()
+                self._in_flight = True
+                self._open_spill()
+                try:
+                    self._write(process, request)
+                except (OSError, ValueError):
+                    pass  # Noticed below as a helper that exited without answering.
+                while not self._ready.wait(timeout=0.02):
+                    if self._cancel_start.is_set() or self._closed or time.monotonic() >= deadline:
+                        break
+                    if process.poll() is not None:
+                        # Exited; its reader may still be delivering an answer.
+                        self._ready.wait(timeout=0.2)
+                        break
+                silent_exit = not self._answered and process.poll() is not None
+                if self._cancel_start.is_set():
+                    self.last_error = RuntimeError("Microphone connection cancelled")
+                elif silent_exit and attempt == 0 and not self._closed:
+                    # The standby helper died before answering (it never
+                    # reached the device); a fresh one takes over.
+                    self._in_flight = False
+                    self._retire_process()
+                    self._close_spill()
+                    continue
+                elif silent_exit:
+                    self.last_error = RuntimeError("The audio helper stopped unexpectedly — try again")
+                elif not self._ready.is_set():
+                    self.last_error = TimeoutError("Microphone connection timed out and was reset — try again")
+                elif self._started and self.last_error is None:
+                    self.recording = True
+                    return True
+                break
+            self._abandon_start()
             return False
         except Exception as exc:
             self.last_error = exc
-            self._reset_process()
-            self._close_spill()
+            try:
+                self._abandon_start()
+            except RuntimeError:
+                pass
             return False
         finally:
             self._cancel_start.clear()
             self._operation_lock.release()
+
+    def _open_spill(self):
+        try:
+            self._recovery_dir.mkdir(parents=True, exist_ok=True)
+            self._spill = recovery.in_progress_path(self._recovery_dir).open("wb")
+        except OSError:
+            self._spill = None  # Memory capture and final archive can still succeed.
+
+    def _abandon_start(self):
+        self._in_flight = False
+        # A helper that answered with an error has already let go of the
+        # device and stays useful; one that never answered, or whose start
+        # was cancelled mid-open, may be wedged in a driver call.
+        if not self._answered or self._started:
+            self._retire_process()
+        self._close_spill()
 
     def cancel_start(self):
         self._cancel_start.set()
@@ -191,12 +332,10 @@ class IsolatedAudioRecorder:
             assert process.stdout is not None
             for line in process.stdout:
                 message = json.loads(line)
+                if process is not self._process:
+                    return  # Replaced helper: its late output belongs to no recording.
                 event = message.get("event")
-                if event == "ready":
-                    self.meter.device_name = message["device"]
-                    self._started = True
-                    self._ready.set()
-                elif event == "audio":
+                if event == "audio":
                     pcm = base64.b64decode(message["pcm"], validate=True)
                     if len(pcm) % 2:
                         raise ValueError("Incomplete audio sample")
@@ -211,58 +350,78 @@ class IsolatedAudioRecorder:
                             except OSError:
                                 self._spill.close()
                                 self._spill = None
+                elif event == "ready":
+                    self.meter.device_name = message["device"]
+                    self.meter.mark_open()
+                    self.warm_start = bool(message.get("warm"))
+                    self._started = True
+                    self._answered = True
+                    self._ready.set()
+                elif event == "reconnecting":
+                    self.meter.set_reconnecting(True)
+                elif event == "device":
+                    self.meter.device_name = message.get("device") or self.meter.device_name
+                    self.meter.set_reconnecting(False)
                 elif event == "error":
                     self.last_error = RuntimeError(message.get("message", "Microphone failed"))
+                    self._answered = True
                     self._ready.set()
+                    self._done.set()
                 elif event == "done":
                     self._done.set()
+                elif event in ("idle", "warm"):
+                    self._accepting.set()
         except Exception as exc:
-            self.last_error = exc
+            if process is self._process and self._in_flight:
+                self.last_error = exc
         finally:
-            if not self._done.is_set() and self.last_error is None:
-                self.last_error = RuntimeError("Microphone connection ended unexpectedly")
-            self._ready.set()
-
-    def _reset_process(self):
-        process = self._process
-        if process is not None:
-            if process.poll() is None:
-                self.reset_count += 1
-                self._kill(process)
-            if self._reader is not None:
-                self._reader.join(timeout=2)
-            if self._reader is not None and self._reader.is_alive():
-                self._closed = True
-                raise RuntimeError("Audio reader could not stop safely")
-            self._close_pipes(process)
-        self._process = None
-        self._reader = None
+            if process is self._process:
+                if self._in_flight and not self._done.is_set() and self.last_error is None:
+                    self.last_error = RuntimeError("Microphone connection ended unexpectedly")
+                self._ready.set()
+                self._done.set()
 
     def stop(self):
         with self._operation_lock:
             process = self._process
-            if process is not None:
+            if process is not None and self._in_flight:
                 try:
-                    assert process.stdin is not None
-                    process.stdin.write("stop\n")
-                    process.stdin.flush()
-                    process.wait(timeout=self._stop_timeout)
-                except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+                    self._write(process, "stop")
+                except (OSError, ValueError):
+                    if self.last_error is None:
+                        self.last_error = RuntimeError("Microphone stopped responding; received audio was retained")
+                # "done" follows the last audio on the same pipe, so the
+                # buffer is complete once it arrives. The helper closes the
+                # device afterwards, on its own time.
+                if not self._done.wait(timeout=self._stop_timeout):
                     self.last_error = RuntimeError("Microphone stopped responding; received audio was retained")
-                finally:
-                    self._reset_process()
+                    try:
+                        self._retire_process()
+                    except RuntimeError as exc:
+                        self.last_error = exc
+            self._in_flight = False
             self.recording = False
+            # A cancel aimed at this recording must not abort the next one.
+            self._cancel_start.clear()
             self._close_spill()
-            with self._data_lock:
+            locked = self._data_lock.acquire(timeout=1.0)
+            try:
                 pcm = b"".join(self.frames)
                 self.frames = []
+            finally:
+                if locked:
+                    self._data_lock.release()
             return pcm
 
     def _close_spill(self):
-        with self._data_lock:
+        locked = self._data_lock.acquire(timeout=1.0)
+        try:
             if self._spill is not None:
                 self._spill.close()
                 self._spill = None
+        finally:
+            if locked:
+                self._data_lock.release()
 
     def preserve_recovery(self, only_if_larger=False):
         self._close_spill()
@@ -287,3 +446,17 @@ class IsolatedAudioRecorder:
             return
         self._closed = True
         self.stop()
+        with self._operation_lock:
+            process = self._process
+            if process is not None and process.stdin is not None:
+                try:
+                    process.stdin.close()  # EOF: the helper releases the device and exits.
+                    process.wait(timeout=0.5)
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    pass
+            resets = self.reset_count
+            try:
+                self._retire_process()
+            except RuntimeError:
+                pass
+            self.reset_count = resets  # Shutting down a healthy helper is not a reset.

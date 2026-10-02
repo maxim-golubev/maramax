@@ -169,11 +169,13 @@ def main() -> None:
         return
 
     launcher = args.bundle / "Contents" / "MacOS" / "Maramax"
-    ping = subprocess.run([str(launcher), "--audio-worker"], input='{"operation":"ping"}\n',
+    # Two requests to one helper: it must stay alive between recordings (the
+    # app keeps it on standby) and exit by itself when its input closes.
+    ping = subprocess.run([str(launcher), "--audio-worker"], input='{"operation":"ping"}\n' * 2,
                           capture_output=True, text=True, check=True, timeout=15)
-    response = json.loads(ping.stdout)
-    assert response["event"] == "pong"
-    assert response["command"] == [str(launcher), "--audio-worker"]
+    responses = [json.loads(line) for line in ping.stdout.splitlines()]
+    assert [response["event"] for response in responses] == ["pong", "pong"]
+    assert responses[0]["command"] == [str(launcher), "--audio-worker"]
     resources = args.bundle / "Contents" / "Resources"
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)

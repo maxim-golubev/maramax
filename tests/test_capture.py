@@ -56,3 +56,45 @@ def test_peak_and_overflow_measurements_are_per_recording():
     assert snapshot.overflow_count == 1
     assert snapshot.audio_seconds == 2 / 16000
     assert CaptureMeter().snapshot().overflow_count == 0
+
+
+def test_a_slow_driver_open_is_not_counted_as_a_missing_microphone():
+    now = [0.0]
+    meter = CaptureMeter(clock=lambda: now[0])
+    now[0] = 6.5  # A Bluetooth route that took 6.5 s to open.
+    meter.mark_open()
+    snapshot = meter.snapshot()
+    assert snapshot.open_delay == 6.5
+    assert snapshot.health == "waiting"
+    now[0] = 12
+    assert meter.snapshot().health == "missing"
+
+
+def test_switching_inputs_pauses_the_disconnect_deadline():
+    now = [0.0]
+    meter = CaptureMeter(clock=lambda: now[0])
+    meter.feed(b"\x10\x00" * 512)
+    now[0] = 2.5
+    meter.set_reconnecting(True)
+    now[0] = 6
+    assert meter.snapshot().health == "reconnecting"
+    meter.set_reconnecting(False)  # The replacement device gets a fresh wait.
+    assert meter.snapshot().health == "receiving"
+    now[0] = 9.5
+    assert meter.snapshot().health == "disconnected"
+
+
+def test_meter_moves_for_quiet_and_loud_microphones():
+    quiet, loud = CaptureMeter(), CaptureMeter()
+    quiet.feed(np.array([300, -300] * 256, dtype="<i2").tobytes())   # about -41 dBFS
+    loud.feed(np.array([12000, -12000] * 256, dtype="<i2").tobytes())  # about -9 dBFS
+    assert 0.2 < quiet.snapshot().level < 0.5
+    assert loud.snapshot().level == 1.0
+    assert not quiet.snapshot().faint
+
+
+def test_noise_floor_of_a_muted_microphone_is_faint_not_speech():
+    meter = CaptureMeter()
+    meter.feed(np.array([15, -12] * 256, dtype="<i2").tobytes())
+    assert meter.snapshot().faint
+    assert meter.snapshot().health == "receiving"

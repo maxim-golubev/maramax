@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import threading
 import time
 from pathlib import Path
@@ -21,6 +22,50 @@ class InputDevice(NamedTuple):
     device_index: int
     name: str
     is_default: bool
+
+
+def lid_closed() -> bool:
+    """True while a laptop lid is shut. Apple silicon disconnects the built-in
+    microphone in hardware then, so it enumerates but only delivers silence."""
+    try:
+        iokit = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/IOKit.framework/IOKit")
+        cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        iokit.IOServiceMatching.restype = ctypes.c_void_p
+        iokit.IOServiceMatching.argtypes = [ctypes.c_char_p]
+        iokit.IOServiceGetMatchingService.restype = ctypes.c_uint32
+        iokit.IOServiceGetMatchingService.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        iokit.IORegistryEntryCreateCFProperty.restype = ctypes.c_void_p
+        iokit.IORegistryEntryCreateCFProperty.argtypes = [
+            ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+        ]
+        iokit.IOObjectRelease.argtypes = [ctypes.c_uint32]
+        cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        cf.CFGetTypeID.restype = ctypes.c_ulong
+        cf.CFGetTypeID.argtypes = [ctypes.c_void_p]
+        cf.CFBooleanGetTypeID.restype = ctypes.c_ulong
+        cf.CFBooleanGetValue.restype = ctypes.c_bool
+        cf.CFBooleanGetValue.argtypes = [ctypes.c_void_p]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        # IOServiceGetMatchingService consumes the matching dictionary.
+        service = iokit.IOServiceGetMatchingService(0, iokit.IOServiceMatching(b"IOPMrootDomain"))
+        if not service:
+            return False
+        key = cf.CFStringCreateWithCString(None, b"AppleClamshellState", 0x08000100)  # UTF-8
+        try:
+            value = iokit.IORegistryEntryCreateCFProperty(service, key, None, 0)
+        finally:
+            cf.CFRelease(key)
+            iokit.IOObjectRelease(service)
+        if not value:
+            return False  # Desktops have no clamshell state.
+        try:
+            return cf.CFGetTypeID(value) == cf.CFBooleanGetTypeID() and bool(cf.CFBooleanGetValue(value))
+        finally:
+            cf.CFRelease(value)
+    except Exception:
+        return False
 
 
 class AudioRecorder:
@@ -137,9 +182,29 @@ class AudioRecorder:
     def capture_snapshot(self) -> CaptureSnapshot:
         return self.meter.snapshot()
 
+    def automatic_device_name(self) -> str | None:
+        """The input Automatic mode would open right now, for display."""
+        if not self._audio_lock.acquire(timeout=3.0):
+            return None
+        try:
+            if self.audio is None:
+                return None
+            index = self._find_builtin_index() if self.prefer_builtin else None
+            if index is None:
+                index = int(self.audio.get_default_input_device_info()["index"])
+            return str(self.audio.get_device_info_by_index(index)["name"])
+        except (IOError, OSError, KeyError, ValueError):
+            return None
+        finally:
+            self._audio_lock.release()
+
     def _find_builtin_index(self) -> int | None:
         """Prefer the Mac's input without changing the system's output or
         opening a Bluetooth headset microphone unless explicitly selected."""
+        if lid_closed():
+            # The built-in microphone is cut off in hardware; preferring it
+            # would record silence. Fall through to the system default.
+            return None
         for i in range(self.audio.get_device_count()):
             try:
                 info = self.audio.get_device_info_by_index(i)
@@ -147,7 +212,8 @@ class AudioRecorder:
                 continue
             name = str(info.get("name", "")).lower()
             if info.get("maxInputChannels", 0) > 0 and (
-                ("macbook" in name and "microphone" in name) or name == "built-in microphone"
+                (("macbook" in name or "imac" in name) and "microphone" in name)
+                or name == "built-in microphone"
             ):
                 return i
         return None
@@ -196,7 +262,12 @@ class AudioRecorder:
         finally:
             self._audio_lock.release()
 
+        self.meter.mark_open()
         self._open_recovery_file()
+        self._start_record_loop()
+        return True
+
+    def _start_record_loop(self) -> None:
         thread = threading.Thread(
             target=self._record_loop,
             args=(self._stream, self._recovery_file, self.start_generation),
@@ -205,7 +276,56 @@ class AudioRecorder:
         with self._state_lock:
             self._recording_thread = thread
         thread.start()
+
+    def reopen(self) -> bool:
+        """Continue the current recording on whichever input is available
+        now (the device vanished or stopped delivering). Captured audio and
+        measurements carry over; an explicitly selected microphone that is
+        gone still fails rather than silently switching."""
+        with self._state_lock:
+            if self._cleaned_up or not self.recording or self.abandoned_sessions >= 2:
+                return False
+            previous = self._recording_thread
+            self._recording_thread = None
+            # Retires the old callback and record loop; they keep only
+            # their own stream reference.
+            self.start_generation += 1
+        if previous is not None:
+            previous.join(timeout=2.0)
+
+        if not self._audio_lock.acquire(timeout=5.0):
+            return False
+        try:
+            self._reinit_audio()
+            self._open_stream()
+        except Exception as exc:
+            logger.error(f"Microphone could not be reopened: {exc}")
+            with self._state_lock:
+                self.last_error = exc
+            self._close_stream(timeout=2.0)
+            return False
+        finally:
+            self._audio_lock.release()
+
+        self._start_record_loop()
         return True
+
+    def rearm(self) -> bool:
+        """Begin a new recording on a stream that was kept open. The buffer
+        is emptied in place because the live callback holds this list."""
+        with self._state_lock:
+            if self._cleaned_up or not self.recording or self._stream is None:
+                return False
+            self.last_error = None
+        del self.frames[:]
+        return True
+
+    def stream_active(self) -> bool:
+        stream = self._stream
+        try:
+            return stream is not None and bool(stream.is_active())
+        except Exception:
+            return False
 
     def stop(self) -> bytes:
         with self._state_lock:
@@ -362,8 +482,12 @@ class AudioRecorder:
                     self.last_error = exc
         finally:
             # Recovery file first: even if the stream close wedges below,
-            # the captured audio is already complete on disk.
-            self._finalize_recovery(recovery_handle)
+            # the captured audio is already complete on disk. After reopen()
+            # the same recording continues, so its spill stays open.
+            handed_over = (generation != self.start_generation and self.is_recording()
+                           and recovery_handle is self._recovery_file)
+            if not handed_over:
+                self._finalize_recovery(recovery_handle)
             self._close_stream(expected=stream)
 
     def _open_recovery_file(self) -> None:

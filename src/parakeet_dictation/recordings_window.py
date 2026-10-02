@@ -16,6 +16,14 @@ from Foundation import NSObject
 from PyObjCTools import AppHelper
 
 
+_STATUS_LABELS = {
+    "done": "transcribed",
+    "saved": "not transcribed yet",
+    "failed": "no transcript",
+    "cancelled": "cancelled",
+}
+
+
 class RecordingsController(NSObject):
     def initWithDelegate_store_(self, delegate, store):
         self = objc.super(RecordingsController, self).init()
@@ -43,6 +51,7 @@ class RecordingsController(NSObject):
         self.text.setSelectable_(True)
         self.text.setRichText_(False)
         self.text.setFont_(NSFont.systemFontOfSize_(13))
+        self.text.setTextContainerInset_((6, 8))
         self.text.textContainer().setWidthTracksTextView_(True)
         scroll.setDocumentView_(self.text)
         self.play = self._button(NSMakeRect(20, 42, 85, 32), "Play", "playAudio:")
@@ -79,7 +88,8 @@ class RecordingsController(NSObject):
             except ValueError:
                 when = record.created_at
             seconds = int(record.duration)
-            title = f"{when} · {seconds // 60}:{seconds % 60:02d} · {record.status}"
+            title = (f"{when} · {seconds // 60}:{seconds % 60:02d} · "
+                     f"{_STATUS_LABELS.get(record.status, record.status)}")
             # NSPopUpButton.addItemWithTitle replaces duplicate titles. Two
             # short captures in the same second must remain separate entries.
             item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, None, "")

@@ -1,4 +1,4 @@
-# Maramax 0.4.1 — ready for your first launch
+# Maramax 0.5.0 — ready for your first launch
 
 ## Open the new version
 
@@ -7,7 +7,7 @@
 3. Wait for the speech model to be ready, then press **Option+Space** to start
    dictating. Press **Option+Space** again, or **Cmd+R**, to finish.
 4. Paste the copied transcript with **Cmd+V**. For automatic insertion, enable
-   **Paste Into Active App** in **Settings…** and grant the macOS Accessibility
+   **Paste into the active app** in **Settings…** and grant the macOS Accessibility
    permission when requested.
 
 macOS requests microphone access when recording is first attempted. Allow it for
@@ -26,6 +26,7 @@ preferences it does not recognize.
 
 - **Compact bar:** stays out of the way and leaves your current app focused.
   Its meter reflects incoming audio, and its timer shows captured duration.
+  The red button finishes; the arrow opens the full window.
 - **Open Transcript:** opens the larger transcript, history,
   and file queue. The arrow in the compact bar opens the same controls.
 - **Settings…:** controls automatic copy/paste, preview, input preference,
@@ -36,10 +37,19 @@ preferences it does not recognize.
   recordings that returned no transcript. A retry copies its result without
   inserting it into another app.
 
-Automatic input prefers the Mac microphone. Wearing AirPods does not automatically
-select their microphone. To use it, choose AirPods in Settings → Microphone.
-Using a Bluetooth microphone can change headphone playback quality; do that test
-when it is convenient to interrupt your movie or music.
+Automatic input prefers the Mac microphone unless you turn that preference off
+or the lid is closed. To always use AirPods, choose them in Settings → Microphone.
+Using a Bluetooth microphone changes headphone playback quality while it is open.
+
+AirPods need two to three seconds to connect before they deliver sound; wait for
+the bar to say **Recording** before speaking. If you dictate several times in a
+row, **Settings → Microphone → Keep the microphone connected for** keeps the
+connection open between dictations so the next one starts instantly. During that
+time macOS shows the microphone indicator and AirPods stay in call-quality
+playback, which is why it is off until you choose a duration.
+
+If a microphone disconnects while you dictate, Automatic continues on the next
+available input and tells you that it switched.
 
 If you switch apps during compact dictation, automatic insertion is skipped and
 the transcript stays copied. If the clipboard changes before insertion, Maramax
@@ -53,6 +63,9 @@ weights download on first use. Recognition runs locally once weights are ready.
 If loading fails, check your connection and use **Retry Speech Model**. The
 optional high-accuracy engine downloads approximately 4.1 GB of additional
 weights. It is off by default and falls back to the standard engine on failure.
+
+A recording interrupted by a crash or a forced quit appears in **Recordings…**
+at the next launch.
 
 If a microphone stops delivering audio, check the saved recording before retrying
 recognition. A silent recording needs a working microphone; retrying a recognizer
@@ -77,9 +90,10 @@ which is already available on this Mac.
 
 Try a short sentence in a text field with the built-in microphone. Confirm that
 the bar shows input and the text arrives. Then, when audio changes are convenient,
-try AirPods and a reconnect. Automated and file-based tests cannot establish that
-the intermittent AirPods problem is fixed; the saved audio and measurements make
-any remaining failure diagnosable.
+try AirPods: a dictation, a second one with the microphone kept connected, and
+taking the AirPods out mid-sentence. These paths were verified with a simulated
+audio device, not with real AirPods; the saved audio and measurements make any
+remaining failure diagnosable.
 
 This is a local, ad-hoc-signed build for this Mac. Public distribution would need
 a separate signing and notarization release process.

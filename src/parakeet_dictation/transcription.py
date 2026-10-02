@@ -16,6 +16,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 from parakeet_mlx import from_pretrained
+from parakeet_mlx.audio import get_logmel
 from huggingface_hub import try_to_load_from_cache
 
 from .logger_config import setup_logging
@@ -23,6 +24,8 @@ from .logger_config import setup_logging
 logger = setup_logging()
 
 FFMPEG_TIMEOUT_SECONDS = 120
+CHUNK_SECONDS = 120.0
+OVERLAP_SECONDS = 15.0
 FFMPEG_CANDIDATES = (
     "ffmpeg",
     "/opt/homebrew/bin/ffmpeg",
@@ -86,17 +89,7 @@ class ParakeetTranscriber:
 
     def _warm_model(self) -> None:
         assert self.model is not None
-        silence = np.zeros(int(0.3 * 16000), dtype=np.int16).tobytes()
-        temp_path = write_wav_file(silence, channels=1, sample_width=2, rate=16000)
-        try:
-            self.model.transcribe(temp_path)
-        finally:
-            gc.collect()
-            mx.clear_cache()
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
+        self._transcribe_samples(np.zeros(int(0.3 * 16000), dtype=np.int16))
 
     def wait_until_ready(self) -> None:
         self.ready_event.wait()
@@ -120,6 +113,20 @@ class ParakeetTranscriber:
             return ""
 
         self.wait_until_ready()
+        assert self.model is not None
+        config = self.model.preprocessor_config
+        if (sample_width == 2 and rate == config.sample_rate
+                and len(pcm_bytes) <= CHUNK_SECONDS * rate * channels * 2):
+            # A dictation that fits one chunk goes straight from memory to the
+            # model: no temporary file and no FFmpeg process. The result is
+            # identical to the file path, which longer captures still take
+            # for the library's chunk merging.
+            samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+            if channels > 1:
+                samples = samples.reshape(-1, channels).mean(axis=1).astype(np.int16)
+            if progress_callback is not None:
+                progress_callback(len(samples), len(samples))
+            return self._transcribe_samples(samples)
         temp_path = write_wav_file(pcm_bytes, channels=channels, sample_width=sample_width, rate=rate)
         try:
             return self._transcribe_path(temp_path, progress_callback=progress_callback)
@@ -183,6 +190,22 @@ class ParakeetTranscriber:
             gc.collect()
             mx.clear_cache()
 
+    def _transcribe_samples(self, samples: np.ndarray) -> str:
+        assert self.model is not None
+        config = self.model.preprocessor_config
+        # Shorter than one analysis hop cannot form a spectrogram frame.
+        if len(samples) < config.hop_length:
+            return ""
+        result = None
+        try:
+            audio = mx.array(samples).astype(mx.float32) / 32768.0
+            result = self.model.generate(get_logmel(audio, config))[0]
+            return (getattr(result, "text", "") or "").strip()
+        finally:
+            del result
+            gc.collect()
+            mx.clear_cache()
+
     def _transcribe_path(
         self,
         file_path: str | Path,
@@ -199,8 +222,8 @@ class ParakeetTranscriber:
             pass
 
         kwargs: dict = {}
-        kwargs["chunk_duration"] = 120.0
-        kwargs["overlap_duration"] = 15.0
+        kwargs["chunk_duration"] = CHUNK_SECONDS
+        kwargs["overlap_duration"] = OVERLAP_SECONDS
         if progress_callback is not None:
             kwargs["chunk_callback"] = progress_callback
         result = None
@@ -224,10 +247,12 @@ class QwenTranscriber:
 
     MODEL_ID = "mlx-community/Qwen3-ASR-1.7B-bf16"
 
-    def __init__(self, on_load_failed: Callable[[str], None] | None = None):
+    def __init__(self, on_load_failed: Callable[[str], None] | None = None,
+                 on_loaded: Callable[[], None] | None = None):
         self.model = None
         self.load_error: Exception | None = None
         self._on_load_failed = on_load_failed
+        self._on_loaded = on_loaded
         self._load_lock = threading.Lock()
         self._loading = False
         self._discard_when_loaded = False
@@ -252,7 +277,7 @@ class QwenTranscriber:
         try:
             from qwen3_asr_mlx import Qwen3ASR
 
-            model = Qwen3ASR.from_pretrained(self.MODEL_ID)
+            model = Qwen3ASR.from_pretrained(cached_model_source(self.MODEL_ID))
             model.warm_up()
             gc.collect()
             mx.clear_cache()
@@ -270,6 +295,8 @@ class QwenTranscriber:
             else:
                 self.load_error = None
                 logger.info("Qwen3-ASR high-accuracy model loaded")
+                if self._on_loaded is not None:
+                    self._on_loaded()
         except Exception as exc:
             if model is not None:
                 try:
@@ -288,6 +315,9 @@ class QwenTranscriber:
 
     def is_ready(self) -> bool:
         return self.model is not None
+
+    def is_loading(self) -> bool:
+        return self._loading
 
     def _acquire_model(self):
         """Take an in-use reference so unload() can't close the model out
@@ -337,7 +367,10 @@ class QwenTranscriber:
         gc.collect()
         mx.clear_cache()
 
-    def transcribe_pcm(self, pcm_bytes: bytes, channels: int, sample_width: int, rate: int) -> str:
+    def transcribe_pcm(self, pcm_bytes: bytes, channels: int, sample_width: int, rate: int,
+                       context: str | None = None) -> str:
+        """`context` is free text the model reads before listening, used to
+        pass the spellings of names and jargon the user cares about."""
         if not pcm_bytes:
             return ""
         if sample_width != 2 or rate != 16000:
@@ -350,7 +383,7 @@ class QwenTranscriber:
             samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             if channels > 1:
                 samples = samples.reshape(-1, channels).mean(axis=1)
-            result = model.transcribe(samples, language="en")
+            result = model.transcribe(samples, language="en", context=context)
             text = (result.text or "").strip()
             return text
         finally:
@@ -359,7 +392,7 @@ class QwenTranscriber:
             gc.collect()
             mx.clear_cache()
 
-    def transcribe_file(self, file_path: str | Path) -> str:
+    def transcribe_file(self, file_path: str | Path, context: str | None = None) -> str:
         model = self._acquire_model()
         result = None
         try:
@@ -371,7 +404,7 @@ class QwenTranscriber:
                             return ""
                 except (wave.Error, OSError):
                     pass
-                result = model.transcribe(normalized_path, language="en")
+                result = model.transcribe(normalized_path, language="en", context=context)
                 text = (result.text or "").strip()
                 return text
             finally:

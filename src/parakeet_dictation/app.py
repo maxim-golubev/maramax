@@ -9,14 +9,14 @@ import time
 from pathlib import Path
 
 import rumps
-from AppKit import NSApplicationActivateIgnoringOtherApps, NSWorkspace
+from AppKit import NSApplication, NSApplicationActivateIgnoringOtherApps, NSMenu, NSMenuItem, NSWorkspace
 from PyObjCTools import AppHelper
 
 from .autopaste import PasteError, accessibility_trusted, send_paste_keystroke
 from .clipboard import ClipboardError, contains_text, copy_text
 from .capture import CaptureSnapshot
 from .config import AppConfig
-from .corrections import apply_replacements
+from .corrections import apply_replacements, vocabulary_hint
 from .export import ExportError, export_results
 from .history import HistoryStore
 from .hotkeys import GlobalHotKeyManager, HotKeyError
@@ -32,14 +32,14 @@ from .recordings_window import RecordingsController
 from .transcription import ParakeetTranscriber, QwenTranscriber, TranscriptionError
 
 _SETTING_LABELS = {
-    "compact_dictation": "Use Compact Dictation Bar",
-    "prefer_builtin_mic": "Prefer Mac Microphone in Automatic Mode",
-    "auto_start_recording": "Record Immediately on Option+Space",
-    "auto_copy_to_clipboard": "Auto-Copy Result",
-    "paste_to_active_app": "Paste Into Active App",
-    "live_preview": "Live Preview While Speaking",
-    "high_accuracy": "High-Accuracy Model (more RAM)",
-    "use_corrections": "Apply My Word Replacements",
+    "compact_dictation": "Use the compact dictation bar",
+    "prefer_builtin_mic": "Prefer the Mac’s own microphone in Automatic",
+    "auto_start_recording": "Start recording on Option+Space",
+    "auto_copy_to_clipboard": "Copy the transcript to the clipboard",
+    "paste_to_active_app": "Paste into the active app",
+    "live_preview": "Show a live preview in the full window",
+    "high_accuracy": "Use the high-accuracy model",
+    "use_corrections": "Apply my word replacements",
 }
 
 logger = setup_logging()
@@ -58,15 +58,20 @@ class DictationApp(rumps.App):
         self._settings_path = app_support_dir() / "settings.json"
         self.config = config or AppConfig.load(self._settings_path)
         self.transcriber = ParakeetTranscriber()
-        self.qwen = QwenTranscriber(on_load_failed=self._on_qwen_load_failed)
+        self.qwen = QwenTranscriber(
+            on_load_failed=self._on_qwen_load_failed,
+            on_loaded=lambda: AppHelper.callAfter(self._refresh_preferences),
+        )
         self.recorder = AudioRecorder(prefer_builtin=self.config.prefer_builtin_mic)
         self.recorder.set_device(self.config.input_device)
+        self.recorder.keep_warm_seconds = self.config.keep_mic_ready_seconds
         self.recordings = RecordingStore(app_support_dir() / "recordings")
         # A leftover in-progress capture means a previous session crashed or
         # hung mid-recording — keep it recoverable.
         self._recovery_available = self.recorder.preserve_recovery() or self.recorder.has_recoverable_recording()
         if self._recovery_available:
             logger.info("Found unsaved recording from a previous session")
+            threading.Thread(target=self._adopt_recovered_audio, daemon=True).start()
         self.history_store = HistoryStore(history_limit=self.config.history_limit)
         self.queue = TranscriptionQueue()
         self.current_transcript = ""
@@ -93,6 +98,7 @@ class DictationApp(rumps.App):
         self._compact_session = False
         self._capture_health = ""
         self._capture_warning = ""
+        self._capture_device = ""
         self._capture_at_stop: CaptureSnapshot | None = None
         self._last_status = "Loading speech model…"
         self._recordings_window: RecordingsController | None = None
@@ -127,14 +133,50 @@ class DictationApp(rumps.App):
         self.overlay_controller.set_history_text(self.history_store.render())
         self.overlay_controller.set_current_text(
             "Press Option+Space to dictate. Press it again, or Cmd+R, to finish.\n\n"
-            "Your transcript is copied automatically. Enable Paste Into Active App in Settings "
+            "Your transcript is copied automatically. Turn on “Paste into the active app” in Settings "
             "for direct insertion. Saved audio and retries are in Recordings."
         )
 
+        self._install_edit_menu()
         self._start_model_watchdog()
         self._register_global_hotkeys()
         # Opening even a temporary mic at launch can change a Bluetooth
         # playback route. Capture is opened only after an explicit request.
+
+    @staticmethod
+    def _install_edit_menu() -> None:
+        """A menu-bar app has no visible menu bar, but AppKit still routes
+        Cmd+X/C/V/A/Z/W through the main menu. Without one, text fields in
+        Settings cannot be pasted into."""
+        application = NSApplication.sharedApplication()
+        if application.mainMenu() is not None:
+            return
+        edit = NSMenu.alloc().initWithTitle_("Edit")
+        for title, action, key in (
+            ("Undo", "undo:", "z"), ("Redo", "redo:", "Z"), ("Cut", "cut:", "x"), ("Copy", "copy:", "c"),
+            ("Paste", "paste:", "v"), ("Select All", "selectAll:", "a"), ("Close Window", "performClose:", "w"),
+        ):
+            edit.addItem_(NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, action, key))
+        holder = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Edit", None, "")
+        holder.setSubmenu_(edit)
+        main = NSMenu.alloc().initWithTitle_("Maramax")
+        main.addItem_(holder)
+        application.setMainMenu_(main)
+
+    def _adopt_recovered_audio(self) -> None:
+        """Move a capture left behind by a crash into Recordings, where it
+        can be played, exported, and transcribed like any other."""
+        try:
+            pcm = self.recorder.load_recoverable_recording()
+            if not pcm:
+                return
+            record = self.recordings.save(pcm[: len(pcm) - len(pcm) % 2], {"device_name": "Unknown microphone"})
+            if record is None:
+                return
+            self.recordings.update(record.id, message="Recovered after an interrupted session")
+            self.recorder.discard_recoverable_recording()
+        except Exception as exc:
+            logger.error(f"Could not move recovered audio into Recordings: {exc}")
 
     def _start_model_watchdog(self) -> None:
         threading.Thread(target=self._wait_for_model_readiness, daemon=True).start()
@@ -153,16 +195,25 @@ class DictationApp(rumps.App):
                 self.qwen.start_loading()
             AppHelper.callAfter(self._refresh_preferences)
 
+        self._prepare_recorder()
         if self._hotkey_error_message:
             self._push_status(self._hotkey_error_message, recording=False)
         else:
             self._push_status("Ready", recording=False)
         if self._recovery_available:
+            self._recovery_available = False
             self._push_status(
                 "Unsaved recording found — use Recover Last Recording",
                 recording=False,
                 revert_after=12,
             )
+
+    def _prepare_recorder(self) -> None:
+        # The audio helper is launched ahead of time (no device is opened),
+        # so Option+Space pays for the driver open only.
+        prepare = getattr(self.recorder, "prepare", None)
+        if prepare is not None and not self._shutting_down:
+            prepare()
 
     def _register_global_hotkeys(self) -> None:
         try:
@@ -298,7 +349,7 @@ class DictationApp(rumps.App):
             return False
 
         if self.is_transcribing:
-            self._push_status("Wait for the current transcription to finish", recording=False)
+            self._push_status("Wait for the current transcription to finish", recording=False, revert_after=5)
             return False
 
         if self.recording_active:
@@ -313,11 +364,16 @@ class DictationApp(rumps.App):
         self._capture_at_stop = None
         self._stop_when_started = False
         self._compact_session = self.config.compact_dictation and not self.overlay_visible
+        self.recording_active = True
+        self._starting = True
+        session = self._overlay_session
+        # The microphone opens first: every millisecond of window drawing
+        # ahead of it is speech that would not be captured.
+        self._start_thread = threading.Thread(target=self._start_recording_worker, args=(session,), daemon=True)
+        self._start_thread.start()
         if self._recordings_window is not None:
             self._recordings_window.stop_playback()
         self.overlay_controller.prepare_for_recording()
-        self.recording_active = True
-        self._starting = True
         if self._compact_session:
             self.indicator.show()
             self._set_recording_shortcut(True)
@@ -325,9 +381,6 @@ class DictationApp(rumps.App):
             self.overlay_visible = True
             self.overlay_controller.show_mode("result")
         self._apply_status_on_main("Connecting microphone…", recording=True)
-        session = self._overlay_session
-        self._start_thread = threading.Thread(target=self._start_recording_worker, args=(session,), daemon=True)
-        self._start_thread.start()
         AppHelper.callLater(10, self._check_microphone_start, session)
         return True
 
@@ -351,17 +404,23 @@ class DictationApp(rumps.App):
         if not started:
             self.recording_active = False
             self._set_recording_shortcut(False)
-            error = self.recorder.last_error
+            error = self.recorder.last_error or "the audio helper did not start"
+            # "Connecting microphone…" must not come back when this message
+            # times out.
+            self._restore_base_status()
             self._apply_status_on_main("Connection cancelled" if self._stop_when_started else
                                       f"Microphone unavailable: {error}", False, 8)
             if self._compact_session:
                 self.indicator.finish(self._last_status)
+            self._reset_deferred_flags()
+            self._prepare_recorder()
             return
         if self._stop_when_started:
             self.stop_recording_requested()
             return
+        self._capture_device = self.recorder.capture_snapshot().device_name
+        self.overlay_controller.show_active_microphone(self._capture_device)
         self._monitor_capture(session)
-        self.overlay_controller.show_active_microphone(self.recorder.capture_snapshot().device_name)
         # A passive bar needs input levels, not a second model pass whose
         # drafts are never displayed. Expanding the window enables preview.
         if self.recording_active and self.config.live_preview and not self._compact_session:
@@ -391,12 +450,23 @@ class DictationApp(rumps.App):
         snapshot = self.recorder.capture_snapshot()
         if self._compact_session:
             self.indicator.set_capture(snapshot)
+        else:
+            self.overlay_controller.set_capture(snapshot)
         health = snapshot.health
+        if getattr(self.recorder, "last_error", None) is not None:
+            # The audio helper reported a failure or exited: nothing more
+            # will arrive, so finish with what was captured.
+            health = "disconnected"
+        if snapshot.device_name != self._capture_device:
+            # The helper carried the recording over to another input.
+            self._capture_device = snapshot.device_name
+            self._capture_warning = f"Microphone changed to {snapshot.device_name} during recording"
         if health != self._capture_health:
             self._capture_health = health
             message = {
                 "waiting": "Waiting for microphone signal…",
                 "receiving": "Recording…",
+                "reconnecting": "Microphone lost — switching input…",
                 "silent": "No microphone signal — check your input",
                 "quiet": "Microphone is quiet — check your input",
                 "missing": "Microphone is not delivering audio",
@@ -461,12 +531,18 @@ class DictationApp(rumps.App):
     # Qwen failure. Qwen has no progress callback, so cancellation is
     # checked before inference; a completed result is always published.
 
+    def _vocabulary_hint(self) -> str | None:
+        # The high-accuracy model can be told how the user's names and
+        # jargon are spelled; the replacement targets are exactly that list.
+        return vocabulary_hint(self.config.replacements) if self.config.use_corrections else None
+
     def _qwen_transcribe_recorder_pcm(self, pcm_bytes: bytes) -> str:
         return self.qwen.transcribe_pcm(
             pcm_bytes,
             channels=self.recorder.channels,
             sample_width=self.recorder.sample_width(),
             rate=self.recorder.rate,
+            context=self._vocabulary_hint(),
         )
 
     def _final_transcribe_pcm(self, pcm_bytes: bytes) -> str:
@@ -495,7 +571,7 @@ class DictationApp(rumps.App):
             raise TranscriptionError("Cancelled")
         if self.config.high_accuracy and self.qwen.is_ready() and not cancel_event.is_set():
             try:
-                text = self.qwen.transcribe_file(path)
+                text = self.qwen.transcribe_file(path, context=self._vocabulary_hint())
                 if text:
                     return text
                 logger.warning("High-accuracy model returned no text; trying Parakeet")
@@ -524,6 +600,7 @@ class DictationApp(rumps.App):
                 "captured_seconds": len(pcm_bytes) / 32000,
                 "abandoned_audio_sessions": self.recorder.abandoned_sessions,
                 "audio_worker_resets": getattr(self.recorder, "reset_count", 0),
+                "warm_start": getattr(self.recorder, "warm_start", False),
                 "active_threads": threading.active_count(),
             }
             # Save before inference, including silent/empty-result captures.
@@ -561,6 +638,8 @@ class DictationApp(rumps.App):
                     result_message = "No audio received from microphone — check your input"
                 elif not has_signal:
                     result_message = "Microphone delivered silence — check your input"
+                elif snapshot.faint and snapshot.audio_seconds > 0:
+                    result_message = f"No speech heard — the microphone signal was barely audible; {retention}"
                 else:
                     result_message = f"No transcript returned — {retention}"
                 self._push_status(result_message, recording=False, revert_after=8)
@@ -626,6 +705,7 @@ class DictationApp(rumps.App):
                 except Exception as exc:
                     logger.error(f"Could not update recording details: {exc}")
             logger.info(f"Recording outcome={outcome} measurements={diagnostics}")
+            self._prepare_recorder()
             AppHelper.callAfter(self._complete_transcription_on_main, session)
 
     def _complete_transcription_on_main(self, session: int) -> None:
@@ -660,7 +740,7 @@ class DictationApp(rumps.App):
 
         if self.recording_active or self.is_transcribing:
             self._push_status(
-                "Finish the current operation first", recording=self.recording_active,
+                "Finish the current operation first", recording=self.recording_active, revert_after=5,
             )
             return
 
@@ -742,13 +822,16 @@ class DictationApp(rumps.App):
 
         if self.recording_active or self.is_transcribing:
             self._push_status(
-                "Finish the current operation first", recording=self.recording_active,
+                "Finish the current operation first", recording=self.recording_active, revert_after=5,
             )
             return
 
         records = self.recordings.list_recordings()
         if recording_id is None:
-            unsaved = [record for record in records if record.status != "done"]
+            # Audio that never reached the recognizer (a crash or quit
+            # mid-dictation) comes before captures that were tried already.
+            untried = [record for record in records if record.status == "saved"]
+            unsaved = untried or [record for record in records if record.status != "done"]
             if unsaved:
                 recording_id = unsaved[0].id
             elif not self.recorder.has_recoverable_recording() and records:
@@ -845,6 +928,7 @@ class DictationApp(rumps.App):
             recording=None,
             revert_after=8,
         )
+        AppHelper.callAfter(self._refresh_preferences)
 
     # -- Queue delegate methods --
 
@@ -884,6 +968,11 @@ class DictationApp(rumps.App):
 
         output_config = self.overlay_controller.show_output_mode_dialog()
         if output_config is None:
+            return
+        # The dialog runs a nested event loop: Option+Space may have started
+        # a dictation while it was open.
+        if self.is_transcribing or self.recording_active:
+            self._push_status("Finish the current operation first", recording=self.recording_active, revert_after=5)
             return
 
         self.is_transcribing = True
@@ -1066,17 +1155,30 @@ class DictationApp(rumps.App):
 
     def handle_device_selected(self, device_name: str | None) -> None:
         if self.recording_active or self.is_transcribing:
+            # Put the picker back: the change was not applied.
+            self._refresh_preferences()
             return
         self.recorder.set_device(device_name)
         self.config.input_device = device_name
         self._save_settings()
+        self._refresh_preferences()
+
+    def handle_keep_ready_selected(self, seconds: int) -> None:
+        self.config.keep_mic_ready_seconds = seconds
+        self.recorder.keep_warm_seconds = seconds
+        if seconds == 0:
+            release = getattr(self.recorder, "release_device", None)
+            if release is not None:
+                threading.Thread(target=release, daemon=True).start()
+        self._save_settings()
 
     def _refresh_input_devices(self) -> None:
-        if (self.recording_active or self.is_transcribing or self._preferences_window is None
-                or self._preferences_window.tabs.selectedSegment() != 1):
+        preferences = self._preferences_window
+        if (self.recording_active or self.is_transcribing or preferences is None
+                or not preferences.panel.isVisible() or preferences.tabs.selectedSegment() != 1):
             return
-        # Device enumeration can rebuild the PortAudio session (~100-250ms);
-        # off the main thread so the overlay never beachballs.
+        # Device enumeration runs in a helper process (~150 ms); off the
+        # main thread so Settings never beachballs.
         def _enumerate():
             devices = self.recorder.list_input_devices()
             if devices is None:
@@ -1084,7 +1186,8 @@ class DictationApp(rumps.App):
                 # showing a false "no input devices found".
                 return
             selected = self.recorder.get_selected_device_name()
-            AppHelper.callAfter(self._preferences_window.update_input_devices, devices, selected)
+            automatic = getattr(self.recorder, "automatic_device_name", None)
+            AppHelper.callAfter(preferences.update_input_devices, devices, selected, automatic)
 
         threading.Thread(target=_enumerate, daemon=True).start()
 
@@ -1398,9 +1501,10 @@ class DictationApp(rumps.App):
         rumps.alert(title="Welcome to Maramax", message=(
             "Press Option+Space to start dictating and again to finish. Cmd+R also finishes a recording.\n\n"
             "The small bar leaves your current app focused. Your words copy to the clipboard. "
-            "Enable Paste Into Active App in Settings for automatic insertion; macOS will require Accessibility access.\n\n"
-            "Automatic input prefers the Mac microphone, so your headphones can stay an output device. "
-            "Choose AirPods explicitly in Open Transcript to use their microphone.\n\n"
+            "Turn on “Paste into the active app” in Settings for automatic insertion; macOS will require Accessibility access.\n\n"
+            "Settings → Microphone chooses the input. Automatic follows macOS, or prefers the Mac's own "
+            "microphone so headphones stay in high-quality playback. Bluetooth microphones need a moment "
+            "to connect: start speaking when the bar says Recording.\n\n"
             "Recordings keeps audio for playback, export, and retry. "
             "Speech recognition runs locally; model weights download on first use."
         ))

@@ -132,3 +132,52 @@ def test_cache_files_from_different_revisions_are_not_mixed(tmp_path, monkeypatc
     monkeypatch.setattr(transcription, "try_to_load_from_cache", lambda _model, name:
                         str((first if name == "config.json" else second) / name))
     assert transcription.cached_model_source("test/model") == "test/model"
+
+
+def recognizer(calls):
+    transcriber = object.__new__(transcription.ParakeetTranscriber)
+    transcriber.ready_event = threading.Event()
+    transcriber.ready_event.set()
+    transcriber.load_error = None
+    transcriber.model = SimpleNamespace(
+        preprocessor_config=SimpleNamespace(sample_rate=16000, hop_length=160),
+        generate=lambda mel: calls.append(("memory", mel)) or [SimpleNamespace(text=" spoken words ")],
+        transcribe=lambda path, **kwargs: calls.append(("file", kwargs)) or SimpleNamespace(text="long words"),
+    )
+    return transcriber
+
+
+def test_short_dictation_is_recognized_from_memory_without_a_temporary_file(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: len(audio))
+    monkeypatch.setattr(transcription.tempfile, "tempdir", str(tmp_path))
+    progress = []
+    text = recognizer(calls).transcribe_pcm(b"\x01\x00" * 16000, 1, 2, 16000,
+                                            progress_callback=lambda *a: progress.append(a))
+    assert text == "spoken words"
+    assert calls == [("memory", 16000)]
+    assert progress == [(16000, 16000)]
+    assert not list(tmp_path.iterdir())
+
+
+def test_long_dictation_keeps_the_library_chunk_merging(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(transcription.tempfile, "tempdir", str(tmp_path))
+    pcm = b"\x01\x00" * (16000 * 121)
+    assert recognizer(calls).transcribe_pcm(pcm, 1, 2, 16000) == "long words"
+    assert calls == [("file", {"chunk_duration": 120.0, "overlap_duration": 15.0})]
+    assert not list(tmp_path.iterdir())  # The temporary WAV is removed.
+
+
+def test_audio_too_short_for_a_spectrogram_is_no_speech():
+    calls = []
+    assert recognizer(calls).transcribe_pcm(b"\x01\x00" * 100, 1, 2, 16000) == ""
+    assert calls == []
+
+
+def test_high_accuracy_pass_receives_the_users_vocabulary():
+    seen = {}
+    model = transcription.QwenTranscriber()
+    model.model = SimpleNamespace(transcribe=lambda samples, **kwargs: seen.update(kwargs) or SimpleNamespace(text="ok"))
+    assert model.transcribe_pcm(b"\x01\x02" * 100, 1, 2, 16000, context="Vocabulary: Maramax.") == "ok"
+    assert seen == {"language": "en", "context": "Vocabulary: Maramax."}

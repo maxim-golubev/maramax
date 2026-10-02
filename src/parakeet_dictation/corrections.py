@@ -46,3 +46,14 @@ def apply_replacements(text: str, rules: list[dict[str, str]]) -> str:
         return ordered[int(match.lastgroup[1:])]["replacement"]
 
     return pattern.sub(replace, text)
+
+
+def vocabulary_hint(rules: list[dict[str, str]], limit: int = 50) -> str | None:
+    """The spellings the user asked for, phrased for a recognizer that
+    accepts context. Long replacements are snippets, not vocabulary."""
+    terms: list[str] = []
+    for rule in normalize_rules(rules):
+        term = rule["replacement"]
+        if len(term) <= 40 and "\n" not in term and term.casefold() not in {t.casefold() for t in terms}:
+            terms.append(term)
+    return f"Vocabulary: {', '.join(terms[:limit])}." if terms else None

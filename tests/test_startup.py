@@ -72,6 +72,12 @@ with patch.object(module, "app_support_dir", lambda: base), \
     assert not app.overlay_controller.panel.isVisible()
     assert not app.indicator.panel.isVisible()
     assert not prefs.panel.isVisible()
+    # Text fields in a menu-bar app need an Edit menu for Cmd+V and friends.
+    edit = NSApplication.sharedApplication().mainMenu().itemAtIndex_(0).submenu()
+    assert {str(edit.itemAtIndex_(i).keyEquivalent()) for i in range(edit.numberOfItems())} >= set("zxcva")
+    # The audio helper is launched only once the model is ready, never by construction.
+    assert app.recorder._process is None
+    assert app.indicator.stop_button.frame().size == app.indicator.expand_button.frame().size
     app.cleanup()
     app.cleanup()
 '''

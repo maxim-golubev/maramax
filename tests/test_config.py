@@ -91,3 +91,14 @@ def test_invalid_microphone_choice_falls_back_to_automatic(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text(json.dumps({"input_device": 42}))
     assert AppConfig.load(path).input_device is None
+
+
+def test_keep_microphone_ready_accepts_zero_and_rejects_nonsense(tmp_path):
+    path = tmp_path / "settings.json"
+    assert AppConfig.load(path).keep_mic_ready_seconds == 0
+    for stored, expected in ((120, 120), (0, 0), (-5, 0), (86400, 0), (True, 0), ("30", 0)):
+        path.write_text(json.dumps({"keep_mic_ready_seconds": stored}), encoding="utf-8")
+        assert AppConfig.load(path).keep_mic_ready_seconds == expected
+    config = AppConfig(keep_mic_ready_seconds=300)
+    config.save(path)
+    assert AppConfig.load(path).keep_mic_ready_seconds == 300

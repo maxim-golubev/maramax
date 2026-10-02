@@ -9,6 +9,9 @@ from pathlib import Path
 from .corrections import normalize_rules
 
 # Settings the user can change at runtime; everything else stays code-defined.
+# How long the microphone may stay connected after a dictation.
+MAX_KEEP_MIC_READY_SECONDS = 600
+
 _PERSISTED_FIELDS = (
     "auto_start_recording",
     "auto_copy_to_clipboard",
@@ -19,6 +22,7 @@ _PERSISTED_FIELDS = (
     "compact_dictation",
     "prefer_builtin_mic",
     "input_device",
+    "keep_mic_ready_seconds",
     "use_corrections",
     "replacements",
 )
@@ -43,6 +47,8 @@ class AppConfig:
     compact_dictation: bool = True
     prefer_builtin_mic: bool = True
     input_device: str | None = None
+    # 0 releases the microphone the moment a dictation ends.
+    keep_mic_ready_seconds: int = 0
     use_corrections: bool = True
     replacements: list[dict[str, str]] = field(default_factory=list)
     shortcuts: ShortcutConfig = field(default_factory=ShortcutConfig)
@@ -71,6 +77,10 @@ class AppConfig:
             if name == "input_device":
                 if value is None or (isinstance(value, str) and value.strip()):
                     config.input_device = value
+                continue
+            if name == "keep_mic_ready_seconds":
+                if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_KEEP_MIC_READY_SECONDS:
+                    config.keep_mic_ready_seconds = value
                 continue
             if isinstance(default, bool):
                 if isinstance(value, bool):

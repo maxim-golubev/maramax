@@ -1,4 +1,4 @@
-# Maramax 0.4.1
+# Maramax 0.5.0
 
 Local dictation for macOS on Apple Silicon. Parakeet recognizes speech on your
 Mac; an optional Qwen model provides an alternative final pass. Model weights
@@ -11,14 +11,16 @@ without a network freshness check. Audio is not uploaded for recognition.
 - A small bar shows the selected microphone, captured duration, and actual input
   level without taking focus from your current app. Cmd+R is registered globally
   only while recording from the compact bar; it is released afterward.
-- Results copy to the clipboard by default. **Settings → Paste Into Active App**
+- Results copy to the clipboard by default. **Settings → Paste into the active app**
   enables insertion too. In compact mode, insertion is skipped if you switch to
   a different app while dictating; the text stays copied. If the clipboard changes
   before insertion, auto-paste is skipped and the transcript remains in history.
   Expanding the bar during an operation preserves its original destination app.
 - Use the arrow in the bar or **Open Transcript** for the full transcript, history,
   and file queue. Live transcription previews remain available in that window.
-- Disable **Use Compact Dictation Bar** to use the original window interaction.
+- Disable **Use the compact dictation bar** to use the original window interaction.
+- Capture continues for a fifth of a second after you press stop, so a last
+  syllable still travelling through the driver or a Bluetooth link is not cut off.
 
 **Settings…** opens native controls for these preferences and your word
 replacements. Enter a phrase the recognizer gets wrong and its desired spelling.
@@ -26,7 +28,13 @@ Replacements match whole words or phrases without case sensitivity and apply
 once, preferring longer phrases. They apply to dictation and recording retries;
 the original transcript is retained in history and recording details. Imported
 media is transcribed without these replacements. No additional language model
-rewrites the text in this release.
+rewrites the text in this release. Standard editing shortcuts (Cmd+V, Cmd+C,
+Cmd+A, Cmd+Z, Cmd+W) work in Settings and the other windows.
+
+With **Use the high-accuracy model** on, the spellings you entered as
+replacements are also given to that model as vocabulary before it listens. On
+this Mac it is several times slower than the standard model (a five-minute
+dictation took about a minute instead of five seconds), so it stays off by default.
 
 If the speech model cannot load, use **Retry Speech Model** after restoring your
 connection. **Quick Start…** explains recording, insertion, microphone selection,
@@ -37,15 +45,32 @@ audio; quit the old copy before opening a different version.
 
 Automatic mode prefers the Mac's built-in microphone when available, allowing
 headphones to remain an output device. It does not change the system input or
-output setting. Choose a specific microphone in the full window to override
-automatic selection; that choice persists. Disable **Prefer Mac Microphone in
-Automatic Mode** to follow the system default instead.
+output setting. Choose a specific microphone in **Settings → Microphone** to
+override automatic selection; that choice persists, and the Automatic entry names
+the microphone it would use right now. Disable **Prefer the Mac's own microphone
+in Automatic** to follow the system default instead. With the lid closed the
+built-in microphone is switched off in hardware, so the preference is skipped.
 
-Maramax does not initialize PortAudio or open input at launch. Microphone startup and teardown run off
-the main UI thread. The bar distinguishes waiting for input, digital silence,
-and a stream that stopped delivering audio. Ordinary pauses after signal has
-arrived do not count as disconnections. A locked microphone disappearing produces
-an error rather than silently switching inputs.
+Maramax does not initialize PortAudio or open input at launch. Once the speech
+model is ready it starts its audio helper process on standby, without touching
+any device, so a recording pays only for the driver open rather than a process
+launch (about 125 ms saved per dictation on this Mac). Microphone startup and
+teardown run off the main UI thread. The bar distinguishes waiting for input,
+digital silence, and a stream that stopped delivering audio. Ordinary pauses
+after signal has arrived do not count as disconnections.
+
+If the microphone disappears or stops delivering audio mid-dictation, Automatic
+mode reopens whichever input macOS now offers and continues the same recording;
+the result notes that the microphone changed. A microphone you selected
+explicitly is never swapped: the recording ends and what was captured is kept.
+
+Bluetooth microphones deliver one and a half to two and a half seconds of
+silence each time they connect; that is the headset switching into call mode and
+no app can shorten it. **Keep the microphone connected for** (Off, 30 seconds,
+2 minutes, 5 minutes) leaves the stream open after a dictation so the next one
+starts instantly. While it is open macOS shows the microphone indicator and
+AirPods stay in call-quality playback; audio heard while waiting is discarded
+inside the helper and never reaches the app. It is off by default.
 
 Bluetooth driver failures can still require an app restart. After two abandoned
 driver sessions, further recording attempts request a restart rather than allowing
@@ -66,13 +91,15 @@ the newest even if it alone exceeds that budget; older recordings are removed
 as new ones are saved. Export recordings you want to keep permanently.
 
 The live PCM recovery spill is still written during capture for crash recovery.
-**Recover Last Recording** can retry archived failures and legacy spill files.
+At the next launch a leftover spill is moved into Recordings as an ordinary
+entry. **Recover Last Recording** retries audio that never reached the recognizer
+first, then the newest capture without a transcript.
 **Clear History & Recordings…** deletes both transcript history and retained audio
 after confirmation, and is unavailable during an active operation.
 
 The original transcript for a replaced phrase is stored separately in
 `history-originals.json`, keeping `history.json` readable by 0.3.0. Both are
-cleared by the new app's history command. Operational logs rotate at 2 MB with
+cleared by the app's history command. Operational logs rotate at 2 MB with
 two backups under `logs/`; no transcript text is deliberately logged.
 
 ## Development
@@ -127,11 +154,12 @@ Key modules: `app.py` coordinates operations; `recorder.py` owns device capture;
 
 After it is convenient to use audio, test with built-in input and explicitly
 selected AirPods: immediate speech after the shortcut, short and long recordings,
-repeated dictations, reconnects between recordings, and disconnection while
-recording. Verify the actual selected input, passive focus behavior, Cmd+R being
+repeated dictations, reconnects between recordings, disconnection while
+recording in Automatic mode (it should continue on the Mac's microphone), and
+back-to-back dictations with the microphone kept connected. Verify the actual selected input, passive focus behavior, Cmd+R being
 released afterward, optional insertion, playback, and recovery after force-quit.
 
-Compare `first_frame_delay`, `stop_seconds`, `stop_to_result_seconds`,
-`abandoned_audio_sessions`, and `active_threads` in recording metadata across
-repeated sessions. Measure real stop-to-insertion latency separately; the stored
+Compare `open_delay` (request to device open), `first_frame_delay`,
+`stop_seconds`, `stop_to_result_seconds`, `warm_start`, `abandoned_audio_sessions`,
+and `active_threads` in recording metadata across repeated sessions. Measure real stop-to-insertion latency separately; the stored
 stop-to-result timing does not include the final UI/clipboard insertion.

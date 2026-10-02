@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 import warnings
 
 import objc
@@ -261,12 +260,10 @@ class OverlayController(NSObject):
         self.mode_control.setTarget_(self)
         self.mode_control.setAction_("toggleMode:")
 
-        self.device_popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(24, 52, 640, 26), False
-        )
-        self.device_popup.setFont_(NSFont.systemFontOfSize_(11))
-        self.device_popup.setTarget_(self)
-        self.device_popup.setAction_("deviceSelected:")
+        # Microphone and elapsed time while recording without a live draft.
+        self.detail_label = self._make_label(NSMakeRect(124, 36, 440, 16), "", 11, False)
+        self.detail_label.setAlignment_(NSTextAlignmentCenter)
+        self.detail_label.setTextColor_(NSColor.secondaryLabelColor())
 
         self.record_button = self._make_button(NSMakeRect(224, 16, 168, 34), "", "toggleRecording:")
         self.copy_button = self._make_button(NSMakeRect(404, 16, 90, 34), "Copy", "copyTranscript:")
@@ -276,12 +273,14 @@ class OverlayController(NSObject):
         self.scroll_view = NSScrollView.alloc().initWithFrame_(NSMakeRect(24, 16, 640, 124))
         self.scroll_view.setHasVerticalScroller_(True)
         self.scroll_view.setBorderType_(0)
+        self._round(self.scroll_view)
 
         self.text_view = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 640, 124))
         self.text_view.setEditable_(False)
         self.text_view.setSelectable_(True)
         self.text_view.setRichText_(False)
         self.text_view.setFont_(NSFont.systemFontOfSize_(13))
+        self.text_view.setTextContainerInset_((6, 8))
         self.text_view.textContainer().setWidthTracksTextView_(True)
         self.scroll_view.setDocumentView_(self.text_view)
 
@@ -298,11 +297,13 @@ class OverlayController(NSObject):
         self.queue_scroll_view = NSScrollView.alloc().initWithFrame_(NSMakeRect(24, 52, 640, 160))
         self.queue_scroll_view.setHasVerticalScroller_(True)
         self.queue_scroll_view.setBorderType_(0)
+        self._round(self.queue_scroll_view)
 
         self.queue_text_view = NSTextView.alloc().initWithFrame_(NSMakeRect(0, 0, 640, 160))
         self.queue_text_view.setEditable_(False)
         self.queue_text_view.setSelectable_(True)
         self.queue_text_view.setRichText_(False)
+        self.queue_text_view.setTextContainerInset_((6, 8))
         self.queue_text_view.setFont_(NSFont.monospacedSystemFontOfSize_weight_(12, 0))
         self.queue_text_view.textContainer().setWidthTracksTextView_(True)
         self.queue_scroll_view.setDocumentView_(self.queue_text_view)
@@ -326,7 +327,7 @@ class OverlayController(NSObject):
 
         for view in [
             self.status_label,
-            self.device_popup,
+            self.detail_label,
             self.mode_control,
             self.record_button,
             self.copy_button,
@@ -343,6 +344,14 @@ class OverlayController(NSObject):
             self.queue_start_button,
         ]:
             self.content_view.addSubview_(view)
+
+    @staticmethod
+    def _round(view):
+        # Text areas share the panel's rounded language instead of meeting
+        # it with square white corners.
+        view.setWantsLayer_(True)
+        view.layer().setCornerRadius_(8.0)
+        view.layer().setMasksToBounds_(True)
 
     @objc.python_method
     def _apply_appearance(self):
@@ -406,8 +415,9 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def _set_button_tint(self, button, color):
-        if hasattr(button, "setContentTintColor_"):
-            button.setContentTintColor_(color)
+        # A coloured bezel reads as the primary action; a text tint has no
+        # visible effect on a standard push button.
+        button.setBezelColor_(color)
 
     @objc.python_method
     def _sync_copy_button(self):
@@ -439,7 +449,7 @@ class OverlayController(NSObject):
     @objc.python_method
     def _hide_all_controls(self):
         for v in [
-            self.device_popup, self.mode_control, self.record_button,
+            self.detail_label, self.mode_control, self.record_button,
             self.copy_button, self.files_button, self.close_button,
             self.scroll_view, self.drop_label,
             self.queue_scroll_view, self.queue_add_button, self.queue_up_button,
@@ -468,7 +478,6 @@ class OverlayController(NSObject):
 
         show_text_area = self._should_show_text_area()
         show_drop_hint = self._should_show_drop_hint()
-        show_device = False
 
         if show_text_area:
             height = self.EXPANDED_HEIGHT
@@ -488,12 +497,10 @@ class OverlayController(NSObject):
             controls_y = 16
             status_y = height - 40
 
-        device_y = controls_y + 36
-
         self.status_label.setFrame_(NSMakeRect(124, status_y, 440, 20))
-        self.device_popup.setFrame_(NSMakeRect(24, device_y, 640, 26))
-        self.device_popup.setHidden_(not show_device)
-        self.mode_control.setFrame_(NSMakeRect(24, controls_y + 2, 186, 30))
+        self.detail_label.setFrame_(NSMakeRect(124, status_y - 22, 440, 16))
+        self.detail_label.setHidden_(not self.is_recording or show_text_area)
+        self.mode_control.setFrame_(NSMakeRect(24, controls_y + 3, 186, 28))
         self.mode_control.setHidden_(False)
         self.record_button.setFrame_(NSMakeRect(224, controls_y, 168, 34))
         self.record_button.setHidden_(False)
@@ -557,13 +564,13 @@ class OverlayController(NSObject):
 
         self.status_label.setFrame_(NSMakeRect(124, status_y, 440, 20))
         self.status_label.setHidden_(False)
-        self.mode_control.setFrame_(NSMakeRect(24, controls_y + 2, 186, 30))
+        self.mode_control.setFrame_(NSMakeRect(24, controls_y + 3, 186, 28))
         self.mode_control.setHidden_(False)
         self.close_button.setFrame_(NSMakeRect(588, controls_y, 76, 34))
         self.close_button.setHidden_(False)
 
         # Hide non-queue controls
-        self.device_popup.setHidden_(True)
+        self.detail_label.setHidden_(True)
         self.record_button.setHidden_(True)
         self.copy_button.setHidden_(True)
         self.files_button.setHidden_(True)
@@ -607,7 +614,7 @@ class OverlayController(NSObject):
 
         if processing:
             self.queue_start_button.setTitle_("Running\u2026")
-            self._set_button_tint(self.queue_start_button, NSColor.secondaryLabelColor())
+            self._set_button_tint(self.queue_start_button, None)
         else:
             self.queue_start_button.setTitle_("Start")
             self._set_button_tint(self.queue_start_button, NSColor.systemGreenColor())
@@ -786,6 +793,7 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def prepare_for_recording(self):
+        self.detail_label.setStringValue_("")
         self.mode = "result"
         self.mode_control.setSelectedSegment_(0)
         self.current_text = ""
@@ -817,52 +825,23 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def show_active_microphone(self, name: str):
-        self.device_popup.removeAllItems()
-        self.device_popup.addItemWithTitle_(name)
-        self.device_popup.setEnabled_(False)
+        self.detail_label.setStringValue_(name)
 
     @objc.python_method
-    def update_input_devices(self, devices, selected_name: str | None):
-        self.device_popup.removeAllItems()
-
-        if not devices:
-            self.device_popup.addItemWithTitle_("No input devices found")
-            self.device_popup.setEnabled_(False)
-            return
-
-        self.device_popup.setEnabled_(not self.is_recording)
-
-        automatic = "Automatic — prefer Mac microphone" if self.config.prefer_builtin_mic else "Automatic — system default"
-        self.device_popup.addItemWithTitle_(automatic)
-
-        for d in devices:
-            self.device_popup.addItemWithTitle_(d.name)
-
-        if selected_name is not None:
-            idx = self.device_popup.indexOfItemWithTitle_(selected_name)
-            if idx >= 0:
-                self.device_popup.selectItemAtIndex_(idx)
-                return
-
-        if selected_name is not None:
-            # Keep the missing lock visible; recording will report the
-            # disconnection instead of silently changing microphones.
-            self.device_popup.addItemWithTitle_(f"Unavailable: {selected_name}")
-            self.device_popup.selectItemWithTitle_(f"Unavailable: {selected_name}")
-            return
-        self.device_popup.selectItemAtIndex_(0)
+    def set_capture(self, snapshot):
+        seconds = int(snapshot.audio_seconds)
+        self.detail_label.setStringValue_(f"{snapshot.device_name} · {seconds // 60}:{seconds % 60:02d}")
 
     @objc.python_method
     def set_recording(self, is_recording: bool):
         self.is_recording = is_recording
-        self.device_popup.setEnabled_(not is_recording)
         if is_recording:
             self._cancel_copy_feedback()
             self.record_button.setTitle_(f"Stop ({self.config.shortcuts.toggle_recording})")
             self._set_button_tint(self.record_button, NSColor.systemRedColor())
         else:
             self.record_button.setTitle_(f"Record ({self.config.shortcuts.toggle_recording})")
-            self._set_button_tint(self.record_button, NSColor.systemBlueColor())
+            self._set_button_tint(self.record_button, NSColor.controlAccentColor())
         self._update_layout()
 
     @objc.python_method
@@ -905,9 +884,7 @@ class OverlayController(NSObject):
         token = self._copy_feedback_token
         self._copy_feedback_visible = True
         self._sync_copy_button()
-        timer = threading.Timer(2.0, lambda: AppHelper.callAfter(self._reset_copy_feedback, token))
-        timer.daemon = True
-        timer.start()
+        AppHelper.callLater(2.0, self._reset_copy_feedback, token)
 
     @objc.python_method
     def handle_dropped_paths(self, paths):
@@ -936,12 +913,6 @@ class OverlayController(NSObject):
             self._render_queue_list()
         self._update_layout()
         self._focus_panel()
-
-    def deviceSelected_(self, sender):
-        if sender.indexOfSelectedItem() == 0:
-            self.delegate.handle_device_selected(None)
-        elif not sender.titleOfSelectedItem().startswith("Unavailable: "):
-            self.delegate.handle_device_selected(sender.titleOfSelectedItem())
 
     def toggleRecording_(self, sender):
         del sender

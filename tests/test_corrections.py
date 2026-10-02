@@ -61,3 +61,12 @@ def test_publication_keeps_raw_text_and_pastes_only_new_dictation(tmp_path, monk
     assert app._publish_transcript("mara max", "file", "File", True, 3) == "mara max"
     app.config.use_corrections = False
     assert app._publish_transcript("mara max", "microphone", "Raw", True, 4) == "mara max"
+
+
+def test_vocabulary_hint_lists_wanted_spellings_once():
+    from parakeet_dictation.corrections import vocabulary_hint
+
+    rules = [{"heard": "mara max", "replacement": "Maramax"}, {"heard": "meramax", "replacement": "maramax"},
+             {"heard": "sig", "replacement": "Kind regards,\nMaxim"}, {"heard": "kairos", "replacement": "Cairos"}]
+    assert vocabulary_hint(rules) == "Vocabulary: Maramax, Cairos."
+    assert vocabulary_hint([]) is None

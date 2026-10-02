@@ -48,6 +48,8 @@ class FakeAudio:
 def recorder(tmp_path, monkeypatch):
     monkeypatch.setattr(module.pyaudio, "PyAudio", FakeAudio)
     monkeypatch.setattr(FakeAudio, "opens", [])
+    # The result must not depend on whether this Mac's lid happens to be shut.
+    monkeypatch.setattr(module, "lid_closed", lambda: False)
     instance = module.AudioRecorder(recovery_dir=tmp_path)
     yield instance
     instance.cleanup()
@@ -136,3 +138,53 @@ def test_repeated_sessions_release_workers_streams_and_spill_handles(recorder):
         assert recorder.capture_snapshot().callbacks == 1
         assert recorder.abandoned_sessions == 0
         previous_callback = stream.callback
+
+
+def test_reopen_continues_the_same_recording_on_the_new_default(recorder, monkeypatch):
+    recorder.prefer_builtin = False
+    assert recorder.start()
+    first = recorder._stream
+    first.callback(b"\x01\x00" * 8000, 512, {}, 0)
+    monkeypatch.setattr(FakeAudio, "devices", ["MacBook Pro Microphone"])
+    monkeypatch.setattr(FakeAudio, "get_default_input_device_info",
+                        lambda self: self.get_device_info_by_index(0))
+    assert recorder.reopen()
+    assert recorder._stream is not first and not first.active
+    assert recorder.capture_snapshot().device_name == "MacBook Pro Microphone"
+    first.callback(b"\x09\x00" * 512, 512, {}, 0)  # The retired stream is ignored.
+    recorder._stream.callback(b"\x02\x00" * 8000, 512, {}, 0)
+    assert recorder.stop() == b"\x01\x00" * 8000 + b"\x02\x00" * 8000
+    assert recorder.preserve_recovery()
+    assert recorder.load_recoverable_recording() == b"\x01\x00" * 8000 + b"\x02\x00" * 8000
+
+
+def test_reopen_refuses_to_replace_a_locked_microphone(recorder, monkeypatch):
+    recorder.set_device("AirPods")
+    assert recorder.start()
+    recorder._stream.callback(b"\x01\x00" * 512, 512, {}, 0)
+    monkeypatch.setattr(FakeAudio, "devices", ["MacBook Pro Microphone"])
+    assert recorder.reopen() is False
+    assert "disconnected" in str(recorder.last_error)
+    assert recorder.stop() == b"\x01\x00" * 512
+
+
+def test_closed_lid_does_not_prefer_the_switched_off_builtin_microphone(recorder, monkeypatch):
+    monkeypatch.setattr(module, "lid_closed", lambda: True)
+    assert recorder.start()
+    assert FakeAudio.opens[-1]["input_device_index"] == 1
+    assert recorder.automatic_device_name() == "AirPods"
+
+
+def test_rearm_starts_a_fresh_recording_on_the_open_stream(recorder):
+    assert recorder.start()
+    stream = recorder._stream
+    stream.callback(b"\x01\x00" * 512, 512, {}, 0)
+    assert recorder.rearm()
+    assert recorder._stream is stream and len(FakeAudio.opens) == 1
+    stream.callback(b"\x02\x00" * 512, 512, {}, 0)
+    assert recorder.stop() == b"\x02\x00" * 512
+    assert recorder.rearm() is False
+
+
+def test_lid_state_is_readable_without_raising():
+    assert module.lid_closed() in (True, False)
