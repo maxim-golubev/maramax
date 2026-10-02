@@ -8,7 +8,9 @@ import re
 import shutil
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import rumps
 from AppKit import NSAlert, NSAlertFirstButtonReturn, NSAlertThirdButtonReturn, NSApplication
@@ -29,6 +31,8 @@ CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 IDLE_BEFORE_INSTALL_SECONDS = 3.0
 # Long enough to read "Restarting Maramax…" before the window goes.
 RESTART_NOTICE_SECONDS = 0.8
+# A quit that has not happened by then is not going to.
+QUIT_WATCHDOG_SECONDS = 15.0
 MAX_NOTES_CHARS = 600
 
 
@@ -38,6 +42,15 @@ class Step(enum.Enum):
     PROMPTING = "prompting"      # the "is available" alert is open
     DOWNLOADING = "downloading"
     INSTALLING = "installing"    # downloaded and verified; waiting to quit
+
+
+@dataclass(frozen=True)
+class CheckFailed:
+    problem: str
+
+
+# How the last check went: one value, so "failed" always carries its reason.
+LastCheck = Literal["not checked", "succeeded"] | CheckFailed
 
 
 def menu_title(step: Step, version: str | None, percent: int | None = None) -> str:
@@ -51,7 +64,7 @@ def menu_title(step: Step, version: str | None, percent: int | None = None) -> s
     return f"Install Maramax {version}…" if version else CHECK_TITLE
 
 
-def status_line(*, step: Step, version: str | None, percent: int | None, checked: bool, problem: str | None,
+def status_text(*, step: Step, version: str | None, percent: int | None, last_check: LastCheck,
                 updated_to: str | None = None) -> str:
     """The sentence under Settings → Updates. `updated_to` is set on the
     first launch after an update installed."""
@@ -63,11 +76,11 @@ def status_line(*, step: Step, version: str | None, percent: int | None, checked
         return f"Maramax {version} is ready and installs as soon as Maramax is idle."
     if version:
         return f"Maramax {version} is available."
-    if problem:
-        return f"The last check did not work: {problem}"
+    if isinstance(last_check, CheckFailed):
+        return f"The last check did not work: {last_check.problem}"
     if updated_to:
         return f"Updated to Maramax {updated_to}."
-    return "This is the newest version." if checked else "Not checked yet."
+    return "This is the newest version." if last_check == "succeeded" else "Not checked yet."
 
 
 _INSTALL_FAILURES = {
@@ -84,17 +97,23 @@ def install_failure(result: updater.InstallResult) -> str | None:
     return _INSTALL_FAILURES.get(result)
 
 
+def should_prompt(*, asked: bool, version: str, skipped_version: str | None, busy: bool) -> bool:
+    """A check the user asked for always answers. One that ran by itself
+    stays quiet about a skipped version, and never interrupts work."""
+    return asked or (version != skipped_version and not busy)
+
+
+def ready_to_install(*, idle_now: bool, idle_before: bool) -> bool:
+    """Idle on two looks in a row: a dictation that just finished has had
+    time to paste and show its outcome."""
+    return idle_now and idle_before
+
+
 def plain_notes(markdown: str) -> str:
     """Release notes as an alert shows them: without Markdown's markup."""
     text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", markdown)        # [label](url) -> label
     text = re.sub(r"(\*\*|__|`)", "", text)
     return re.sub(r"(?m)^\s*#+\s*", "", text)
-
-
-def should_prompt(*, asked: bool, version: str, skipped_version: str | None, busy: bool) -> bool:
-    """A check the user asked for always answers. One that ran by itself
-    stays quiet about a skipped version, and never interrupts work."""
-    return asked or (version != skipped_version and not busy)
 
 
 def release_message(release: updater.Release, current_version: str) -> str:
@@ -109,15 +128,14 @@ def release_message(release: updater.Release, current_version: str) -> str:
 
 
 class UpdateOffer:
-    def __init__(self, *, menu_item, current_version: str, installed_app: Path | None, updates_dir: Path,
-                 log_path: Path, config: AppConfig, save_settings: Callable[[], bool],
-                 is_busy: Callable[[], bool], quit_app: Callable[[], None], on_change: Callable[[], None]):
+    def __init__(self, *, menu_item, current_version: str, installed_app: Path | None, support_dir: Path,
+                 config: AppConfig, save_settings: Callable[[], bool], is_busy: Callable[[], bool],
+                 quit_app: Callable[[], None], on_change: Callable[[], None]):
         self._menu_item = menu_item
         self._current = current_version
         # None when running from source: there is no bundle to replace.
         self._installed_app = installed_app
-        self._updates_dir = updates_dir
-        self._log_path = log_path
+        self._paths = updater.UpdatePaths.under(support_dir)
         self._config = config
         self._save_settings = save_settings
         self._is_busy = is_busy
@@ -127,8 +145,7 @@ class UpdateOffer:
         self._step = Step.IDLE
         self._percent: int | None = None
         self._release: updater.Release | None = None
-        self._has_checked = False           # a check has succeeded since launch
-        self._problem: str | None = None    # why the last check failed, until one succeeds
+        self._last_check: LastCheck = "not checked"
         self._updated_to: str | None = None  # this launch follows an update that installed
         self._cancel = threading.Event()     # one per download, so a cancel cannot outlive it
         self._window: UpdateProgressWindow | None = None
@@ -139,13 +156,9 @@ class UpdateOffer:
         self._report_last_install()
         call_later(FIRST_CHECK_SECONDS, self._scheduled_check)
 
-    @property
-    def _result_path(self) -> Path:
-        return self._updates_dir / "last-install"
-
     def _report_last_install(self) -> None:
         try:
-            result = updater.take_install_result(self._result_path)
+            result = updater.take_install_result(self._paths.result)
         except updater.UpdateError as exc:
             logger.warning(str(exc))
             return
@@ -156,14 +169,13 @@ class UpdateOffer:
             logger.info(f"Updated to Maramax {self._current}")
             self._updated_to = self._current
             return
-        logger.error(f"The last update did not install ({result}): {failure} See {self._log_path}.")
+        logger.error(f"The last update did not install ({result}): {failure} See {self._paths.log}.")
         # Once the menu bar is up, not in the middle of launching.
         call_later(5, lambda: rumps.alert(title="The update was not installed", message=failure))
 
     def status_text(self) -> str:
-        return status_line(step=self._step, version=self._release.version if self._release else None,
-                           percent=self._percent, checked=self._has_checked, problem=self._problem,
-                           updated_to=self._updated_to)
+        return status_text(step=self._step, version=self._release.version if self._release else None,
+                           percent=self._percent, last_check=self._last_check, updated_to=self._updated_to)
 
     def can_check(self) -> bool:
         return self._step is Step.IDLE
@@ -202,25 +214,27 @@ class UpdateOffer:
 
     def _check_worker(self, asked: bool) -> None:
         try:
-            release, problem = updater.latest_release(self._current), None
+            release = updater.latest_release(self._current)
         except updater.UpdateError as exc:
-            release, problem = None, str(exc)
+            AppHelper.callAfter(self._check_failed, str(exc), asked)
+            return
         except Exception as exc:
             # Never leave the menu stuck on "Checking": report and carry on.
             logger.exception("Update check failed unexpectedly")
-            release, problem = None, f"Unexpected error: {exc}"
-        AppHelper.callAfter(self._checked, release, problem, asked)
-
-    def _checked(self, release: updater.Release | None, problem: str | None, asked: bool) -> None:
-        if problem is not None:
-            logger.warning(f"Update check failed: {problem}")
-            self._problem = problem
-            self._set_step(Step.IDLE)  # What was known before still stands.
-            if asked:
-                rumps.alert(title="Could not check for updates", message=problem)
+            AppHelper.callAfter(self._check_failed, f"Unexpected error: {exc}", asked)
             return
+        AppHelper.callAfter(self._checked, release, asked)
+
+    def _check_failed(self, problem: str, asked: bool) -> None:
+        logger.warning(f"Update check failed: {problem}")
+        self._last_check = CheckFailed(problem)
+        self._set_step(Step.IDLE)  # What was known before still stands.
+        if asked:
+            rumps.alert(title="Could not check for updates", message=problem)
+
+    def _checked(self, release: updater.Release | None, asked: bool) -> None:
         self._release = release
-        self._has_checked, self._problem = True, None
+        self._last_check = "succeeded"
         self._set_step(Step.IDLE)
         if release is None:
             logger.info(f"Update check: {self._current} is the newest release")
@@ -232,7 +246,7 @@ class UpdateOffer:
                          busy=self._is_busy()):
             self._offer(release)
 
-    # -- Offering and installing --
+    # -- Offering --
 
     def _offer(self, release: updater.Release) -> None:
         # The alert runs a nested event loop in which the daily timer can
@@ -261,6 +275,8 @@ class UpdateOffer:
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         return int(alert.runModal())
 
+    # -- Downloading --
+
     def _download(self, release: updater.Release) -> None:
         installed_app = self._installed_app
         if installed_app is None:
@@ -268,10 +284,11 @@ class UpdateOffer:
                         message=f"Update the checkout instead, or download the app from {release.page_url}")
             return
         try:
-            updater.check_installable(installed_app, self._updates_dir)
+            updater.ensure_installable(installed_app, self._paths.updates)
         except updater.UpdateError as exc:
             rumps.alert(title=f"Maramax {release.version} cannot be installed here", message=str(exc))
             return
+        self._release = release
         self._cancel = threading.Event()
         if self._window is None:
             self._window = UpdateProgressWindow.alloc().initWithCancel_(self.cancel_requested)
@@ -287,7 +304,7 @@ class UpdateOffer:
         if self._window is not None:
             self._window.close()
 
-    def _downloading(self, received: int, expected: int) -> None:
+    def _show_download_progress(self, received: int, expected: int) -> None:
         if self._step is not Step.DOWNLOADING:
             return  # A report that arrived after the download ended.
         self._set_step(Step.DOWNLOADING, min(100, received * 100 // expected))
@@ -302,60 +319,84 @@ class UpdateOffer:
             percent = received * 100 // expected
             if (percent, expected) != tuple(shown) or received >= expected:
                 shown[:] = [percent, expected]
-                AppHelper.callAfter(self._downloading, received, expected)
+                AppHelper.callAfter(self._show_download_progress, received, expected)
 
         try:
-            staged_app = updater.download(release, self._current, installed_app, self._updates_dir / "download",
+            staged_app = updater.download(release, self._current, installed_app, self._paths.download,
                                           progress, cancel.is_set)
-            problem = None
+        except updater.UpdateCancelled:
+            AppHelper.callAfter(self._download_stopped, release)
+            return
         except updater.UpdateError as exc:
-            staged_app, problem = None, str(exc)
+            AppHelper.callAfter(self._download_failed, release, str(exc))
+            return
         except Exception as exc:
             # Never leave the menu stuck on "Downloading": report and carry on.
             logger.exception("Update download failed unexpectedly")
-            staged_app, problem = None, f"Unexpected error: {exc}"
-        AppHelper.callAfter(self._downloaded, release, installed_app, staged_app, problem)
-
-    def _downloaded(self, release: updater.Release, installed_app: Path, staged_app: Path | None,
-                    problem: str | None) -> None:
-        if self._cancel.is_set():
-            logger.info(f"Update to {release.version} cancelled")
-            self._set_step(Step.IDLE)
-            if staged_app is not None:
-                self._discard(staged_app)
+            AppHelper.callAfter(self._download_failed, release, f"Unexpected error: {exc}")
             return
-        if staged_app is None:
-            if self._window is not None:
-                self._window.close()
-            logger.error(f"Update to {release.version} failed: {problem}")
-            self._set_step(Step.IDLE)
-            rumps.alert(title=f"Maramax {release.version} could not be installed",
-                        message=f"{problem}\n\nThe current version keeps working; try again from the menu.")
+        AppHelper.callAfter(self._staged, release, installed_app, staged_app)
+
+    def _download_stopped(self, release: updater.Release) -> None:
+        logger.info(f"Update to {release.version} cancelled")
+        self._set_step(Step.IDLE)
+
+    def _download_failed(self, release: updater.Release, problem: str) -> None:
+        logger.error(f"Update to {release.version} failed: {problem}")
+        self._set_step(Step.IDLE)
+        if self._window is not None:
+            self._window.close()
+        rumps.alert(title=f"Maramax {release.version} could not be installed",
+                    message=f"{problem}\n\nThe current version keeps working; try again from the menu.")
+
+    def _staged(self, release: updater.Release, installed_app: Path, staged_app: Path) -> None:
+        if self._cancel.is_set():
+            # The cancel arrived after the download had finished.
+            self._download_stopped(release)
+            self._discard(staged_app)
             return
         logger.info(f"Maramax {release.version} downloaded and verified: {staged_app}")
         self._set_step(Step.INSTALLING)
-        self._install_when_idle(installed_app, staged_app, idle_before=False)
+        self._install_when_idle(release, installed_app, staged_app, idle_before=False)
 
-    def _install_when_idle(self, installed_app: Path, staged_app: Path, idle_before: bool) -> None:
-        """Quit and install once the app has been idle on two looks in a row,
-        with no dialog or file panel open."""
+    # -- Installing --
+
+    def _idle(self) -> bool:
+        return not self._is_busy() and NSApplication.sharedApplication().modalWindow() is None
+
+    def _install_when_idle(self, release: updater.Release, installed_app: Path, staged_app: Path,
+                           idle_before: bool) -> None:
+        """Look again every few seconds until the app has been idle, with no
+        dialog or file panel open, on two looks in a row."""
         if self._cancel.is_set():
             logger.info("Update cancelled before it was installed")
             self._set_step(Step.IDLE)
             self._discard(staged_app)
             return
-        idle = not self._is_busy() and NSApplication.sharedApplication().modalWindow() is None
-        if not (idle and idle_before):
+        idle = self._idle()
+        if not ready_to_install(idle_now=idle, idle_before=idle_before):
             if self._window is not None:
-                self._window.show_ready(self._release.version if self._release else "", busy=not idle)
-            call_later(IDLE_BEFORE_INSTALL_SECONDS, self._install_when_idle, installed_app, staged_app, idle)
+                self._window.show_ready(release.version, busy=not idle)
+            call_later(IDLE_BEFORE_INSTALL_SECONDS, self._install_when_idle, release, installed_app, staged_app,
+                       idle)
+            return
+        if self._window is not None:
+            self._window.show_restarting()
+        call_later(RESTART_NOTICE_SECONDS, self._restart, release, installed_app, staged_app)
+
+    def _restart(self, release: updater.Release, installed_app: Path, staged_app: Path) -> None:
+        """Start the swap and quit, unless something began during the notice."""
+        if self._cancel.is_set():
+            self._install_when_idle(release, installed_app, staged_app, idle_before=False)  # Discards it.
+            return
+        if not self._idle():
+            self._install_when_idle(release, installed_app, staged_app, idle_before=False)
             return
         try:
             updater.install_after_exit(
                 staged_app=staged_app, installed_app=installed_app,
-                previous_app=self._updates_dir / "previous" / installed_app.name,
-                staging=self._updates_dir / "download", result_path=self._result_path,
-                log_path=self._log_path, pid=os.getpid(),
+                previous_app=self._paths.previous(installed_app), staging=self._paths.download,
+                result_path=self._paths.result, log_path=self._paths.log, pid=os.getpid(),
             )
         except updater.UpdateError as exc:
             logger.error(str(exc))
@@ -365,12 +406,23 @@ class UpdateOffer:
             rumps.alert(title="The update could not be installed", message=str(exc))
             return
         logger.info("Quitting so the update can be installed")
+        call_later(QUIT_WATCHDOG_SECONDS, self._quit_did_not_happen)
+        self._quit_app()
+
+    def _quit_did_not_happen(self) -> None:
+        # Still here: the swap script will give up and change nothing.
+        logger.error("Maramax did not quit to install the update")
+        self._set_step(Step.IDLE)
         if self._window is not None:
-            self._window.show_restarting()
-        call_later(RESTART_NOTICE_SECONDS, self._quit_app)
+            self._window.close()
+        rumps.alert(title="The update was not installed",
+                    message="Maramax could not quit to install it. Try again from the menu.")
 
     @staticmethod
     def _discard(staged_app: Path) -> None:
+        def remove() -> None:
+            shutil.rmtree(staged_app, onexc=lambda _function, path, exc: logger.warning(
+                f"Could not remove {path} from a cancelled update: {exc}"))
+
         # Thousands of files: off the main thread.
-        threading.Thread(target=shutil.rmtree, args=(staged_app,), kwargs={"ignore_errors": True},
-                         daemon=True).start()
+        threading.Thread(target=remove, daemon=True).start()

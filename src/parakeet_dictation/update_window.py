@@ -24,10 +24,12 @@ def download_size(size: int) -> str:
     return f"{max(1, round(size / 1024))} KB"
 
 
-def progress_detail(received: int, expected: int) -> str:
+def progress_state(received: int, expected: int) -> tuple[str, float | None]:
+    """What the window says and how full the bar is (None: still working,
+    with no measure of how far along)."""
     if received >= expected:
-        return "Checking the download…"
-    return f"{download_size(received)} of {download_size(expected)}"
+        return "Checking the download…", None
+    return f"{download_size(received)} of {download_size(expected)}", received / expected
 
 
 class UpdateProgressWindow(NSObject):
@@ -75,11 +77,12 @@ class UpdateProgressWindow(NSObject):
 
     @objc.python_method
     def show_progress(self, received, expected):
-        self.detail.setStringValue_(progress_detail(received, expected))
-        if received >= expected:
+        text, fraction = progress_state(received, expected)
+        self.detail.setStringValue_(text)
+        if fraction is None:
             self._indeterminate()
         else:
-            self._determinate(received / expected)
+            self._determinate(fraction)
 
     @objc.python_method
     def show_ready(self, version, busy):

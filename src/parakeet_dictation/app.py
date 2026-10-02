@@ -209,8 +209,7 @@ class DictationApp(rumps.App):
 
         self.updates = UpdateOffer(
             menu_item=update_item, current_version=__version__, installed_app=app_bundle(),
-            updates_dir=self._support_dir / "updates", log_path=self._support_dir / "logs" / "update.log",
-            config=self.config, save_settings=self._save_settings, is_busy=lambda: self.is_busy,
+            support_dir=self._support_dir, config=self.config, save_settings=self._save_settings, is_busy=lambda: self.is_busy,
             quit_app=rumps.quit_application, on_change=self._show_update_status,
         )
 

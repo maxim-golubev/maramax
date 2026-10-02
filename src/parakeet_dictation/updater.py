@@ -29,10 +29,12 @@ import shutil
 import subprocess
 import urllib.error
 import urllib.request
+import xml.parsers.expat
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import bundle_delta
 from .logger_config import logger
 
 LATEST_RELEASE_URL = "https://api.github.com/repos/maxim-golubev/maramax/releases/latest"
@@ -65,6 +67,35 @@ class UpdateCancelled(UpdateError):
 
 
 @dataclass(frozen=True)
+class UpdatePaths:
+    """Where an update keeps its files under Maramax's support folder."""
+    updates: Path
+    log: Path
+
+    @classmethod
+    def under(cls, support_dir: Path) -> UpdatePaths:
+        return cls(support_dir / "updates", support_dir / "logs" / "update.log")
+
+    @property
+    def download(self) -> Path:
+        return self.updates / "download"
+
+    @property
+    def result(self) -> Path:
+        """The swap script's outcome, read once by the next launch."""
+        return self.updates / "last-install"
+
+    def previous(self, installed_app: Path) -> Path:
+        """The one rollback copy: the version the last update replaced."""
+        return self.updates / "previous" / installed_app.name
+
+
+def checksum_name(asset_name: str) -> str:
+    """The name of the file holding an asset's SHA-256 (`shasum -a 256` format)."""
+    return f"{asset_name}.sha256"
+
+
+@dataclass(frozen=True)
 class Asset:
     """One downloadable file of a release, with the URL of its SHA-256."""
     name: str
@@ -82,17 +113,6 @@ class Release:
     delta: Asset | None     # only what changed since the version installed here, when published
 
 
-# A delta holds the files that differ between two signed bundles under
-# files/, and the paths that no longer exist in deleted.txt.
-_DELTA_FILES = "files"
-_DELTA_DELETED = "deleted.txt"
-
-
-def delta_name(from_version: str, to_version: str) -> str:
-    # A ZIP, but not named .zip: 0.6.1 accepts a release only with exactly one .zip.
-    return f"Maramax-{to_version}-from-{from_version}.delta"
-
-
 def version_key(version: str) -> tuple[int, ...]:
     """'0.5.2' (or a tag 'v0.5.2') as numbers, so 0.10 sorts after 0.9 and
     0.6 equals 0.6.0."""
@@ -106,9 +126,9 @@ def version_key(version: str) -> tuple[int, ...]:
 
 
 def _asset(tag: str, assets: dict[str, dict], name: str) -> Asset:
-    archive, checksum = assets[name], assets.get(f"{name}.sha256")
+    archive, checksum = assets[name], assets.get(checksum_name(name))
     if checksum is None:
-        raise UpdateError(f"Release {tag} has {name} without {name}.sha256")
+        raise UpdateError(f"Release {tag} has {name} without {checksum_name(name)}")
     for item in (archive, checksum):
         if item.get("state", "uploaded") != "uploaded" or not isinstance(item.get("browser_download_url"), str):
             raise UpdateError(f"Release {tag} is still being published ({item['name']} is not uploaded yet)")
@@ -132,13 +152,17 @@ def newer_release(current_version: str, payload: dict) -> Release | None:
     archives = [name for name in assets if name.endswith(".zip")]
     if len(archives) != 1:
         raise UpdateError(f"Release {tag} should have one app .zip; it has {sorted(assets)}")
-    delta = delta_name(current_version, version)
+    delta_name = bundle_delta.delta_name(current_version, version)
+    try:
+        delta = _asset(tag, assets, delta_name) if delta_name in assets else None
+    except UpdateError:
+        delta = None  # A delta is only a shortcut: the whole app is always there.
     return Release(
         version=version,
         notes=str(payload.get("body") or "").strip(),
         page_url=str(payload.get("html_url", "")),
         archive=_asset(tag, assets, archives[0]),
-        delta=_asset(tag, assets, delta) if delta in assets else None,
+        delta=delta,
     )
 
 
@@ -182,7 +206,7 @@ def latest_release(current_version: str, url: str = LATEST_RELEASE_URL) -> Relea
     return newer_release(current_version, payload)
 
 
-def check_installable(installed_app: Path, updates_dir: Path) -> None:
+def ensure_installable(installed_app: Path, updates_dir: Path) -> None:
     """Refuse, before anything is downloaded, an install that cannot work."""
     if installed_app.resolve().is_relative_to(updates_dir.resolve()):
         raise UpdateError(f"This is the copy kept from the last update ({installed_app}). "
@@ -195,7 +219,7 @@ def check_installable(installed_app: Path, updates_dir: Path) -> None:
 def _bundle_info(app: Path) -> dict:
     try:
         return plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
-    except (OSError, plistlib.InvalidFileException) as exc:
+    except (OSError, ValueError, plistlib.InvalidFileException, xml.parsers.expat.ExpatError) as exc:
         raise UpdateError(f"{app} is not a readable app bundle: {exc}") from exc
 
 
@@ -219,12 +243,14 @@ def download(release: Release, current_version: str, installed_app: Path, stagin
                                       progress, cancelled)
             except UpdateCancelled:
                 raise
-            except (UpdateError, OSError) as exc:
+            except Exception as exc:
+                # A delta is only a shortcut: whatever goes wrong with it, the
+                # whole app is fetched instead.
                 logger.warning(f"The update delta did not produce a verified app ({exc}); downloading the whole app")
         if new_app is None:
             _reset(staging)
             new_app = _from_archive(release, current_version, installed_app, staging, progress, cancelled)
-        return _place_beside(new_app, installed_app)
+        staged = _place_beside(new_app, installed_app)
     except OSError as exc:
         shutil.rmtree(staging, ignore_errors=True)
         raise UpdateError(f"Could not prepare Maramax {release.version}: {exc}") from exc
@@ -232,6 +258,11 @@ def download(release: Release, current_version: str, installed_app: Path, stagin
         # Reported by the caller; what was downloaded is no use any more.
         shutil.rmtree(staging, ignore_errors=True)
         raise
+    # Everything needed is beside the installed app now; what is left is
+    # only disk space, so a failure to remove it does not fail the update.
+    shutil.rmtree(staging, onexc=lambda _function, path, exc: logger.warning(
+        f"Could not remove {path} after the update was staged: {exc}"))
+    return staged
 
 
 def _reset(staging: Path) -> None:
@@ -288,11 +319,20 @@ def _from_delta(release: Release, delta: Asset, current_version: str, installed_
     archive.unlink()
     new_app = staging / "assembled" / installed_app.name
     new_app.parent.mkdir()
-    # A clone on APFS: instant, and no extra space until files differ.
-    if subprocess.run(["cp", "-cR", str(installed_app), str(new_app)], capture_output=True).returncode != 0:
+    try:
+        # A clone on APFS: instant, and no extra space until files differ.
+        _run(["cp", "-cR", str(installed_app), str(new_app)], f"clone {installed_app}")
+    except UpdateError as exc:
+        logger.info(f"{exc}; copying it instead")
         shutil.rmtree(new_app, ignore_errors=True)
         _run(["ditto", str(installed_app), str(new_app)], f"copy {installed_app} to rebuild it")
-    apply_delta(unpacked, new_app)
+    # A copy installed from a browser download carries quarantine; the
+    # update must not, or Gatekeeper would stop it at the relaunch.
+    _run(["xattr", "-cr", str(new_app)], "clear the rebuilt app's extended attributes")
+    try:
+        bundle_delta.apply(unpacked, new_app)
+    except bundle_delta.DeltaError as exc:
+        raise UpdateError(str(exc)) from exc
     _verify(new_app, installed_app, release.version)
     return new_app
 
@@ -307,74 +347,6 @@ def _verify(new_app: Path, installed_app: Path, version: str) -> None:
                           f"but the release is {version}")
     _run(["codesign", "--verify", "--deep", "--strict", f"-R={signer_requirement(identifier)}", str(new_app)],
          f"confirm that Maramax {version} was signed by Maramax's release certificate")
-
-
-def _bundle_entries(app: Path) -> dict[str, tuple[str, str]]:
-    """Every file and symlink in a bundle, by path relative to it: its kind and content."""
-    entries = {}
-    for directory, _, names in os.walk(app):
-        for name in names:
-            path = Path(directory) / name
-            relative = str(path.relative_to(app))
-            if path.is_symlink():
-                entries[relative] = ("link", os.readlink(path))
-            else:
-                with path.open("rb") as file:
-                    entries[relative] = ("file", hashlib.file_digest(file, "sha256").hexdigest())
-    return entries
-
-
-def make_delta(old_app: Path, new_app: Path, delta_dir: Path) -> tuple[int, int]:
-    """Write into `delta_dir` what turns `old_app` into `new_app`. Returns
-    how many paths it adds or changes, and how many it deletes. Used by
-    packaging/create_release.py; apply_delta() reads the same layout."""
-    old, new = _bundle_entries(old_app), _bundle_entries(new_app)
-    changed = sorted(path for path, entry in new.items() if old.get(path) != entry)
-    deleted = sorted(path for path in old if path not in new)
-    files = delta_dir / _DELTA_FILES
-    for relative in changed:
-        source, target = new_app / relative, files / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if source.is_symlink():
-            target.symlink_to(os.readlink(source))
-        else:
-            shutil.copy2(source, target)
-    (delta_dir / _DELTA_DELETED).write_text("".join(f"{path}\n" for path in deleted))
-    return len(changed), len(deleted)
-
-
-def _inside(root: Path, relative: str) -> Path:
-    """`root / relative`, refusing anything that would land outside `root`."""
-    parts = Path(relative).parts
-    if not parts or Path(relative).is_absolute() or ".." in parts:
-        raise UpdateError(f"The update delta names a path outside the app: {relative!r}")
-    return root.joinpath(*parts)
-
-
-def apply_delta(delta_dir: Path, app: Path) -> None:
-    """Turn `app` (a copy of the installed one) into the new version."""
-    try:
-        deleted = (delta_dir / _DELTA_DELETED).read_text().splitlines()
-    except FileNotFoundError as exc:
-        raise UpdateError(f"The update delta has no {_DELTA_DELETED}") from exc
-    for relative in filter(None, deleted):
-        path = _inside(app, relative)
-        if path.is_symlink() or path.is_file():
-            path.unlink()
-        elif path.is_dir():
-            shutil.rmtree(path)
-    files = delta_dir / _DELTA_FILES
-    for directory, _, names in os.walk(files):
-        for name in names:
-            source = Path(directory) / name
-            target = _inside(app, str(source.relative_to(files)))
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.is_symlink() or target.is_file():
-                target.unlink()
-            if source.is_symlink():
-                target.symlink_to(os.readlink(source))
-            else:
-                shutil.copy2(source, target)
 
 
 def _place_beside(new_app: Path, installed_app: Path) -> Path:
