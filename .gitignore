@@ -8,3 +8,5 @@ __pycache__
 *.egg-info/
 .vscode/launch.json
 .DS_Store
+# Third-party course text: used locally, not republished.
+docs/clean-code.txt
