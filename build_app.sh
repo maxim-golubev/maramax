@@ -70,6 +70,15 @@ shutil.move(tmp, src)
 print(f"Rewrote {os.path.basename(src)} reproducibly; stripped {removed} stub entries")
 PY
 fi
+# py2app's bootstrap site.pyc carries the same build time, and sits sourceless.
+python - "$BUNDLE_RESOURCES/site.pyc" <<'PY'
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+data = path.read_bytes()
+if data[4:8] == b"\0\0\0\0" and not path.with_suffix(".py").exists():
+    path.write_bytes(data[:8] + b"\0\0\0\0" + data[12:])
+PY
 
 # ── Copy full mlx package from venv ──
 # Place in site-packages so it's found on sys.path.
@@ -123,17 +132,35 @@ SIGNING_KEYCHAIN="$SIGNING_DIR/signing.keychain-db"
 if [ -f "$SIGNING_KEYCHAIN" ]; then
   SIGNER_SHA1="$(PYTHONPATH="$ROOT_DIR/src" python -c 'from parakeet_dictation.updater import SIGNER_CERTIFICATE_SHA1; print(SIGNER_CERTIFICATE_SHA1)')"
   security unlock-keychain -p "$(cat "$SIGNING_DIR/keychain-password")" "$SIGNING_KEYCHAIN"
-  # codesign finds identities only in the search list; the signing keychain
-  # is on it just for this call.
+  # codesign finds identities only in the user's keychain search list (not
+  # with --keychain, not with another preferences home), so the signing
+  # keychain is appended to it for this one call. That list is what every
+  # app uses to find its passwords: it is checked before it is touched, put
+  # back on any exit, and proved restored afterwards.
+  ORIGINAL_LISTING="$(security list-keychains -d user)"
   ORIGINAL_KEYCHAINS=()
   while IFS= read -r line; do
-    line="${line#"${line%%[![:space:]]*}"}"; line="${line%\"}"; ORIGINAL_KEYCHAINS+=("${line#\"}")
-  done < <(security list-keychains -d user)
-  trap 'security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}"' EXIT
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line%\"}"; line="${line#\"}"
+    if [ -z "$line" ] || [ ! -f "$line" ]; then
+      echo "ERROR: the keychain search list has an entry that is not a keychain file: '$line'." >&2
+      echo "Not touching it. Fix it first (security list-keychains -d user -s <each keychain>)." >&2
+      exit 1
+    fi
+    ORIGINAL_KEYCHAINS+=("$line")
+  done <<< "$ORIGINAL_LISTING"
+  restore_keychains() {
+    security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}"
+    if [ "$(security list-keychains -d user)" != "$ORIGINAL_LISTING" ]; then
+      echo "ERROR: the keychain search list was not restored. It was:" >&2
+      echo "$ORIGINAL_LISTING" >&2
+      return 1
+    fi
+  }
+  trap restore_keychains EXIT
   security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}" "$SIGNING_KEYCHAIN"
   codesign --force --sign "$SIGNER_SHA1" "$ROOT_DIR/dist/Maramax.app"
-  security list-keychains -d user -s "${ORIGINAL_KEYCHAINS[@]}"
   trap - EXIT
+  restore_keychains
 else
   echo "WARNING: no signing keychain at $SIGNING_KEYCHAIN; signing ad hoc. This build cannot be published." >&2
   codesign --force --sign - "$ROOT_DIR/dist/Maramax.app"
