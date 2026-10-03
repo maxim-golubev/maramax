@@ -84,9 +84,10 @@ measured off-screen, and the update swap script runs against temporary folders.
    starts in a few seconds and works offline.
 
 Allow microphone access when asked; turn on Accessibility only if you want the
-text pasted for you. Also there: your own replacement list for names and jargon
-it mishears, an optional larger recognizer (Qwen3-ASR 1.7B) that takes that list
-as vocabulary, and batch transcription of audio and video files.
+text pasted for you. Settings also has your own replacement list for names and
+jargon it mishears and an optional larger recognizer (Qwen3-ASR 1.7B) that takes
+that list as vocabulary; the transcript window transcribes audio and video files
+in batches.
 
 ## Build from source
 

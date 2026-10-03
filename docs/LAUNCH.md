@@ -34,9 +34,10 @@ version you have.
 
 **Install and Relaunch** shows the download in a small window (only the files
 that changed, when possible), accepts it only if it carries Maramax's release
-signature, waits until you finish dictating, and restarts Maramax as the new
-version. Settings, history, and recordings are untouched; if anything goes
-wrong, the next launch says so. The version it replaced is kept at
+signature, waits until Maramax is idle (not dictating, transcribing, or saving
+audio), and restarts it as the new version. Settings, history, and recordings
+are untouched; if anything goes wrong, the next launch says so. The version it
+replaced is kept at
 `~/Library/Application Support/Maramax/updates/previous/Maramax.app`: to roll
 back, quit Maramax and move that copy into Applications. Because every release
 carries the same signature, macOS keeps the microphone and Accessibility

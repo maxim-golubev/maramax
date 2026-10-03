@@ -1,4 +1,4 @@
-"""Renders the app icon document (packaging/Maramax.icon) into the files the bundle and the README use.
+"""Renders the app icon document (packaging/Maramax.icon) into the committed image files listed below.
 
     .venv/bin/python packaging/app_icon.py
 

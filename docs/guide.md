@@ -127,13 +127,13 @@ anything. A settings or history file that cannot be read is renamed to
 
 ## Updates
 
-Maramax checks GitHub for a newer release once a day (turn it off in
-**Settings → General**); **Check for Updates…** in the menu or **Check Now** in
-Settings asks right away, and the top of Settings shows your version. Choosing
-**Install and Relaunch** opens a small window with the download's progress;
-Maramax then restarts by itself (after you finish dictating, if you are). An
-update downloads only the files that changed since your version when it can,
-and is accepted only if it carries Maramax's own release signature. The
-replaced version is kept for rollback under
+Maramax checks GitHub for a newer release once a day (turn it off in **Settings
+→ General**); **Check for Updates…** in the menu or **Check Now** in Settings
+asks right away, and the top of Settings shows your version. Choosing **Install
+and Relaunch** opens a small window with the download's progress; Maramax then
+restarts by itself as soon as it is idle (not dictating, transcribing, or
+saving audio). An update downloads only the files that changed since your
+version when it can, and is accepted only if it carries Maramax's own release
+signature. The replaced version is kept for rollback under
 `~/Library/Application Support/Maramax/updates/previous`. The check sends
 nothing but the request and the installed version number.
