@@ -114,10 +114,12 @@ def test_missing_permission_never_posts_events(paste_context, monkeypatch):
 def test_keyboard_events_are_allocated_before_posting_and_always_released(monkeypatch, fail_key_up):
     events = []
 
-    def create(_source, _key, down):
+    def create(_source, key, down):
+        assert key == 0x2F  # The key that gives V on this (Dvorak) layout, not the US V key.
         events.append(("create", down))
         return 10 if down else (None if fail_key_up else 20)
 
+    monkeypatch.setattr(autopaste, "command_key_code", {"v": 0x2F}.get)
     monkeypatch.setattr(autopaste, "_core_graphics", SimpleNamespace(
         CGEventCreateKeyboardEvent=create,
         CGEventSetFlags=lambda _event, _flags: None,
@@ -134,6 +136,13 @@ def test_keyboard_events_are_allocated_before_posting_and_always_released(monkey
         autopaste.send_paste_keystroke()
         assert events == [("create", True), ("create", False), ("post", 10),
                           ("post", 20), ("release", 10), ("release", 20)]
+
+
+def test_no_keystroke_when_no_key_gives_cmd_v(monkeypatch):
+    monkeypatch.setattr(autopaste, "command_key_code", lambda character: None)
+    monkeypatch.setattr(autopaste, "_core_graphics", None)   # Nothing may be created or posted.
+    with pytest.raises(autopaste.PasteError, match="Cmd\\+V"):
+        autopaste.send_paste_keystroke()
 
 
 def test_paste_target_is_the_last_app_used_other_than_maramax():

@@ -129,6 +129,40 @@ assert str(panel.update_status.stringValue()) == "Checking for updates…" and n
 # Clicking another app must not make a window of a Dock-less app vanish.
 assert not panel.panel.hidesOnDeactivate()
 assert not panel.panel.isVisible() and not panel.shows_microphones()
+# Other shortcut… records keys; another tab, or closing Settings, gives the global shortcut back.
+from AppKit import NSMakeRect
+shortcut_calls = []
+delegate.pause_shortcut = lambda: shortcut_calls.append("pause")
+delegate.resume_shortcut = lambda: shortcut_calls.append("resume")
+delegate.problem_with_shortcut = lambda key, modifiers: (
+    "That key cannot be a shortcut. Use a letter, digit, punctuation key, Space, or F1–F12.")
+picker = panel.shortcut_picker
+def choose_other():
+    panel.tabs.setSelectedSegment_(0)
+    panel.selectTab_(None)
+    picker.popup.selectItemAtIndex_(picker.popup.numberOfItems() - 1)
+    picker.chooseItem_(None)
+def check_now_bottom():
+    content.layoutSubtreeIfNeeded()
+    return panel.update_check.convertRect_toView_(panel.update_check.bounds(), None).origin.y
+panel.tabs.setSelectedSegment_(0)
+panel.selectTab_(None)
+bottom = check_now_bottom()
+choose_other()
+assert shortcut_calls == ["pause"] and picker.is_recording()
+picker.key_pressed(0x24, 0)                      # Return: refused with two lines of explanation.
+content.layoutSubtreeIfNeeded()
+note = picker.note
+needed = note.cell().cellSizeForBounds_(NSMakeRect(0, 0, note.frame().size.width, 10000)).height
+assert note.frame().size.height >= needed - 0.5, (note.frame(), needed)   # "or press Esc." is not cut off.
+assert note.preferredMaxLayoutWidth() <= note.frame().size.width + 0.5, note.frame()   # It wraps where it ends.
+assert abs(check_now_bottom() - bottom) < 1, (check_now_bottom(), bottom)   # The window grew to fit it.
+panel.tabs.setSelectedSegment_(2)
+panel.selectTab_(None)                           # Typing a replacement is not choosing a shortcut.
+assert shortcut_calls == ["pause", "resume"] and not picker.is_recording()
+choose_other()
+panel.windowWillClose_(None)
+assert shortcut_calls == ["pause", "resume", "pause", "resume"] and not picker.is_recording()
 '''
     result = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr[-1500:]

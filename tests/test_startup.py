@@ -42,11 +42,29 @@ from parakeet_dictation.config import AppConfig
 NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyProhibited)
 base = Path(sys.argv[1])
 transcriber = SimpleNamespace(is_ready=lambda: True, load_error=None, status_message=lambda: "Speech model ready")
+registered, scheduled = [], []
+class Shortcuts:  # Carbon stays out of it: what would be registered is recorded.
+    def __init__(self, handler):
+        pass
+    def set_dictation_shortcut(self, spec):
+        registered.append(spec.label)
+    def cleanup(self):
+        pass
+from parakeet_dictation.hotkeys import KEY_NAMES, controlKey, optionKey
 with patch.object(module, "ParakeetTranscriber", lambda: transcriber), \
      patch.object(module.DictationApp, "_start_model_watchdog", lambda self: None), \
-     patch.object(module.DictationApp, "_register_global_hotkeys", lambda self: None):
+     patch.object(module, "GlobalHotKeyManager", Shortcuts), \
+     patch.object(module, "layout_key_names", lambda: KEY_NAMES), \
+     patch.object(module, "macos_shortcuts", lambda: frozenset()), \
+     patch.object(module, "call_later", lambda delay, function, *args: scheduled.append(function.__name__)):
     # Everything the app stores goes under the directory it is given.
-    app = module.DictationApp(config=AppConfig(), support_dir=base)
+    app = module.DictationApp(config=AppConfig(dictation_shortcut=[0x02, controlKey | optionKey], onboarded=True),
+                              support_dir=base)
+    # The shortcut the user chose is the one registered and named, and a
+    # user who has seen the welcome does not get it again.
+    assert registered == ["Control+Option+D"], registered
+    assert "Press Control+Option+D to dictate" in app.overlay_controller.intro_text
+    assert "show_welcome" not in scheduled
     import rumps
     for bind in getattr(rumps.clicked, "*buttons", []):
         bind(app)
@@ -78,6 +96,11 @@ with patch.object(module, "ParakeetTranscriber", lambda: transcriber), \
     app.cleanup()
     app.cleanup()
     assert sorted(path.name for path in base.iterdir()) == ["recordings", "settings.json"]
+    # A first launch opens the welcome a moment after start-up.
+    import tempfile
+    first = module.DictationApp(config=AppConfig(), support_dir=Path(tempfile.mkdtemp(dir=base.parent)))
+    assert scheduled.count("show_welcome") == 1 and registered[-1] == "Option+Space"
+    first.cleanup()
 '''
     result = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr[-1500:]

@@ -9,6 +9,7 @@ from parakeet_dictation.app import Phase
 from parakeet_dictation.capture import CaptureMeter
 from parakeet_dictation.config import AppConfig
 from parakeet_dictation.file_queue import TranscriptionQueue
+from parakeet_dictation.hotkeys import KEY_NAMES, controlKey, optionKey
 from parakeet_dictation.recordings import RecordingStore
 
 
@@ -35,6 +36,7 @@ def controller(monkeypatch):
     app._queue_cancel_event = threading.Event()
     app._recordings_window = None
     app._preferences_window = None
+    app._welcome_window = None
     app._previous_app = None
     app._capture_health = None
     app._capture_device = ""
@@ -55,8 +57,8 @@ def controller(monkeypatch):
         set_queue_files=lambda _files: None,
         hide=lambda: calls.append("window hidden"),
     )
-    app._dictate = module.dictation_shortcut(0x31, 1 << 11)
-    app.indicator = SimpleNamespace(show=lambda shortcut: calls.append("passive bar"),
+    app._dictate = module.dictation_shortcut(0x31, 1 << 11, KEY_NAMES)
+    app.indicator = SimpleNamespace(show=lambda shortcut: calls.extend(["passive bar", ("bar names", shortcut)]),
                                     set_capture=lambda _snapshot: None,
                                     set_transcribing=lambda: calls.append("bar transcribing"),
                                     finish=lambda message, duration: calls.append(("bar finished", duration)),
@@ -87,13 +89,14 @@ def test_compact_start_returns_while_the_audio_backend_is_still_opening(monkeypa
         return release.wait(timeout=2)
 
     app.recorder.start = open_backend
+    app._dictate = module.dictation_shortcut(0x02, controlKey | optionKey, KEY_NAMES)  # Not the default.
     try:
         assert app.start_recording()
         assert entered.wait(timeout=1)
         assert not release.is_set()
         assert app._phase is Phase.CONNECTING
         assert app._previous_app == "the app in front"
-        assert "passive bar" in calls
+        assert "passive bar" in calls and ("bar names", "Control+Option+D") in calls
         assert "activated window" not in calls
     finally:
         release.set()
@@ -480,15 +483,13 @@ def test_the_shortcut_dictates_from_an_open_idle_window(monkeypatch):
 
 
 def test_the_window_intro_says_what_the_shortcut_does(monkeypatch):
-    assert module.intro_text("Option+Space", True).startswith("Press Option+Space to dictate. Press it again")
-    opens = module.intro_text("Option+Space", False)
-    assert opens.startswith("Press Cmd+R or Dictate to start") and "Option+Space brings this window back" in opens
     app, _ = controller(monkeypatch)
     shown = []
     app.overlay_controller.set_intro_text = shown.append
     app._save_settings = lambda: True
     app.toggle_setting("auto_start_recording")
-    assert shown == [module.intro_text("Option+Space", False)]
+    assert shown == [module.intro_text("Option+Space", app.config)]
+    assert shown[0].startswith("Press Cmd+R or Dictate to start")
 
 
 def test_cancelling_while_the_microphone_connects_closes_the_window(monkeypatch):

@@ -101,7 +101,7 @@ def check(args: argparse.Namespace) -> dict:
             updates=SimpleNamespace(status_text=lambda: "Not checked yet.", can_check=lambda: True),
             current_shortcut=lambda: DEFAULT_DICTATE, choose_shortcut=lambda key, modifiers: None,
             pause_shortcut=lambda: None, resume_shortcut=lambda: None,
-            paste_permitted=lambda: False, set_paste_into_apps=lambda enabled: None,
+            paste_permitted=lambda: False, choose_delivery=lambda paste: None,
             open_accessibility_settings=lambda: None, finish_welcome=lambda: None,
         )
         preferences = PreferencesController.alloc().initWithDelegate_labels_(delegate, _SETTING_LABELS)

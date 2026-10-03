@@ -7,9 +7,12 @@ Everything the app does and where it keeps things. For a first launch, see [the 
 - Press **Option+Space** to start, then **Option+Space** or **Cmd+R** to finish. The
   first launch opens a short welcome that lets you pick another shortcut (and
   whether to paste); change it any time under **Settings → General → Shortcut**,
-  or reopen the welcome from **More → Welcome…**. Shortcuts macOS keeps for
-  itself (Spotlight's Cmd+Space, the input-source switches) and Cmd+letter
-  combinations apps rely on are refused with the reason.
+  or reopen the welcome from **More → Welcome…**. Shortcuts macOS has turned on
+  for itself (Spotlight's Cmd+Space, screenshots, and the rest of **Keyboard
+  Shortcuts** in System Settings), combinations that type a character (Option+E)
+  or that apps and Terminal use (Cmd+D, Control+C) are refused with the reason.
+  Maramax cannot tell when another app uses a shortcut: if pressing yours opens
+  something else, choose another.
 - A small bar shows the selected microphone, captured duration, and actual input
   level without taking focus from your current app. Cmd+R is registered globally
   only while recording from the compact bar; it is released afterward.

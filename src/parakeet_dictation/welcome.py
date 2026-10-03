@@ -11,6 +11,7 @@ from AppKit import (
 )
 from Foundation import NSObject
 
+from .config import AppConfig, Delivery
 from .hotkeys import STOP
 from .main_thread import call_later
 from .shortcut_picker import ShortcutPicker
@@ -22,15 +23,35 @@ STEPS = 4
 STATUS_SECONDS = 1.0
 
 
-def try_it_text(shortcut: str, pastes: bool) -> str:
-    result = "copied and pasted where you are typing" if pastes else "copied, ready to paste with Cmd+V"
-    return (f"Click into any text field, press {shortcut}, and say a sentence. Press {shortcut} again "
-            f"(or {STOP.label}): in a moment the text is {result}.")
+_OUTCOMES = {
+    Delivery.PASTED: "copied and pasted where you are typing",
+    Delivery.COPIED: "copied, ready to paste with Cmd+V",
+    Delivery.KEPT: "under Open Transcript in the menu bar icon",
+}
+
+
+def try_it_text(shortcut: str, config: AppConfig) -> str:
+    outcome = _OUTCOMES[config.delivery()]
+    if config.auto_start_recording:
+        return (f"Click into any text field, press {shortcut}, and say a sentence. Press {shortcut} again "
+                f"(or {STOP.label}): in a moment the text is {outcome}.")
+    return (f"Click into any text field and press {shortcut} to open Maramax, then {STOP.label} to start. Say a "
+            f"sentence and press {STOP.label} again: in a moment the text is {outcome}.")
+
+
+def recording_note(config: AppConfig) -> str:
+    """What shows while the first dictation records."""
+    # The shortcut opens the full window instead when it does not start recording.
+    shown = ("A small bar at the bottom of the screen shows the microphone and the time."
+             if config.compact_dictation and config.auto_start_recording else
+             "The Maramax window shows the microphone while you speak.")
+    return (f"{shown} Bluetooth headphones take two or three seconds to connect: start speaking when it says "
+            "Recording. macOS asks for the microphone the first time.")
 
 
 class WelcomeController(NSObject):
     """`delegate` provides what the picker needs (see shortcut_picker.py) and
-    config, transcriber, set_paste_into_apps(bool), paste_permitted(),
+    config, transcriber, choose_delivery(paste), paste_permitted(),
     open_accessibility_settings(), and finish_welcome()."""
 
     def initWithDelegate_(self, delegate):
@@ -39,6 +60,8 @@ class WelcomeController(NSObject):
             return None
         self.delegate = delegate
         self.step = 0
+        # Each show() starts a new watch; an older one stops at its next look.
+        self._watch_generation = 0
         self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, CONTENT_WIDTH + 2 * MARGIN, 300), NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
             NSBackingStoreBuffered, False,
@@ -47,7 +70,7 @@ class WelcomeController(NSObject):
         self.panel.setReleasedWhenClosed_(False)
         self.panel.setHidesOnDeactivate_(False)
         self.panel.setDelegate_(self)
-        self.picker = ShortcutPicker.alloc().initWithOwner_width_(delegate, CONTENT_WIDTH)
+        self.picker = ShortcutPicker.alloc().initWithOwner_width_onResize_(delegate, CONTENT_WIDTH, self._fit_window)
         root = self.panel.contentView()
         self.pages = [self._welcome_page(), self._shortcut_page(), self._result_page(), self._try_page()]
         self.counter = self._small("")
@@ -153,12 +176,11 @@ class WelcomeController(NSObject):
     @objc.python_method
     def _try_page(self):
         self.try_text = self._body("")
+        self.recording_note = self._small("")
         return self._stack([
             self._title("Try it"),
             self.try_text,
-            self._small("A small bar at the bottom of the screen shows the microphone and the time. Bluetooth "
-                        "headphones take two or three seconds to connect: start speaking when the bar says "
-                        "Recording. macOS asks for the microphone the first time."),
+            self.recording_note,
             self._small("Settings and Recordings are in the menu bar icon; this window is under More → Welcome."),
         ], spacing=12)
 
@@ -171,7 +193,8 @@ class WelcomeController(NSObject):
             self.panel.center()
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         self.panel.makeKeyAndOrderFront_(None)
-        self._watch_model()
+        self._watch_generation += 1
+        self._watch_model(self._watch_generation)
 
     @objc.python_method
     def show_step(self, step):
@@ -191,14 +214,17 @@ class WelcomeController(NSObject):
         config = self.delegate.config
         self.model_status.setStringValue_(self.delegate.transcriber.status_message() + ".")
         self.picker.refresh()
-        pastes = config.paste_to_active_app
-        self.copy_choice.setState_(int(not pastes))
-        self.paste_choice.setState_(int(pastes))
+        delivery = config.delivery()
+        # With copying turned off in Settings, neither choice is what happens now.
+        self.copy_choice.setState_(int(delivery is Delivery.COPIED))
+        self.paste_choice.setState_(int(delivery is Delivery.PASTED))
+        pastes = delivery is Delivery.PASTED
         permitted = self.delegate.paste_permitted()
         self.permission_row.setHidden_(not pastes)
         self.permission.setHidden_(permitted)
         self.permission_note.setStringValue_("Permission granted." if permitted else "Not granted yet.")
-        self.try_text.setStringValue_(try_it_text(self.delegate.current_shortcut().label, pastes))
+        self.try_text.setStringValue_(try_it_text(self.delegate.current_shortcut().label, config))
+        self.recording_note.setStringValue_(recording_note(config))
 
     @objc.python_method
     def _fit_window(self):
@@ -213,13 +239,13 @@ class WelcomeController(NSObject):
             NSMakeRect(current.origin.x, top - frame.size.height, frame.size.width, frame.size.height), True)
 
     @objc.python_method
-    def _watch_model(self):
+    def _watch_model(self, generation):
         # The first step says whether the speech model is still downloading.
-        if self.panel.isVisible():
+        if generation == self._watch_generation and self.panel.isVisible():
             self.model_status.setStringValue_(self.delegate.transcriber.status_message() + ".")
             if self.step == 2:
                 self.refresh()  # Accessibility may have been granted meanwhile.
-            call_later(STATUS_SECONDS, self._watch_model)
+            call_later(STATUS_SECONDS, self._watch_model, generation)
 
     # -- Actions --
 
@@ -235,7 +261,7 @@ class WelcomeController(NSObject):
             self.show_step(self.step + 1)
 
     def choosePaste_(self, sender):
-        self.delegate.set_paste_into_apps(sender is self.paste_choice)
+        self.delegate.choose_delivery(sender is self.paste_choice)
         self.refresh()
         self._fit_window()
 

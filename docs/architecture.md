@@ -58,10 +58,15 @@ src/parakeet_dictation/
                        Later / Skip This Version), and quitting into the installer once the app is idle. Step says where it is.
   update_window.py     UpdateProgressWindow: download progress, "ready", "Restarting Maramax…", and Cancel.
 
-  hotkeys.py           Shortcuts: shortcut_label() and shortcut_problem() (pure: names, and which combinations macOS
-                       or apps already use), the presets (DEFAULT_DICTATE is Option+Space), STOP (Cmd+R), and the
-                       GlobalHotKeyManager that registers them through Carbon (set_dictation_shortcut swaps safely).
-  shortcut_picker.py   ShortcutPicker: the presets, or keys the user presses; used by Settings and the welcome.
+  hotkeys.py           Shortcuts in Carbon's terms, the one module that asks Carbon about keys: shortcut_problem() and
+                       macos_problem() (pure: combinations that type or are app commands, and what macos_shortcuts()
+                       says macOS has turned on), shortcut_label() with layout_key_names() (keys named as the
+                       current layout types them, US names as fallback), command_key_code() (the key that gives a
+                       character with Command), the presets (DEFAULT_DICTATE is Option+Space), STOP (Cmd+R), and the
+                       GlobalHotKeyManager that registers them (set_dictation_shortcut swaps safely). Carbon cannot
+                       tell whether another app uses a shortcut: it registers it anyway.
+  shortcut_picker.py   ShortcutPicker: the presets, or keys the user presses in its window (recording ends when that
+                       window stops being key); used by Settings and the welcome.
   welcome.py           WelcomeController: the first launch's four steps (what it is, shortcut, copy or paste, try it).
   autopaste.py         PasteTarget (the last app used other than Maramax) and send_paste_keystroke().
   clipboard.py         copy_text() and contains_text() (fail-closed check before auto-paste).
@@ -170,7 +175,7 @@ The full window is a floating panel: above other apps' windows, below alerts and
 
 ## Auto-Paste
 
-Requires `paste_to_active_app`, a microphone transcript, and no cancel. Always copies first (even with the copy setting off), then on the main thread: Accessibility trust check (opens System Settings if missing), focus check, `contains_text()` clipboard check (fail closed), then `send_paste_keystroke()`. Both CGEvents are allocated before either is posted so a lone key-down can never be sent. The target is `PasteTarget.current()`, the last app activated other than Maramax, captured when a dictation starts. Known limit: the keystroke uses the physical V key, which is not Cmd+V on Dvorak-style layouts.
+Requires `paste_to_active_app`, a microphone transcript, and no cancel. Always copies first (even with the copy setting off), then on the main thread: Accessibility trust check (opens System Settings if missing), focus check, `contains_text()` clipboard check (fail closed), then `send_paste_keystroke()`. Both CGEvents are allocated before either is posted so a lone key-down can never be sent. The target is `PasteTarget.current()`, the last app activated other than Maramax, captured when a dictation starts. The keystroke goes to the key that gives V with Command on the current layout (`hotkeys.command_key_code`; on Dvorak the US V key would be Cmd+K), and no key doing so fails the paste. Cmd+R is registered the same way.
 
 With paste off, "Copy the transcript to the clipboard" is honoured on every path; nothing forces a copy.
 
@@ -208,9 +213,9 @@ Bluetooth headsets deliver 1.5–2.5 s of exact zeros after the stream opens whi
 
 ## Settings
 
-`AppConfig` persists `dictation_shortcut` ([key code, Carbon modifiers], refused back to Option+Space if a hand edit makes it unusable), `onboarded` (the welcome opens a second after launch until it has been seen once; closing it early counts), and: `auto_start_recording`, `auto_copy_to_clipboard`, `paste_to_active_app`, `live_preview`, `high_accuracy`, `history_limit`, `compact_dictation`, `prefer_builtin_mic`, `input_device`, `keep_mic_ready_seconds`, `use_corrections`, `replacements`, `check_for_updates`, `skipped_update_version`. Keys it does not recognize (written by a newer version) are carried through a save; so are unknown keys in recording metadata and history entries. A settings or history file that cannot be parsed is renamed to `*.corrupt` rather than overwritten.
+`AppConfig` persists `dictation_shortcut` ([key code, Carbon modifiers], refused back to Option+Space if a hand edit makes it unusable; one macOS has turned on for itself is kept and reported in the status line at launch), `onboarded` (the welcome opens a second after launch until it has been seen once; closing it early counts), and: `auto_start_recording`, `auto_copy_to_clipboard`, `paste_to_active_app`, `live_preview`, `high_accuracy`, `history_limit`, `compact_dictation`, `prefer_builtin_mic`, `input_device`, `keep_mic_ready_seconds`, `use_corrections`, `replacements`, `check_for_updates`, `skipped_update_version`. Keys it does not recognize (written by a newer version) are carried through a save; so are unknown keys in recording metadata and history entries. A settings or history file that cannot be parsed is renamed to `*.corrupt` rather than overwritten.
 
-`_SETTING_LABELS` in `app.py` names the checkboxes; the explanation under each is `_HELP` in `preferences.py`. The Settings window and the welcome talk to the controller through `current_shortcut`, `choose_shortcut`, `pause_shortcut`, `resume_shortcut` (the picker; the global shortcut is paused while new keys are recorded, and restored if the window closes), `set_paste_into_apps`, `paste_permitted`, `open_accessibility_settings`, `finish_welcome`, `toggle_setting`, `replace_word_rules`, `select_input_device`, `set_keep_microphone_ready`, `refresh_input_devices`, and `retry_speech_model`, and reads `config`, `is_busy`, `transcriber`, `qwen`, and `updates` (`status_text()`, `can_check()`, `check_requested()` for **Check Now**). The General tab opens with the app's name and version.
+`_SETTING_LABELS` in `app.py` names the checkboxes; the explanation under each is `_HELP` in `preferences.py`. The Settings window and the welcome talk to the controller through `current_shortcut`, `problem_with_shortcut`, `choose_shortcut`, `pause_shortcut`, `resume_shortcut` (the picker; the global shortcut is paused while new keys are recorded, and restored when the window closes or stops being key, or Settings changes tab), `choose_delivery` (the welcome: copy, or copy and paste), `paste_permitted`, `open_accessibility_settings`, `finish_welcome`, `toggle_setting`, `replace_word_rules`, `select_input_device`, `set_keep_microphone_ready`, `refresh_input_devices`, and `retry_speech_model`, and reads `config`, `is_busy`, `transcriber`, `qwen`, and `updates` (`status_text()`, `can_check()`, `check_requested()` for **Check Now**). The General tab opens with the app's name and version.
 
 `DictationApp._install_edit_menu()` gives the (invisible) main menu an Edit submenu. Without it a menu-bar app's text fields ignore Cmd+V/C/X/A/Z.
 

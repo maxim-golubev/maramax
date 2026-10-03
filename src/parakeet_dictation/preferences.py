@@ -92,7 +92,6 @@ class PreferencesController(NSObject):
         # A menu-bar app has no Dock icon to bring a hidden panel back with.
         self.panel.setHidesOnDeactivate_(False)
         self.panel.setDelegate_(self)
-        self.shortcut_picker = ShortcutPicker.alloc().initWithOwner_width_(delegate, CONTENT_WIDTH)
         root = self.panel.contentView()
 
         self.tabs = NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(0, 0, 330, 24))
@@ -200,8 +199,11 @@ class PreferencesController(NSObject):
     @objc.python_method
     def _general_page(self):
         sections = {title: [self._header(title)] + [self._option(name) for name in names] for title, names in _SECTIONS}
-        shortcut_row = self._stack([NSTextField.labelWithString_("Shortcut"), self.shortcut_picker.view],
-                                   horizontal=True, spacing=ROW_GAP)
+        shortcut_label = NSTextField.labelWithString_("Shortcut")
+        # The picker's notes wrap within what the label leaves of the row.
+        self.shortcut_picker = ShortcutPicker.alloc().initWithOwner_width_onResize_(
+            self.delegate, CONTENT_WIDTH - shortcut_label.fittingSize().width - ROW_GAP, self._fit_window_to_page)
+        shortcut_row = self._stack([shortcut_label, self.shortcut_picker.view], horizontal=True, spacing=ROW_GAP)
         sections[_DICTATION].insert(1, shortcut_row)
         self.model_status = self._help("")
         self.model_retry = self._button("Retry", "retryModel:")
@@ -369,6 +371,8 @@ class PreferencesController(NSObject):
 
     def selectTab_(self, sender):
         index = self.tabs.selectedSegment()
+        if index != 0:
+            self.shortcut_picker.stop_recording()  # Keys typed on another tab are typing, not a shortcut.
         for page_index, page in enumerate(self.pages):
             page.setHidden_(page_index != index)
         self._fit_window_to_page()

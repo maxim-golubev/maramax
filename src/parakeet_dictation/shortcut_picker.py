@@ -4,45 +4,62 @@ from __future__ import annotations
 
 import objc
 from AppKit import (
-    NSColor, NSEvent, NSEventMaskKeyDown, NSFont, NSMakeRect, NSMenuItem, NSPopUpButton, NSStackView,
-    NSTextField, NSUserInterfaceLayoutOrientationVertical, NSLayoutAttributeLeading,
+    NSAccessibilityAnnouncementKey, NSAccessibilityAnnouncementRequestedNotification, NSAccessibilityPriorityHigh,
+    NSAccessibilityPriorityKey, NSAccessibilityPostNotificationWithUserInfo, NSColor, NSEvent, NSEventMaskKeyDown,
+    NSFont, NSMakeRect, NSMenuItem, NSPopUpButton, NSStackView, NSTextField,
+    NSUserInterfaceLayoutOrientationVertical, NSLayoutAttributeLeading, NSWindowDidResignKeyNotification,
 )
-from Foundation import NSObject
+from Foundation import NSNotificationCenter, NSObject
 
-from .hotkeys import DICTATE_PRESETS, carbon_modifiers, shortcut_problem
+from .hotkeys import DICTATE_PRESETS, carbon_modifiers
 
 OTHER = "Other shortcut…"
+# Carbon cannot tell when another app already uses a shortcut, so the user is told how to notice.
+HINT = "If pressing it opens something else, another app uses it: choose another."
 _ESCAPE = 0x35
 
 
 class ShortcutPicker(NSObject):
-    """`owner` provides current_shortcut(), choose_shortcut(key_code,
-    modifiers) -> problem or None, pause_shortcut(), and resume_shortcut().
-    While keys are being recorded the global shortcut is paused, so pressing
-    the current one is seen here rather than starting a dictation."""
+    """`owner` provides current_shortcut(), problem_with_shortcut(key_code,
+    modifiers) -> problem or None, choose_shortcut(key_code, modifiers) ->
+    problem or None, pause_shortcut(), and resume_shortcut(). While keys are
+    being recorded the global shortcut is paused, so pressing the current one
+    is seen here rather than starting a dictation. Recording ends when its
+    window stops being the key window, so at most one picker records and the
+    shortcut is never left paused. `on_resize` is called when the note under
+    the popup appears, changes, or goes, so the window can fit it."""
 
-    def initWithOwner_width_(self, owner, width):
+    def initWithOwner_width_onResize_(self, owner, width, on_resize):
         self = objc.super(ShortcutPicker, self).init()
         if self is None:
             return None
         self.owner = owner
+        self._on_resize = on_resize
         self._monitor = None
+        self._resign_observer = None
         self._choices = []
         self.popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 100, 25), False)
         self.popup.setTarget_(self)
         self.popup.setAction_("chooseItem:")
+        self.popup.setAccessibilityLabel_("Dictation shortcut")
         self.popup.widthAnchor().constraintEqualToConstant_(260).setActive_(True)
-        self.note = NSTextField.wrappingLabelWithString_("")
-        self.note.setFont_(NSFont.systemFontOfSize_(11))
-        self.note.setTextColor_(NSColor.secondaryLabelColor())
-        self.note.setPreferredMaxLayoutWidth_(width)
+        self.note = self._small_text("", width)
         self.note.setHidden_(True)
-        self.view = NSStackView.stackViewWithViews_([self.popup, self.note])
+        self.view = NSStackView.stackViewWithViews_([self.popup, self.note, self._small_text(HINT, width)])
         self.view.setOrientation_(NSUserInterfaceLayoutOrientationVertical)
         self.view.setAlignment_(NSLayoutAttributeLeading)
         self.view.setSpacing_(4)
         self.refresh()
         return self
+
+    @objc.python_method
+    def _small_text(self, text, width):
+        label = NSTextField.wrappingLabelWithString_(text)
+        label.setFont_(NSFont.systemFontOfSize_(11))
+        label.setTextColor_(NSColor.secondaryLabelColor())
+        label.setSelectable_(False)
+        label.setPreferredMaxLayoutWidth_(width)
+        return label
 
     @objc.python_method
     def refresh(self):
@@ -76,15 +93,20 @@ class ShortcutPicker(NSObject):
     def start_recording(self):
         if self._monitor is not None:
             return
+        window = self.view.window()
         self.owner.pause_shortcut()
         self.popup.setEnabled_(False)
         self._say("Press the keys you want, or Esc to cancel.")
 
         def key_down(event):
+            if event.window() != window:
+                return event  # Typing in another window stays typing.
             self.key_pressed(int(event.keyCode()), int(event.modifierFlags()))
             return None  # Swallowed: the keys are a choice, not typing.
 
         self._monitor = NSEvent.addLocalMonitorForEventsMatchingMask_handler_(NSEventMaskKeyDown, key_down)
+        self._resign_observer = NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
+            NSWindowDidResignKeyNotification, window, None, lambda _notification: self.stop_recording())
 
     @objc.python_method
     def key_pressed(self, key_code, event_flags):
@@ -92,7 +114,7 @@ class ShortcutPicker(NSObject):
             self.stop_recording()
             return
         modifiers = carbon_modifiers(event_flags)
-        problem = shortcut_problem(key_code, modifiers)
+        problem = self.owner.problem_with_shortcut(key_code, modifiers)
         if problem is not None:
             self._say(f"{problem} Try another, or press Esc.")
             return
@@ -101,7 +123,7 @@ class ShortcutPicker(NSObject):
 
     @objc.python_method
     def stop_recording(self):
-        """Leave recording without a choice (Esc, or the window closing)."""
+        """Leave recording without a choice (Esc, another tab or window, or the window closing)."""
         if self._monitor is None:
             return
         self._end_monitor()
@@ -113,6 +135,8 @@ class ShortcutPicker(NSObject):
     def _end_monitor(self):
         NSEvent.removeMonitor_(self._monitor)
         self._monitor = None
+        NSNotificationCenter.defaultCenter().removeObserver_(self._resign_observer)
+        self._resign_observer = None
         self.popup.setEnabled_(True)
 
     @objc.python_method
@@ -125,3 +149,9 @@ class ShortcutPicker(NSObject):
     def _say(self, text):
         self.note.setStringValue_(text or "")
         self.note.setHidden_(not text)
+        if text:
+            # The note is the only sign that keys are being captured or were refused.
+            NSAccessibilityPostNotificationWithUserInfo(
+                self.note, NSAccessibilityAnnouncementRequestedNotification,
+                {NSAccessibilityAnnouncementKey: text, NSAccessibilityPriorityKey: NSAccessibilityPriorityHigh})
+        self._on_resize()

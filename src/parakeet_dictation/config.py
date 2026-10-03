@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import enum
 import json
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -12,6 +13,13 @@ from .hotkeys import DEFAULT_DICTATE, shortcut_problem
 
 # How long the microphone may stay connected after a dictation.
 MAX_KEEP_MIC_READY_SECONDS = 600
+
+
+class Delivery(enum.Enum):
+    """Where a dictation's transcript goes once it is ready, besides History."""
+    KEPT = "kept"        # Nowhere else: the user copies it from Maramax.
+    COPIED = "copied"
+    PASTED = "pasted"    # Copied, then pasted into the app the user was in.
 
 
 @dataclass
@@ -92,6 +100,12 @@ class AppConfig:
                 if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                     setattr(config, name, value)
         return config
+
+    def delivery(self) -> Delivery:
+        """Pasting copies first, whatever the copy setting says."""
+        if self.paste_to_active_app:
+            return Delivery.PASTED
+        return Delivery.COPIED if self.auto_copy_to_clipboard else Delivery.KEPT
 
     def save(self, path: Path) -> None:
         payload = dict(self.unrecognized) | {name: getattr(self, name) for name in _PERSISTED_FIELDS}

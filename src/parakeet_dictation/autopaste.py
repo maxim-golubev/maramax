@@ -13,9 +13,10 @@ from AppKit import (
 )
 from Foundation import NSOperationQueue
 
+from .hotkeys import command_key_code
+
 kCGHIDEventTap = 0
 kCGEventFlagMaskCommand = 1 << 20
-kVK_ANSI_V = 9
 
 
 class PasteError(RuntimeError):
@@ -54,13 +55,18 @@ def accessibility_trusted() -> bool:
 
 
 def send_paste_keystroke() -> None:
-    """Post a synthetic Cmd+V to the frontmost application."""
+    """Post a synthetic Cmd+V to the frontmost application, on the key that
+    gives V with Command on the current layout (on Dvorak the US V key would
+    be Cmd+K, a different command)."""
+    key_code = command_key_code("v")
+    if key_code is None:
+        raise PasteError("No key gives Cmd+V on the current keyboard layout")
     events = []
     try:
         # Allocate both events before posting either: allocation failure for
         # key-up must not leave a lone key-down in the destination app.
         for key_down in (True, False):
-            event = _core_graphics.CGEventCreateKeyboardEvent(None, kVK_ANSI_V, key_down)
+            event = _core_graphics.CGEventCreateKeyboardEvent(None, key_code, key_down)
             if not event:
                 raise PasteError("Could not create keyboard event")
             events.append(event)
