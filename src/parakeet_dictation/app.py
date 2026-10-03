@@ -63,6 +63,26 @@ _DELIVERY_TEXT = {
 
 
 
+class MenuLine(rumps.MenuItem):
+    """A menu item whose text changes while the menu may be open. macOS
+    widens an open menu for a longer title but narrows it again only when an
+    item leaves it (measured: 434 pt stays 434 pt after a retitle, and becomes
+    152 pt after a hide and show), so the item is hidden for the instant its
+    title changes and the open menu fits its lines again."""
+
+    @property
+    def title(self) -> str:
+        return rumps.MenuItem.title.fget(self)
+
+    @title.setter
+    def title(self, text: str) -> None:
+        if text == self.title:
+            return
+        self._menuitem.setHidden_(True)
+        rumps.MenuItem.title.fset(self, text)
+        self._menuitem.setHidden_(False)
+
+
 def unregistered_status(shortcut: str) -> str:
     return f"Maramax could not register {shortcut} — choose another shortcut in Settings"
 
@@ -198,9 +218,9 @@ class DictationApp(rumps.App):
         self._preferences_window: PreferencesController | None = None
         self._welcome_window: WelcomeController | None = None
 
-        self.status_item = rumps.MenuItem(f"Status: {self._resting_status}")
-        self.record_menu = rumps.MenuItem("Start Dictation")
-        update_item = rumps.MenuItem(CHECK_TITLE)
+        self.status_item = MenuLine(f"Status: {self._resting_status}")
+        self.record_menu = MenuLine("Start Dictation")
+        update_item = MenuLine(CHECK_TITLE)
         self.menu = [
             self.record_menu,
             rumps.MenuItem("Open Transcript"),

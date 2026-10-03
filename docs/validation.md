@@ -675,3 +675,18 @@ tests pass.
   `updates/previous`. The keychain search list was left as it was.
 - Releases from here are batched and used locally before they are offered;
   0.7.0, 0.8.0, and 0.8.1 went out within four hours of each other.
+
+### 0.8.1 republished with the menu's width
+
+Opened while the speech model loads, the menu was as wide as "Status:
+Preparing the speech model — the first launch downloads it" and stayed that
+wide after the status became "Ready", until it was closed and opened again.
+Measured on screen with a real open menu: a title change leaves it at 434 pt;
+hiding and showing the item in the same instant brings it to 152 pt. `MenuLine`
+does that for the status, Start/Stop Dictation, and the update line (434 pt to
+152 pt through the app's own class). 477 tests pass.
+
+The first 0.8.1 had been downloaded by this Mac alone (the repository has no
+other users yet), so its release and tag were replaced rather than a fourth
+version published in one day; a version that others may have is never
+replaced.

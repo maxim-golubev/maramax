@@ -548,3 +548,28 @@ def test_an_update_waits_for_an_outcome_on_the_bar_and_for_audio_being_saved(mon
     saving[0] = False
     app._phase = Phase.RECORDING
     assert app._is_in_use()
+
+
+def test_a_menu_line_leaves_the_menu_for_the_instant_its_text_changes():
+    """An open menu narrows only when an item leaves it: without this, a long
+    status left the menu wide after it changed to "Ready"."""
+    line = module.MenuLine("Status: Preparing the speech model — the first launch downloads it")
+    real, calls = line._menuitem, []
+
+    class Watched:
+        def title(self):
+            return real.title()
+
+        def setTitle_(self, text):
+            calls.append(("title", str(text)))
+            real.setTitle_(text)
+
+        def setHidden_(self, hidden):
+            calls.append(("hidden", bool(hidden)))
+            real.setHidden_(hidden)
+    line._menuitem = Watched()
+    line.title = "Status: Ready"
+    assert calls == [("hidden", True), ("title", "Status: Ready"), ("hidden", False)]
+    assert str(real.title()) == "Status: Ready" and not real.isHidden()
+    line.title = "Status: Ready"                 # Nothing changed: the menu is left alone.
+    assert len(calls) == 3
