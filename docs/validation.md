@@ -664,3 +664,14 @@ Checked and consistent: the transcript window, the dictation bar, Recordings,
 the Software Update window's edges, and Dark mode throughout. Tests now hold
 each of these alignments, the column titles by measuring drawn pixels. 476
 tests pass.
+
+### Live results
+
+- **0.8.0 → 0.8.1 through 0.8.0's own Software Update window**, its first use
+  on screen: offered at 22:30:46, a minute after launch; downloaded and
+  verified at 22:31:01, the user's click included (the 1.1 MB delta); idle
+  twice and quit at 22:31:05; 0.8.1 running at 22:31:08 with Option+Space
+  registered, reporting "Updated to Maramax 0.8.1", 0.8.0 kept in
+  `updates/previous`. The keychain search list was left as it was.
+- Releases from here are batched and used locally before they are offered;
+  0.7.0, 0.8.0, and 0.8.1 went out within four hours of each other.
