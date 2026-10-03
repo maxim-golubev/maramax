@@ -116,6 +116,8 @@ fi
 # ── Verify the bundle contains critical files ──
 for check_path in \
   "$BUNDLE_RESOURCES/assets/menu_icon.png" \
+  "$BUNDLE_RESOURCES/Maramax.icns" \
+  "$BUNDLE_RESOURCES/Assets.car" \
   "$BUNDLE_SITE_PACKAGES/parakeet_dictation/__init__.py" \
   "$MLX_PACKAGE_DEST/_reprlib_fix.py" \
   "$MLX_PACKAGE_DEST/core.cpython-312-darwin.so"; do

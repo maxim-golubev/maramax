@@ -81,6 +81,10 @@ packaging/
                        existing tag.
   create_signing_identity.sh  One-time: the release certificate, in its own keychain under ~/.maramax-signing.
   signing.sh           Where that keychain lives; sourced by build_app.sh and create_signing_identity.sh.
+  Maramax.icon         The app icon as an Icon Composer document (the menu bar M, white on a graphite tile).
+  app_icon.py          Renders it, with Xcode 26's actool and ictool, into Assets.car (macOS 26: Liquid Glass in every
+                       appearance), Maramax.icns (earlier macOS, up to 1024 px), and the README's icon-light/dark.png.
+                       The build only copies these committed outputs.
 
 docs/
   LAUNCH.md            Copied into each release as START HERE.md.

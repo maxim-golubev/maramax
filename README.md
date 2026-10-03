@@ -1,9 +1,14 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/icon-dark.png">
+  <img alt="The Maramax icon: a white M on a graphite tile" src="docs/images/icon-light.png" width="96">
+</picture>
+
 # Maramax
 
 On-device dictation for Apple Silicon Macs. Press **Option+Space** (or a
-shortcut you choose), speak, press it again: NVIDIA's Parakeet model transcribes on the GPU through MLX, and the
-text is copied, or pasted into the app you were using. No audio or text leaves
-the Mac.
+shortcut you choose), speak, press it again: NVIDIA's Parakeet model
+transcribes on the GPU through MLX, and the text is copied, or pasted into the
+app you were using. No audio or text leaves the Mac.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/dictation-dark.gif">
@@ -52,7 +57,7 @@ measured off-screen, and the update swap script runs against temporary folders.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/how-it-works-dark.svg">
-  <img alt="Option+Space reaches Maramax, which asks an audio helper process (it owns the microphone) to record and stop and receives the audio over a pipe; the audio is archived as a WAV first, then recognized from memory by Parakeet TDT 0.6B v2 on the GPU, word replacements are applied, and the text goes to the clipboard or is pasted" src="docs/images/how-it-works-light.svg" width="980">
+  <img alt="Your shortcut reaches Maramax, which asks an audio helper process (it owns the microphone) to record and stop and receives the audio over a pipe; the audio is archived as a WAV first, then recognized from memory by Parakeet TDT 0.6B v2 on the GPU, word replacements are applied, and the text goes to the clipboard or is pasted" src="docs/images/how-it-works-light.svg" width="980">
 </picture>
 
 ## Install

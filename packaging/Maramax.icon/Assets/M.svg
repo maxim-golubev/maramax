@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- The menu bar M (assets/menu_icon.png): the polyline 225,727 364,297 512,577 660,297 799,727 with round caps
+       and joins, 74 units wide. Drawn as filled capsules because Icon Composer fills an open path. -->
+  <path fill="#FFFFFF" fill-rule="nonzero" d="M260.21,738.38 L399.21,308.38 A37,37 0 0 0 328.79,285.62 L189.79,715.62 A37,37 0 0 0 260.21,738.38 Z M331.29,314.29 L479.29,594.29 A37,37 0 0 0 544.71,559.71 L396.71,279.71 A37,37 0 0 0 331.29,314.29 Z M544.71,594.29 L692.71,314.29 A37,37 0 0 0 627.29,279.71 L479.29,559.71 A37,37 0 0 0 544.71,594.29 Z M624.79,308.38 L763.79,738.38 A37,37 0 0 0 834.21,715.62 L695.21,285.62 A37,37 0 0 0 624.79,308.38 Z"/>
+</svg>

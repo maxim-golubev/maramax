@@ -53,11 +53,15 @@ OPTIONS = {
         "scipy",
         "charset_normalizer",
     ],
-    "resources": [str(ROOT / "assets"), str(ROOT / "LICENSE"), str(ROOT / "docs" / "LAUNCH.md")],
+    # The icon files come from packaging/app_icon.py: Assets.car for macOS 26 (Liquid Glass), the .icns before it.
+    "iconfile": str(ROOT / "packaging" / "Maramax.icns"),
+    "resources": [str(ROOT / "assets"), str(ROOT / "packaging" / "Assets.car"), str(ROOT / "LICENSE"),
+                  str(ROOT / "docs" / "LAUNCH.md")],
     "plist": {
         "CFBundleName": APP_NAME,
         "CFBundleDisplayName": APP_NAME,
         "CFBundleIdentifier": "com.maramax.dictation",
+        "CFBundleIconName": "Maramax",
         "CFBundleShortVersionString": VERSION,
         "CFBundleVersion": VERSION,
         "LSUIElement": True,

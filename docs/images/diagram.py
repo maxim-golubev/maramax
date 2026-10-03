@@ -37,7 +37,7 @@ def diagram(c):
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" font-family="{FONT}">',
         f'<defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">'
         f'<path d="M 0 0 L 10 5 L 0 10 z" fill="{c["arrow"]}"/></marker></defs>',
-        box(c, 10, top, 130, [("Option+Space", False)]),
+        box(c, 10, top, 130, [("Your shortcut", False)]),
         box(c, 190, top, 130, [("Maramax", False)], accent=True),
         box(c, 430, top, 210, [("Parakeet TDT 0.6B v2", False), ("MLX, on the GPU", True)]),
         box(c, 680, top, 150, [("Word replacements", False)]),
