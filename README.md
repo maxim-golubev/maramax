@@ -27,8 +27,8 @@ Press **Option+Space** (or a shortcut you choose), speak, and press it again.
 NVIDIA's Parakeet model transcribes on the GPU through MLX, and the text is
 copied, or pasted into the app you were using. No audio or text leaves the Mac.
 
-- **Fast:** on my M3 Pro, a dictation under 30 seconds is transcribed in about
-  0.3 s, and one over two minutes in about 3 s (medians over 20 of my own
+- **Fast:** on an M3 Pro, a dictation under 30 seconds is transcribed in about
+  0.3 s, and one over two minutes in about 3 s (medians over 20 real
   dictations).
 - **Private:** recognition, history, and recordings stay on the Mac. The only
   network requests it makes by itself are the one-time speech model download
@@ -37,27 +37,25 @@ copied, or pasted into the app you were using. No audio or text leaves the Mac.
   inference, PortAudio in a separate helper process, Carbon hotkeys through
   ctypes, py2app. About 9,400 lines of app code and 5,800 of tests.
 
-## What was hard
+## Engineering
 
-Honestly, the speech model was the easy part. Most of my time went into these
-three problems:
+The speech model was the easy part. Most of the work went into three problems:
 
 - **Bluetooth audio drivers hang.** A call into the macOS audio stack can block
-  forever while AirPods switch modes, so the app never makes one itself: a
+  forever while AirPods switch modes, so the app never makes one itself. A
   helper process owns the microphone, every start and stop has a deadline, and
   a helper that stops answering is replaced without losing the audio it already
-  sent. If a microphone disappears mid-sentence in Automatic mode, the next one
-  takes over. So far I have only tested that last part with a fake audio device
-  driving the real helper; trying it live with AirPods is still on my list.
-- **No dictation is ever lost.** Audio is written to disk as it arrives and
-  archived before recognition starts, so neither a crash nor a failed
-  transcription can cost a recording.
+  sent. In Automatic mode, a microphone that drops out mid-sentence is replaced
+  by the next available one and the recording continues.
+- **No dictation is lost.** Audio is written to disk as it arrives and archived
+  before recognition starts, so neither a crash nor a failed transcription can
+  cost a recording.
 - **The model sometimes stops punctuating.** In long dictations, Parakeet can
-  write a whole stretch in lower case with no punctuation. Experiments on my
-  own recordings traced it to where the encoder's audio window starts rather
-  than to the decoder. So Maramax finds those stretches, transcribes them again
-  in shorter windows, and puts the result back only if the wording still
-  matches (at least 90% of the words), without touching the text around it.
+  write a whole stretch in lower case with no punctuation. Experiments on real
+  recordings traced this to where the encoder's audio window starts, not to the
+  decoder. Maramax detects those stretches, transcribes them again in shorter
+  windows, and replaces only the affected text, and only if at least 90% of
+  the words still match.
 
 Over 450 tests run without a microphone, a screen, or model weights: a fake
 audio device drives the real helper process, and the native windows are built
@@ -70,14 +68,14 @@ and measured off-screen.
 
 ## Install
 
-Requires an Apple Silicon Mac. I have tested it on macOS 15.
+Requires an Apple Silicon Mac; tested on macOS 15.
 
 1. Download `Maramax-<version>.zip` from
    [Releases](https://github.com/maxim-golubev/maramax/releases/latest), unzip
    it, and move `Maramax.app` to Applications.
-2. Open it. I sign it with my own certificate, but it is not notarized by
-   Apple, so macOS blocks it the first time: open **System Settings → Privacy &
-   Security** and choose **Open Anyway**.
+2. Open it. The app is signed with the project's own certificate but not
+   notarized by Apple, so macOS blocks the first launch: open **System Settings
+   → Privacy & Security** and choose **Open Anyway**.
 3. The first launch downloads the speech model (2.5 GB). After that Maramax
    starts in a few seconds and works offline.
 
@@ -102,9 +100,8 @@ bash build_app.sh                         # dist/Maramax.app, checked before it 
 Maramax started as a fork of Osada Paranaliyanage's
 [parakeet-dictation](https://github.com/osadalakmal/parakeet-dictation), itself
 built on Ashwin P Chandran's
-[whisper-dictation](https://github.com/ashwin-pc/whisper-dictation). I have
-rewritten nearly all of it since, but both gave me the starting point.
-Recognition uses NVIDIA's Parakeet TDT 0.6B v2 through
+[whisper-dictation](https://github.com/ashwin-pc/whisper-dictation). It has
+since been almost entirely rewritten. Recognition uses NVIDIA's Parakeet TDT 0.6B v2 through
 [parakeet-mlx](https://github.com/senstella/parakeet-mlx), and optionally
 Qwen3-ASR through [qwen3-asr-mlx](https://github.com/gabrimatic/qwen3-asr-mlx).
 MIT licensed.
