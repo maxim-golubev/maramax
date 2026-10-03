@@ -8,6 +8,7 @@ from parakeet_dictation import app as module
 from parakeet_dictation.app import Phase
 from parakeet_dictation.capture import CaptureMeter
 from parakeet_dictation.config import AppConfig
+from parakeet_dictation.file_queue import TranscriptionQueue
 from parakeet_dictation.recordings import RecordingStore
 
 
@@ -33,6 +34,7 @@ def controller(monkeypatch):
     app._cancel_event = threading.Event()
     app._queue_cancel_event = threading.Event()
     app._recordings_window = None
+    app._preferences_window = None
     app._previous_app = None
     app._capture_health = None
     app._capture_device = ""
@@ -45,10 +47,12 @@ def controller(monkeypatch):
     app.overlay_controller = SimpleNamespace(
         prepare_for_recording=lambda: None,
         show_mode=lambda _mode: calls.append("activated window"),
+        focus=lambda: calls.append("focused"),
         show_active_microphone=lambda _name: None,
         set_capture=lambda _snapshot: None,
         set_transcribing=lambda _on: None,
         set_queue_processing=lambda _on: None,
+        set_queue_files=lambda _files: None,
         hide=lambda: calls.append("window hidden"),
     )
     app._dictate = module.dictation_shortcut(0x31, 1 << 11)
@@ -457,3 +461,70 @@ def test_recovery_marks_a_recording_it_tried_so_the_next_press_moves_on(monkeypa
     app.transcribe_recording = chosen.append
     app.recover_last_recording()
     assert chosen == [older.id]
+
+
+def test_the_shortcut_dictates_from_an_open_idle_window(monkeypatch):
+    app, calls = controller(monkeypatch)
+    app.overlay_visible = True
+    app.dictation_hotkey_pressed()
+    app._start_thread.join(timeout=2)
+    assert app._phase is Phase.CONNECTING and not app._compact_session  # In the window, with live preview.
+    assert "activated window" in calls and "focused" not in calls
+    app._phase = Phase.TRANSCRIBING
+    app.dictation_hotkey_pressed()
+    assert calls[-1] == "focused"            # Busy: it only brings the window forward.
+    app._phase = Phase.IDLE
+    app.config.auto_start_recording = False
+    app.dictation_hotkey_pressed()
+    assert calls[-1] == "focused" and app._phase is Phase.IDLE   # Set to start from the window.
+
+
+def test_the_window_intro_says_what_the_shortcut_does(monkeypatch):
+    assert module.intro_text("Option+Space", True).startswith("Press Option+Space to dictate. Press it again")
+    opens = module.intro_text("Option+Space", False)
+    assert opens.startswith("Press Cmd+R or Dictate to start") and "Option+Space brings this window back" in opens
+    app, _ = controller(monkeypatch)
+    shown = []
+    app.overlay_controller.set_intro_text = shown.append
+    app._save_settings = lambda: True
+    app.toggle_setting("auto_start_recording")
+    assert shown == [module.intro_text("Option+Space", False)]
+
+
+def test_cancelling_while_the_microphone_connects_closes_the_window(monkeypatch):
+    app, calls = controller(monkeypatch)
+    app.overlay_visible = True
+    app._phase = Phase.CONNECTING
+    app.dismiss_requested()                  # Esc or Close while "Connecting microphone…".
+    monkeypatch.setattr(module.threading, "Thread", lambda **kwargs: SimpleNamespace(start=lambda: None))
+    app._recording_started(False, 0)
+    assert "window hidden" in calls and not app.overlay_visible
+    assert "Connection cancelled" in calls and not app._hide_window_when_done
+
+
+def test_settings_and_recordings_are_told_when_the_app_becomes_busy_or_idle(monkeypatch):
+    app, calls = controller(monkeypatch)
+    app._preferences_window = SimpleNamespace(show_busy_state=lambda: calls.append(("settings", app.is_busy)),
+                                              shows_microphones=lambda: False)
+    app._recordings_window = SimpleNamespace(show_busy_state=lambda: calls.append(("recordings", app.is_busy)),
+                                             stop_playback=lambda: None, refresh=lambda: None)
+    app.start_recording()
+    app._start_thread.join(timeout=2)
+    app._recording_started(True, app._session)
+    app._complete_operation_on_main(app._session)
+    told = [call for call in calls if isinstance(call, tuple) and call[0] in ("settings", "recordings")]
+    assert told == [("settings", True), ("recordings", True), ("settings", False), ("recordings", False)]
+
+
+def test_files_added_during_a_recording_wait_in_the_queue(monkeypatch):
+    app, calls = controller(monkeypatch)
+    app.queue = TranscriptionQueue()
+    app.current_transcript = ""
+    app._phase = Phase.RECORDING
+    app.queue_add_files(["/x/a.m4a", "/x/b.m4a"])
+    assert len(app.queue.items()) == 2 and "activated window" not in calls  # Stop and the draft stay in view.
+    app.menu_open_files(None)
+    assert calls[-1] == "Finish the current operation first"              # Before the file panel, not after it.
+    app._phase = Phase.IDLE
+    app.queue_add_files(["/x/c.m4a"])
+    assert calls[-1] == "activated window"

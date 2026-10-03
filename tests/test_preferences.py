@@ -42,6 +42,16 @@ panel.saveRule_(None)
 assert AppConfig.load(path).replacements == [{"heard": "mara macs", "replacement": "Maramax"}]
 panel.removeRule_(None)
 assert not AppConfig.load(path).replacements
+# Return in either field saves; Tab to the next field does not.
+panel.heard.setStringValue_("mara max")
+panel.replacement.setStringValue_("Maramax")
+panel.panel.makeFirstResponder_(panel.heard)
+panel.panel.fieldEditor_forObject_(True, panel.heard).insertTab_(None)
+assert not AppConfig.load(path).replacements
+panel.panel.fieldEditor_forObject_(True, panel.replacement).insertNewline_(None)
+assert AppConfig.load(path).replacements == [{"heard": "mara max", "replacement": "Maramax"}]
+panel.removeRule_(None)
+assert not AppConfig.load(path).replacements
 from parakeet_dictation.helper_protocol import InputDevice
 calls = []
 delegate.refresh_input_devices = lambda: calls.append("refresh")
@@ -63,6 +73,12 @@ panel.update_input_devices([InputDevice(0, "MacBook Pro Microphone", True)], Non
 assert panel.device_picker.titleOfSelectedItem() == "Automatic — MacBook Pro Microphone"
 panel.selectDevice_(None)
 assert calls[-1] is None
+delegate.is_busy = True
+panel.show_busy_state()                  # Told when a dictation starts, not only on a refresh.
+assert not panel.device_picker.isEnabled()
+delegate.is_busy = False
+panel.show_busy_state()
+assert panel.device_picker.isEnabled()
 delegate.set_keep_microphone_ready = lambda seconds: calls.append(seconds) or setattr(config, "keep_mic_ready_seconds", seconds)
 assert panel.keep_ready.titleOfSelectedItem() == "Off"
 panel.keep_ready.selectItemWithTitle_("2 minutes")
@@ -99,6 +115,10 @@ def labels(view):
     return found + [text for child in view.subviews() for text in labels(child)]
 general = labels(panel.pages[0])
 assert general[:2] == ["Maramax", f"Version {__version__}"], general[:3]
+# Automatic prefers the Mac's own microphone by default, and macOS shows no
+# Accessibility prompt of its own: the help says what really happens.
+assert any(text.startswith("Automatic uses the Mac’s own microphone") for text in labels(panel.pages[1]))
+assert any("turn Maramax on there" in text for text in general)
 assert str(panel.update_status.stringValue()) == "This is the newest version." and panel.update_check.isEnabled()
 checks = []
 delegate.updates = SimpleNamespace(status_text=lambda: "Checking for updates…", can_check=lambda: False,

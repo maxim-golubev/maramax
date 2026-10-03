@@ -52,8 +52,13 @@ _PASTE_LABEL = _SETTING_LABELS["paste_to_active_app"]
 
 
 
-def intro_text(shortcut: str) -> str:
-    return (f"Press {shortcut} to dictate. Press it again, or {STOP.label}, to finish.\n\n"
+def intro_text(shortcut: str, shortcut_starts: bool) -> str:
+    """`shortcut_starts`: the shortcut starts a dictation (auto_start_recording);
+    otherwise it brings up this window, where Cmd+R or Dictate starts one."""
+    start = (f"Press {shortcut} to dictate. Press it again, or {STOP.label}, to finish." if shortcut_starts else
+             f"Press {STOP.label} or Dictate to start, and again to finish. {shortcut} brings this window "
+             "back from any app.")
+    return (f"{start}\n\n"
             f"Your transcript is copied automatically. Turn on “{_PASTE_LABEL}” in Settings "
             "for direct insertion. Saved audio and retries are in Recordings.")
 
@@ -200,7 +205,7 @@ class DictationApp(rumps.App):
         self.indicator = DictationIndicator.alloc().initWithDelegate_(self)
         self.overlay_controller.set_status(self._resting_status)
         self.overlay_controller.set_history_text(self._history_text())
-        self.overlay_controller.set_intro_text(intro_text(self._dictate.label))
+        self._show_intro_text()
 
         self.updates = UpdateOffer(
             menu_item=update_item, current_version=__version__, installed_app=app_bundle(),
@@ -231,11 +236,24 @@ class DictationApp(rumps.App):
     def is_busy(self) -> bool:
         return self._phase is not Phase.IDLE
 
+    def _set_phase(self, phase: Phase) -> None:
+        """The one place the phase changes. Settings and Recordings disable
+        what cannot be used while busy, so they are told when that flips."""
+        was_busy = self.is_busy
+        self._phase = phase
+        if self.is_busy == was_busy:
+            return
+        if self._preferences_window is not None:
+            self._preferences_window.show_busy_state()
+        if self._recordings_window is not None:
+            self._recordings_window.show_busy_state()
+        self.refresh_input_devices()  # Not listed while busy; listed again once idle.
+
     def _begin_transcribing(self) -> int:
         """Take ownership of the display for a new non-microphone operation."""
         self._hide_window_when_done = False
         self.current_transcript = ""
-        self._phase = Phase.TRANSCRIBING
+        self._set_phase(Phase.TRANSCRIBING)
         self._cancel_event.clear()
         self._session += 1
         self.overlay_visible = True
@@ -333,7 +351,8 @@ class DictationApp(rumps.App):
         if self.recording_active:
             # The hotkey is a toggle: press again to finish dictating.
             self.stop_recording_requested(hide_after=True)
-        elif self.overlay_visible:
+        elif self.overlay_visible and (self.is_transcribing or not self.config.auto_start_recording):
+            # Busy, or set to start from the window: bring the window forward.
             self.overlay_controller.focus()
         elif self.config.auto_start_recording:
             self.start_recording()
@@ -432,7 +451,7 @@ class DictationApp(rumps.App):
         self._capture_at_stop = None
         self._stop_when_connected = False
         self._compact_session = self.config.compact_dictation and not self.overlay_visible
-        self._phase = Phase.CONNECTING
+        self._set_phase(Phase.CONNECTING)
         session = self._session
         # The microphone opens first: every millisecond of window drawing
         # ahead of it is speech that would not be captured. The cancel
@@ -474,8 +493,12 @@ class DictationApp(rumps.App):
         if session != self._session or self._shutting_down:
             return
         if not started:
-            self._phase = Phase.IDLE
+            self._set_phase(Phase.IDLE)
             self._set_recording_shortcut(False)
+            if self._stop_when_connected and self._hide_window_when_done:
+                # Esc, Close, or the shortcut cancelled the connection: that
+                # closes the window too. A failure keeps it, to be read.
+                self._hide_window()
             self._hide_window_when_done = False
             # "Connecting microphone…" must not come back when this message
             # times out.
@@ -488,7 +511,7 @@ class DictationApp(rumps.App):
             # Launching a process forks this one; keep that off the main thread.
             threading.Thread(target=self._prepare_recorder, daemon=True).start()
             return
-        self._phase = Phase.RECORDING
+        self._set_phase(Phase.RECORDING)
         if self._stop_when_connected:
             self.stop_recording_requested()
             return
@@ -559,7 +582,7 @@ class DictationApp(rumps.App):
         session = self._session
         self._capture_at_stop = self.recorder.capture_snapshot()
         self._set_recording_shortcut(False)
-        self._phase = Phase.TRANSCRIBING
+        self._set_phase(Phase.TRANSCRIBING)
         self._cancel_event.clear()
         self._show_status("Transcribing…")
         self.overlay_controller.set_transcribing(True)
@@ -736,7 +759,7 @@ class DictationApp(rumps.App):
             return
         # Release operation state on the UI thread, after queued result
         # callbacks. A new hotkey cannot race old completion callbacks.
-        self._phase = Phase.IDLE
+        self._set_phase(Phase.IDLE)
         self.record_menu.title = "Start Dictation"
         self.overlay_controller.set_transcribing(False)
         self.overlay_controller.set_queue_processing(False)
@@ -901,7 +924,10 @@ class DictationApp(rumps.App):
             return
         self.queue.add_many(normalized)
         self._refresh_queue_on_main()
-        self.open_transcript_window(Mode.QUEUE)
+        if not self.is_busy:
+            # Not over a recording's Stop button and live draft, or a run's
+            # progress: the files wait in the Queue tab.
+            self.open_transcript_window(Mode.QUEUE)
 
     def queue_remove_file(self, file_id: str) -> None:
         self.queue.remove(file_id)
@@ -933,7 +959,7 @@ class DictationApp(rumps.App):
             self._push_status("Finish the current operation first", revert_after=5)
             return
 
-        self._phase = Phase.TRANSCRIBING
+        self._set_phase(Phase.TRANSCRIBING)
         self._compact_session = False
         self.indicator.hide()
         self._queue_cancel_event.clear()
@@ -1140,6 +1166,8 @@ class DictationApp(rumps.App):
                 self._push_status("High-accuracy model unloaded", revert_after=5)
         elif name == "prefer_builtin_mic":
             self._microphone_settings_changed()
+        elif name == "auto_start_recording":
+            self._show_intro_text()  # It says what the shortcut does.
         self._refresh_preferences()
 
     def replace_word_rules(self, rules: list[dict[str, str]]) -> bool:
@@ -1222,7 +1250,7 @@ class DictationApp(rumps.App):
         self.config.dictation_shortcut = [key_code, modifiers]
         self._save_settings()
         logger.info(f"Dictation shortcut is now {spec.label}")
-        self.overlay_controller.set_intro_text(intro_text(spec.label))
+        self._show_intro_text()
         self._refresh_history_on_main()
         self._refresh_preferences()
         if self._welcome_window is not None:
@@ -1307,6 +1335,9 @@ class DictationApp(rumps.App):
         self._push_status("History cleared" if cleared else
                           "Audio cleared, but transcript history could not be deleted from disk",
                           revert_after=8)
+
+    def _show_intro_text(self) -> None:
+        self.overlay_controller.set_intro_text(intro_text(self._dictate.label, self.config.auto_start_recording))
 
     def _history_text(self) -> str:
         rendered = self.history_store.render()
@@ -1442,6 +1473,8 @@ class DictationApp(rumps.App):
     @rumps.clicked("More", "Open Media Files…")
     def menu_open_files(self, sender):
         del sender
+        if not self._can_begin_transcribing():
+            return  # Said before the file panel, not after a choice it cannot act on.
         self.open_transcript_window()
         AppHelper.callAfter(self.overlay_controller.openFiles_, None)
 

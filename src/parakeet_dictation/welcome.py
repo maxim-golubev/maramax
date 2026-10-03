@@ -138,8 +138,9 @@ class WelcomeController(NSObject):
             self.copy_choice,
             self._indented(self._small("Paste it yourself with Cmd+V. Nothing needs extra permission.")),
             self.paste_choice,
-            self._indented(self._small("Maramax presses Cmd+V for you in the app you were typing in. macOS asks "
-                                       "once for Accessibility permission.")),
+            self._indented(self._small("Maramax presses Cmd+V for you in the app you were typing in. This needs "
+                                       "Maramax turned on under Privacy & Security → Accessibility in "
+                                       "System Settings.")),
             self._indented(self.permission_row),
         ], spacing=6)
 

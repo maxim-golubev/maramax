@@ -99,7 +99,7 @@ docs/
 
 ## Phase and Session
 
-`DictationApp._phase` is one value: `IDLE`, `CONNECTING` (microphone requested, not yet open), `RECORDING`, or `TRANSCRIBING` (a dictation, a file, the queue, or a recovery). `recording_active`, `is_transcribing`, and `is_busy` are read-only views of it, so the combinations that used to be possible with separate flags cannot occur. It is read and written on the main thread only.
+`DictationApp._phase` is one value: `IDLE`, `CONNECTING` (microphone requested, not yet open), `RECORDING`, or `TRANSCRIBING` (a dictation, a file, the queue, or a recovery). `recording_active`, `is_transcribing`, and `is_busy` are read-only views of it, so the combinations that used to be possible with separate flags cannot occur. It is read and written on the main thread only, and changes only through `_set_phase()`, which tells Settings and Recordings (`show_busy_state()`) whenever the app becomes busy or idle.
 
 `_session` is bumped whenever a new operation takes ownership of the display (start of a recording, a file transcription, a recovery, or opening the window while idle). Every worker and delayed callback carries the value it started under and drops its result if the session moved on. `open_transcript_window()` deliberately does *not* bump it while an operation is in flight, so expanding the compact bar keeps the live drafts, the final result, and the original paste target.
 
@@ -157,7 +157,9 @@ On launch a leftover spill is promoted, a status hint is shown once, and `_adopt
 
 ## Compact Bar vs Full Window
 
-`config.compact_dictation` (default on) makes the hotkey show `DictationIndicator`, a `NSStatusWindowLevel` non-activating panel, so the target app keeps focus. In a compact session: no live preview, Cmd+R is registered as a global stop shortcut for the duration and released afterwards, auto-paste fires immediately without re-activating anything and is skipped if the frontmost app changed. The arrow button opens the full window; `_compact_session` is cleared but the session and paste target are preserved. With compact mode off, the full window opens, live preview runs, and auto-paste re-activates the previous app and waits 0.3 s before re-checking focus.
+`config.compact_dictation` (default on) makes the hotkey show `DictationIndicator`, a `NSStatusWindowLevel` non-activating panel, so the target app keeps focus. In a compact session: no live preview, Cmd+R is registered as a global stop shortcut for the duration and released afterwards, auto-paste fires immediately without re-activating anything and is skipped if the frontmost app changed. The arrow button opens the full window; `_compact_session` is cleared but the session and paste target are preserved. With compact mode off, the full window opens, live preview runs, and auto-paste re-activates the previous app and waits 0.3 s before re-checking focus. With the full window already open and idle, the hotkey starts a dictation in it; while it transcribes, or with `auto_start_recording` off, the hotkey only brings it forward.
+
+The full window is a floating panel: above other apps' windows, below alerts and file panels. While another Maramax window is key (Settings, Recordings, the welcome, update progress, a dialog) it drops to normal level behind that window; it floats again when it becomes key or the app is deactivated.
 
 `dismiss_requested()` is what Escape, Close, Cmd+W, and the bar's button all call: it finishes a recording, cancels a transcription, or closes the window, by phase.
 

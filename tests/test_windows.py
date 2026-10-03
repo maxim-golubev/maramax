@@ -180,6 +180,9 @@ for control in (window.picker, window.retry):
 delegate.is_busy = True
 window.refresh()
 assert not window.play.isEnabled() and not window.retry.isEnabled() and window.save.isEnabled()
+delegate.is_busy = False
+window.show_busy_state()                             # Told when the app becomes idle, not only on a refresh.
+assert window.play.isEnabled() and window.retry.isEnabled()
 ''', str(tmp_path))
 
 
@@ -219,4 +222,118 @@ for kind in (Glyph.EXPAND, Glyph.CLOSE):
     # Within a pixel of the centre (half a point on this 2x render), both ways.
     assert all(abs(v) <= 1.0 for v in outline), (kind, outline)
     assert all(abs(v) <= 1.3 for v in weight), (kind, weight)
+''')
+
+
+def test_transcript_window_background_follows_light_and_dark():
+    run(r'''
+import warnings
+from AppKit import NSAppearance, NSColor
+from parakeet_dictation.overlay import OverlayController
+warnings.simplefilter("ignore")  # Reading a layer's CGColor back.
+window = OverlayController.alloc().initWithDelegate_(delegate)
+
+def red():
+    color = NSColor.colorWithCGColor_(window.content_view.layer().backgroundColor())
+    return color.colorUsingColorSpaceName_("NSCalibratedRGBColorSpace").redComponent()
+
+# AppKit reports the change while drawing in the old appearance, which is the
+# Mac's own here: one of these differs from it, whichever the Mac uses.
+for name, dark in (("NSAppearanceNameDarkAqua", True), ("NSAppearanceNameAqua", False),
+                   ("NSAppearanceNameDarkAqua", True)):
+    window.panel.setAppearance_(NSAppearance.appearanceNamed_(name))
+    window.content_view.viewDidChangeEffectiveAppearance()
+    assert (red() < 0.5) == dark, (name, red())
+''')
+
+
+def test_transcript_window_never_covers_a_maramax_window_or_dialog_in_use():
+    run(r'''
+from AppKit import (NSApplicationDidResignActiveNotification, NSBackingStoreBuffered, NSMakeRect,
+                    NSModalPanelWindowLevel, NSNormalWindowLevel, NSPanel, NSWindowDidBecomeKeyNotification,
+                    NSWindowStyleMaskTitled)
+from Foundation import NSNotificationCenter
+from parakeet_dictation.overlay import OverlayController
+window = OverlayController.alloc().initWithDelegate_(delegate)
+level = window.panel.level
+# Above other apps' windows; alerts and file panels open above it even when
+# they are not key (an alert from the menu bar while another app is active).
+assert NSNormalWindowLevel < level() < NSModalPanelWindowLevel
+settings = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+    NSMakeRect(0, 0, 200, 100), NSWindowStyleMaskTitled, NSBackingStoreBuffered, False)
+center = NSNotificationCenter.defaultCenter()
+center.postNotificationName_object_(NSWindowDidBecomeKeyNotification, settings)
+assert level() == NSNormalWindowLevel                # Settings, Recordings, a dialog: in front of it.
+center.postNotificationName_object_(NSWindowDidBecomeKeyNotification, window.panel)
+assert level() > NSNormalWindowLevel                 # Clicked again: it floats again.
+center.postNotificationName_object_(NSWindowDidBecomeKeyNotification, settings)
+center.postNotificationName_object_(NSApplicationDidResignActiveNotification, NSApplication.sharedApplication())
+assert level() > NSNormalWindowLevel                 # In another app it floats over that app's windows.
+assert not window.panel.isVisible() and not settings.isVisible()
+''')
+
+
+def test_window_shortcuts_follow_what_the_layout_types_with_cmd():
+    run(r'''
+from AppKit import NSEvent, NSEventModifierFlagCommand, NSEventTypeKeyDown
+from parakeet_dictation.overlay import OverlayController
+delegate.toggle_recording_requested = lambda: calls.append("toggle")
+delegate.copy_current_transcript = lambda: calls.append("copy")
+window = OverlayController.alloc().initWithDelegate_(delegate)
+
+def key(typed, unmodified, code, flags=NSEventModifierFlagCommand):
+    event = NSEvent.keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode_(
+        NSEventTypeKeyDown, (0, 0), flags, 0, 0, None, typed, unmodified, False, code)
+    return window.panel.performKeyEquivalent_(event)
+
+# Russian: these keys type к, ц, с alone and r, w, c with Cmd held.
+assert key("r", "к", 0x0F) and key("w", "ц", 0x0D) and key("c", "с", 0x08)
+assert calls == ["toggle", "dismiss", "copy"]
+assert not key("z", "z", 0x0D)       # AZERTY: Cmd+Z on the US W key is Undo, never Close.
+assert key("\x1b", "\x1b", 0x35, 0) and calls[-1] == "dismiss"
+''')
+
+
+def test_work_that_waits_for_a_recording_is_not_offered_during_one():
+    run(r'''
+from AppKit import NSPasteboard, NSURL
+from parakeet_dictation.file_queue import QueuedFile
+from parakeet_dictation.overlay import Mode, OverlayController
+window = OverlayController.alloc().initWithDelegate_(delegate)
+pasteboard = NSPasteboard.pasteboardWithUniqueName()  # Not the clipboard.
+pasteboard.writeObjects_([NSURL.fileURLWithPath_("/x/a.m4a"), NSURL.fileURLWithPath_("/x/b.m4a")])
+drag = SimpleNamespace(draggingPasteboard=lambda: pasteboard)
+try:
+    assert window.content_view.draggingEntered_(drag) and window.files_button.isEnabled()
+    window.content_view.draggingExited_(drag)
+    window.set_recording(True)
+    assert not window.content_view.draggingEntered_(drag) and not window.files_button.isEnabled()
+    window._set_mode(Mode.QUEUE)
+    window.set_queue_files([QueuedFile(id="a", path="/x/a.m4a", filename="a.m4a")])
+    assert window.queue_add_button.isEnabled()          # Files can be collected meanwhile,
+    assert not window.queue_start_button.isEnabled()    # and run once the recording ends.
+    window.set_recording(False)
+    assert window.queue_start_button.isEnabled()
+finally:
+    pasteboard.releaseGlobally()
+''')
+
+
+def test_a_window_left_on_a_display_that_is_gone_comes_back():
+    run(r'''
+from AppKit import NSMakeRect
+from parakeet_dictation.overlay import OverlayController
+window = OverlayController.alloc().initWithDelegate_(delegate)
+window._place_on_a_screen()
+frame = window.panel.frame()
+visible = window.panel.screen().visibleFrame()
+moved = NSMakeRect(visible.origin.x + 10, visible.origin.y + 10, frame.size.width, frame.size.height)
+window.panel.setFrame_display_(moved, False)
+window._place_on_a_screen()
+assert window.panel.frame() == moved                 # Where the user left it.
+window.panel.setFrame_display_(NSMakeRect(100000, 100000, frame.size.width, frame.size.height), False)
+assert window.panel.screen() is None                 # On a display that was unplugged.
+window._place_on_a_screen()
+assert window.panel.screen() is not None
+assert not window.panel.isVisible()
 ''')

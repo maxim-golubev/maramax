@@ -129,10 +129,16 @@ class RecordingsController(NSObject):
         self._show_selected()
 
     @objc.python_method
-    def _show_selected(self):
+    def show_busy_state(self):
+        """Playing and transcribing again wait for a dictation or transcription to end."""
         record = self.selected()
         for button in (self.play, self.retry):
             button.setEnabled_(record is not None and not self.delegate.is_busy)
+
+    @objc.python_method
+    def _show_selected(self):
+        record = self.selected()
+        self.show_busy_state()
         self.save.setEnabled_(record is not None)
         if record is None:
             self.text.setString_(

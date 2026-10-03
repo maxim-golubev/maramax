@@ -29,7 +29,8 @@ _HELP = {
     "auto_start_recording": f"Turn off to open the window first and start with {STOP.label}.",
     "live_preview": "Draft text while you speak. The final transcript always replaces it.",
     "auto_copy_to_clipboard": "",
-    "paste_to_active_app": "Pastes the result where your cursor is. macOS asks for Accessibility permission once.",
+    "paste_to_active_app": "Pastes the result where your cursor is. Needs Accessibility permission: Maramax opens "
+                           "System Settings → Privacy & Security → Accessibility; turn Maramax on there.",
     "high_accuracy": "Qwen3-ASR 1.7B, a larger model that reads your word replacements as vocabulary. "
                      "Several times slower on long dictations, about 6 GB of memory, "
                      "and a 4.1 GB download on first use.",
@@ -234,7 +235,8 @@ class PreferencesController(NSObject):
                                horizontal=True, spacing=ROW_GAP)
         return self._page([
             [self._header("Input"), picker_row,
-             self._help("Automatic follows the input chosen in macOS. If a microphone disconnects while you "
+             self._help("Automatic uses the Mac’s own microphone while the option below is on, otherwise the "
+                        "input chosen in macOS. If a microphone disconnects while you "
                         "dictate, Automatic carries on with the next available one; a microphone you picked "
                         "here is never swapped silently."),
              self._option("prefer_builtin_mic")],
@@ -283,6 +285,10 @@ class PreferencesController(NSObject):
         field.setPlaceholderString_(placeholder)
         field.setBezelStyle_(NSTextFieldRoundedBezel)
         field.widthAnchor().constraintEqualToConstant_(width).setActive_(True)
+        # Return saves, as Save does; Tab and clicking away do not.
+        field.setTarget_(self)
+        field.setAction_("saveRule:")
+        field.cell().setSendsActionOnEndEditing_(False)
         return field
 
     # -- State --
@@ -313,7 +319,7 @@ class PreferencesController(NSObject):
 
         if config.input_device in self.device_names:
             self.device_picker.selectItemAtIndex_(self.device_names.index(config.input_device))
-        self._sync_device_picker_enabled()
+        self.show_busy_state()
 
         selected = self.picker.indexOfSelectedItem()
         self.rules = list(config.replacements)
@@ -343,7 +349,8 @@ class PreferencesController(NSObject):
         self.show_update_status()
 
     @objc.python_method
-    def _sync_device_picker_enabled(self):
+    def show_busy_state(self):
+        """A microphone cannot be chosen during a dictation or transcription."""
         self.device_picker.setEnabled_(not self.delegate.is_busy)
 
     @objc.python_method
@@ -388,7 +395,7 @@ class PreferencesController(NSObject):
         self.device_picker.removeAllItems()
         self.device_picker.addItemsWithTitles_([automatic] + names)
         self.device_picker.selectItemAtIndex_(self.device_names.index(selected_name))
-        self._sync_device_picker_enabled()
+        self.show_busy_state()
 
     def selectDevice_(self, sender):
         self.delegate.select_input_device(self.device_names[self.device_picker.indexOfSelectedItem()])

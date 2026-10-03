@@ -9,6 +9,7 @@ import objc
 from AppKit import (
     NSAlert,
     NSApplication,
+    NSApplicationDidResignActiveNotification,
     NSBackingStoreBuffered,
     NSButton,
     NSColor,
@@ -20,20 +21,20 @@ from AppKit import (
     NSOpenPanel,
     NSPanel,
     NSPopUpButton,
-    NSPopUpMenuWindowLevel,
     NSSavePanel,
     NSScrollView,
     NSSegmentedControl,
-    NSStatusWindowLevel,
     NSTextField,
     NSTextAlignmentCenter,
     NSTextView,
     NSView,
+    NSWindowBelow,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSWindowDidBecomeKeyNotification,
     NSWindowStyleMaskBorderless,
 )
-from Foundation import NSMakeRange, NSObject
+from Foundation import NSMakeRange, NSNotificationCenter, NSObject
 
 from .export import OutputConfig, OutputMode
 from .file_queue import QueueStatus
@@ -134,13 +135,17 @@ class OverlayPanel(NSPanel):
         return True
 
     def performKeyEquivalent_(self, event):
-        chars = (event.charactersIgnoringModifiers() or "").lower()
         flags = int(event.modifierFlags()) & _COMMAND_ONLY_MASK
         delegate = self.controller.delegate
 
-        if chars == "\x1b":
+        if event.charactersIgnoringModifiers() == "\x1b":
             delegate.dismiss_requested()
             return True
+
+        # Matched on what the layout types with Cmd held: Russian and other
+        # non-Latin layouts give Latin letters there, as menu shortcuts
+        # expect. Matching key codes would move these shortcuts on AZERTY.
+        chars = (event.characters() or "").lower()
 
         if flags == NSEventModifierFlagCommand and chars == "r":
             delegate.toggle_recording_requested()
@@ -189,7 +194,9 @@ class OverlayDropView(NSView):
         return [url.path() for url in urls if url.path() and _is_media(url.path())]
 
     def draggingEntered_(self, sender):
-        if self._dragged_media(sender):
+        # A drop starts or queues work and opens the Queue tab, over Stop
+        # and the live draft: not while recording.
+        if not self.controller.is_recording and self._dragged_media(sender):
             self.controller.set_drop_state(True)
             return NSDragOperationCopy
         return 0
@@ -262,16 +269,21 @@ class OverlayController(NSObject):
         self.panel.setBackgroundColor_(NSColor.clearColor())
         self.panel.setHasShadow_(True)
         self.panel.setMovableByWindowBackground_(True)
+        # Above other apps' windows, below alerts and file panels, which
+        # must never open behind it (see windowBecameKey_).
         self.panel.setFloatingPanel_(True)
         self.panel.setBecomesKeyOnlyIfNeeded_(False)
         self.panel.setHidesOnDeactivate_(False)
         self.panel.setReleasedWhenClosed_(False)
         self.panel.setWorksWhenModal_(True)
-        self.panel.setLevel_(NSStatusWindowLevel)
         self.panel.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces
             | NSWindowCollectionBehaviorFullScreenAuxiliary
         )
+        center = NSNotificationCenter.defaultCenter()
+        center.addObserver_selector_name_object_(self, "windowBecameKey:", NSWindowDidBecomeKeyNotification, None)
+        center.addObserver_selector_name_object_(self, "appResignedActive:",
+                                                 NSApplicationDidResignActiveNotification, None)
 
         self.content_view = OverlayDropView.alloc().initWithFrame_controller_(frame, self)
         self.content_view.layer().setCornerRadius_(18.0)
@@ -352,14 +364,19 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def apply_appearance(self):
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
-            self.content_view.layer().setBackgroundColor_(
-                NSColor.windowBackgroundColor().colorWithAlphaComponent_(0.985).CGColor()
-            )
-            self.content_view.layer().setBorderColor_(
-                NSColor.separatorColor().colorWithAlphaComponent_(0.28).CGColor()
-            )
+        def apply_colors():
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
+                self.content_view.layer().setBackgroundColor_(
+                    NSColor.windowBackgroundColor().colorWithAlphaComponent_(0.985).CGColor()
+                )
+                self.content_view.layer().setBorderColor_(
+                    NSColor.separatorColor().colorWithAlphaComponent_(0.28).CGColor()
+                )
+
+        # A CGColor is fixed when made; while AppKit reports an appearance
+        # change, the current drawing appearance is still the old one.
+        self.content_view.effectiveAppearance().performAsCurrentDrawingAppearance_(apply_colors)
 
     @objc.python_method
     def _make_label(self, text, font_size: float, bold: bool):
@@ -467,6 +484,7 @@ class OverlayController(NSObject):
         self._place(self.record_button, left, row_bottom, copy_left - BUTTON_GAP - left)
         self._place_text(self.scroll_view, BOTTOM, row_bottom - GAP - BOTTOM)
         self._place_text(self.drop_label, BOTTOM, 16)
+        self.files_button.setEnabled_(not self.is_recording)  # Files start work, which waits for the recording.
 
         visible = [self.status_label, self.mode_control, *self._transcript_buttons, self.close_button]
         if show_text:
@@ -552,7 +570,8 @@ class OverlayController(NSObject):
         has_pending = any(i.status in (QueueStatus.PENDING, QueueStatus.CANCELLED) for i in self._queue_files)
         selected = self._selected_queue_index() is not None
         idle = not self._queue_processing
-        self.queue_start_button.setEnabled_(has_pending and idle)
+        # Files can be added during a recording; the run waits for it to end.
+        self.queue_start_button.setEnabled_(has_pending and idle and not self.is_recording)
         self.queue_clear_button.setEnabled_(has_items and idle)
         for button in (self.queue_remove_button, self.queue_up_button, self.queue_down_button):
             button.setEnabled_(selected and idle)
@@ -646,13 +665,6 @@ class OverlayController(NSObject):
         popup.addItemWithTitle_("Save as Single File")
         alert.setAccessoryView_(popup)
 
-        # The overlay panel sits at NSStatusWindowLevel, which would otherwise
-        # obscure modal dialogs. Lift the alert (and follow-up file pickers)
-        # above that level so they render in front of the overlay.
-        alert_window = alert.window()
-        if alert_window is not None:
-            alert_window.setLevel_(NSPopUpMenuWindowLevel)
-
         response = alert.runModal()
         if response != 1000:  # NSAlertFirstButtonReturn
             return None
@@ -671,7 +683,6 @@ class OverlayController(NSObject):
             panel.setCanChooseFiles_(False)
             panel.setAllowsMultipleSelection_(False)
             panel.setPrompt_("Choose Folder")
-            panel.setLevel_(NSPopUpMenuWindowLevel)
             if not panel.runModal():
                 return None
             return OutputConfig(
@@ -687,7 +698,6 @@ class OverlayController(NSObject):
             else:
                 panel.setAllowedFileTypes_(["txt"])
             panel.setNameFieldStringValue_("transcript.txt")
-            panel.setLevel_(NSPopUpMenuWindowLevel)
             if not panel.runModal():
                 return None
             return OutputConfig(
@@ -706,7 +716,6 @@ class OverlayController(NSObject):
             panel.setAllowedContentTypes_(content_types)
         else:
             panel.setAllowedFileTypes_(MEDIA_EXTENSIONS)
-        panel.setLevel_(NSPopUpMenuWindowLevel)
         return [url.path() for url in panel.URLs()] if panel.runModal() else []
 
     # -- Showing and hiding --
@@ -738,11 +747,17 @@ class OverlayController(NSObject):
     def show_mode(self, mode: Mode):
         self._set_mode(mode)
         self.mode_control.setSelectedSegment_(_SEGMENTS.index(mode))
-        if not self._positioned:
-            # Centred once; afterwards it reappears where the user left it.
+        self._place_on_a_screen()
+        self.focus()
+
+    @objc.python_method
+    def _place_on_a_screen(self):
+        """Centred the first time; afterwards where the user left it, unless
+        that is on no screen now (a display was unplugged). AppKit does not
+        bring a borderless window back by itself."""
+        if not self._positioned or self.panel.screen() is None:
             self.panel.center()
             self._positioned = True
-        self.focus()
 
     @objc.python_method
     def _set_mode(self, mode: Mode):
@@ -762,6 +777,19 @@ class OverlayController(NSObject):
         self._cancel_copy_feedback()
         self._refresh_text_view()
         self._update_layout()
+
+    def windowBecameKey_(self, notification):
+        """Settings, Recordings, the welcome, or a dialog the user turns to
+        comes in front of this window; using this window again lifts it."""
+        key = notification.object()
+        self.panel.setFloatingPanel_(key is self.panel)
+        if key is not self.panel and self.panel.isVisible():
+            self.panel.orderWindow_relativeTo_(NSWindowBelow, key.windowNumber())
+
+    def appResignedActive_(self, notification):
+        """In another app, this window floats above its windows again."""
+        del notification
+        self.panel.setFloatingPanel_(True)
 
     @objc.python_method
     def hide(self):

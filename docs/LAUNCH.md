@@ -16,8 +16,9 @@
 macOS asks for microphone access the first time you dictate; allow it. If you
 denied it earlier, switch Maramax on under **System Settings → Privacy &
 Security → Microphone**. For the transcript to be pasted for you, turn on
-**Settings → Paste into the active app** and allow Accessibility when macOS
-asks. Opening the app does not open the microphone; only dictating does.
+**Settings → Paste into the active app**; Maramax opens **System Settings →
+Privacy & Security → Accessibility**, where you switch Maramax on. Opening the
+app does not open the microphone; only dictating does.
 
 If an older Maramax is running, quit it from its menu bar icon first: one copy
 runs at a time. Settings, history, and recordings are shared between versions.
