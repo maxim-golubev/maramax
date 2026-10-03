@@ -19,11 +19,13 @@ app you were using. No audio or text leaves the Mac.
 
 - **Fast:** on an M3 Pro, a dictation under 30 seconds is transcribed in about
   0.3 s and one over two minutes in about 3 s (medians over 20 real dictations).
-- **Private:** recognition, history, and recordings stay on the Mac; the only
-  network request it makes by itself is a daily update check.
+- **Private:** recognition, history, and recordings stay on the Mac. The only
+  network requests it makes by itself are the one-time speech model download
+  and a daily update check, which can be turned off.
 - **Built with:** Python 3.12, PyObjC/AppKit for the native interface, MLX for
   inference, PortAudio in a separate helper process, Carbon hotkeys through
-  ctypes, py2app. About 8,000 lines of code and 4,000 of tests; macOS 15.
+  ctypes, py2app. About 9,400 lines of app code and 5,800 of tests; built on
+  macOS 15.
 
 ## Engineering problems
 
@@ -51,7 +53,7 @@ A speech model is the easy part. Most of the work went into these:
   the installed one, proves the result identical to the release before
   swapping it in, and keeps the previous version.
 
-Over 300 tests run without a microphone, a screen, or model weights: a fake
+Over 450 tests run without a microphone, a screen, or model weights: a fake
 audio device drives the real helper process, the native windows are built and
 measured off-screen, and the update swap script runs against temporary folders.
 
@@ -94,8 +96,8 @@ Maramax started as a fork of Osada Paranaliyanage's
 [parakeet-dictation](https://github.com/osadalakmal/parakeet-dictation), itself
 built on Ashwin P Chandran's
 [whisper-dictation](https://github.com/ashwin-pc/whisper-dictation). It has
-since been rewritten: `git blame` attributes 53 of its roughly 8,800 lines to
-the earlier projects. Recognition uses NVIDIA's Parakeet TDT 0.6B v2 through
+since been rewritten: `git blame` attributes 32 of the 9,397 lines in `src/`
+to the earlier projects. Recognition uses NVIDIA's Parakeet TDT 0.6B v2 through
 [parakeet-mlx](https://github.com/senstella/parakeet-mlx), and optionally
 Qwen3-ASR through [qwen3-asr-mlx](https://github.com/gabrimatic/qwen3-asr-mlx).
 MIT licensed.

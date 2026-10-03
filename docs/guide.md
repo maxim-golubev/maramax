@@ -4,9 +4,10 @@ Everything the app does and where it keeps things. For a first launch, see [the 
 
 ## Everyday dictation
 
-- Press **Option+Space** to start, then **Option+Space** or **Cmd+R** to finish. The
-  first launch opens a short welcome that lets you pick another shortcut (and
-  whether to paste); change it any time under **Settings → General → Shortcut**,
+- Press the dictation shortcut (**Option+Space** unless you chose another) to
+  start, then press it again or **Cmd+R** to finish. The first launch opens a
+  short welcome that lets you pick another shortcut (and whether to paste);
+  change it any time under **Settings → General → Shortcut**,
   or reopen the welcome from **More → Welcome…**. Shortcuts macOS has turned on
   for itself (Spotlight's Cmd+Space, screenshots, and the rest of **Keyboard
   Shortcuts** in System Settings), combinations that type a character (Option+E)
@@ -46,9 +47,8 @@ replacements are also given to that model as vocabulary before it listens
 slower than the standard model (for dictations over two minutes, a median of
 19.5 s against 2.3 s), so it stays off by default.
 
-If the speech model cannot load, use **Retry Speech Model** after restoring your
-connection. **Quick Start…** explains recording, insertion, microphone selection,
-and recovery. A second copy of Maramax is blocked before it loads models or opens
+If the speech model cannot load, use **More → Retry Speech Model** after restoring your
+connection. A second copy of Maramax is blocked before it loads models or opens
 audio; quit the old copy before opening a different version.
 
 ## Microphones and AirPods
@@ -107,8 +107,11 @@ as new ones are saved. Export recordings you want to keep permanently.
 
 The live PCM recovery spill is written during capture for crash recovery.
 At the next launch every leftover spill (one per capture that could not be
-archived) is moved into Recordings as an ordinary entry. **Recover Last Recording** retries audio that never reached the recognizer
-first, then the newest capture without a transcript.
+archived) is moved into Recordings as an ordinary entry. **More → Recover Last
+Recording** transcribes audio that never reached the recognizer first, then the
+newest capture without a transcript, then an unsaved recording that could not be
+moved into Recordings, and otherwise the newest recording. A recovery that
+returns no text marks that recording as tried, so the next press moves on.
 **Clear History & Recordings…** deletes both transcript history and retained audio
 after confirmation, and is unavailable during an active operation.
 

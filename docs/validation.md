@@ -254,6 +254,11 @@ High severity:
   give no text and real speech is unaffected. Only plain names and terms are
   admitted to the context (no snippets, addresses, lists, or numbers).
 
+  *Note, October 2, 2026 (after 0.6.3):* an answer made only of vocabulary
+  terms is no longer always dropped, since a user can say exactly those words.
+  It is kept when the standard engine also hears speech in the capture; an
+  answer that repeats the context with its "Vocabulary:" label is still no text.
+
 Audio loss or wrong destination:
 
 - Confirming "Clear History & Recordings" after a dictation had started behind
@@ -326,7 +331,9 @@ shifted the queue selection.
 ### Known and left as is
 
 - Auto-paste sends the physical V key, which is not Cmd+V on Dvorak-style
-  layouts.
+  layouts. *(Note, October 2, 2026, after 0.6.3: fixed. The paste keystroke
+  and the Cmd+R stop shortcut now use the key that gives V or R with Command
+  on the current layout.)*
 - The reader side of the helper protocol still uses field names as plain
   strings.
 - `app.py` remains the largest module. The reviewers' advice, which matches the
@@ -379,6 +386,13 @@ came out fully formatted, with three changed words in the 75 s one ("619" →
 dropped) and none in the 588 s one; the other 18 transcripts are byte-identical.
 The repair cost 1.3 s and 0.3 s on the two captures and nothing on the others.
 On the 100 history transcripts the detector would have tried a repair in 20.
+
+*Note, October 2, 2026 (after 0.6.3):* the splice described here is no longer
+what the code does. A repair now replaces only the words of the unformatted
+stretch, cut at the words on either side that both recognitions heard alike,
+and the wording check uses an exact longest common subsequence. The author's
+re-run on the archive after that change reports the repeated "just" dropped
+and no other word changed: "619" → "6:19" no longer happens.
 
 ### Self-update
 
@@ -448,7 +462,8 @@ Code standard. All 302 tests, Ruff, and mypy pass after the fixes below.
 Through the shipped code path on the 22 archived dictations: the two affected
 captures are fully formatted (word changes: "619" → "6:19" and one repeated
 "just" in the 75 s capture, none in the 588 s one); every other transcript is
-identical to what the app stored.
+identical to what the app stored. (See the note under 0.6.0: since the repair
+changes only the stretch, "619" stays as it was.)
 
 ## Hardware checks before a release
 
@@ -501,6 +516,8 @@ review by the author followed their fixes. All 327 tests, Ruff, and mypy pass.
 - The repair checked the wording only inside the unformatted stretch, while a
   retry window can replace up to about ten seconds of formatted text before it.
   Both are now checked, separately, against what the splice actually replaces.
+  *(Note, October 2, 2026: superseded. A repair now replaces nothing outside
+  the stretch; see the note under 0.6.0.)*
 - A cancel is its own exception, so the repair stops only for a cancel.
 
 On the 22 archived dictations the result is unchanged from 0.6.2: the two
@@ -511,7 +528,9 @@ affected captures repaired, every other transcript identical.
 The README leads with what the app does and its engineering problems, shows an
 animation and a diagram rendered from the app's own views (Mermaid's controls
 covered the diagram on GitHub), qualifies what was tested only with a fake
-audio device, and credits the forked projects with a measured share. The
+audio device, and credits the forked projects with a measured share.
+*(Note, October 2, 2026: that share, 53 lines, could not be reproduced; the
+README now gives what plain `git blame` over `src/` attributes to them.)* The
 architecture has its own document, `docs/architecture.md`; the launch
 guide no longer describes the author's own Mac.
 
