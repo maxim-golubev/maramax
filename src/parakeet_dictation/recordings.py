@@ -15,9 +15,14 @@ from pathlib import Path
 
 from .atomic_file import write_text_atomically
 from .audio_format import CHANNELS, SAMPLE_RATE, SAMPLE_WIDTH, seconds
+from .logger_config import logger
 
 MAX_RECORDINGS = 20
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+# What a recording leaves on disk: its audio, its metadata, and the temporary
+# files of an atomic write of either.
+_AUDIO_SUFFIX, _METADATA_SUFFIX = ".wav", ".json"
+_TEMP_SUFFIXES = (_AUDIO_SUFFIX + ".tmp", _METADATA_SUFFIX + ".tmp")
 
 
 class RecordingStatus(StrEnum):
@@ -66,10 +71,10 @@ class RecordingStore:
     def audio_path(self, recording_id: str) -> Path:
         if len(recording_id) != 32 or any(c not in "0123456789abcdef" for c in recording_id):
             raise ValueError("Invalid recording identifier")
-        return self.base_dir / f"{recording_id}.wav"
+        return self.base_dir / f"{recording_id}{_AUDIO_SUFFIX}"
 
     def _metadata_path(self, recording_id: str) -> Path:
-        return self.audio_path(recording_id).with_suffix(".json")
+        return self.audio_path(recording_id).with_suffix(_METADATA_SUFFIX)
 
     def _write_metadata(self, record: Recording) -> None:
         payload = dict(record.unrecognized) | {name: getattr(record, name) for name in _KNOWN_FIELDS}
@@ -128,8 +133,10 @@ class RecordingStore:
             diagnostics=dict(diagnostics or {}),
         )
         with self._lock:
+            # Something outside the app may have removed the folder since.
+            self.base_dir.mkdir(parents=True, exist_ok=True)
             path = self.audio_path(record.id)
-            temp = path.with_suffix(".wav.tmp")
+            temp = path.with_suffix(_TEMP_SUFFIXES[0])
             try:
                 with temp.open("wb") as handle:
                     with wave.open(handle, "wb") as audio:
@@ -140,11 +147,21 @@ class RecordingStore:
                     handle.flush()
                     os.fsync(handle.fileno())
                 temp.replace(path)
-                self._write_metadata(record)
             finally:
                 temp.unlink(missing_ok=True)
+            # The recording exists from here: list_recordings rebuilds an
+            # entry without metadata. Raising now would make the caller keep
+            # the recovery spill too, and the next launch would archive the
+            # same audio a second time; so these failures are only logged.
+            try:
+                self._write_metadata(record)
+            except OSError as exc:
+                logger.error(f"Recording {record.id} was saved without its details: {exc}")
             # Pruning is after durable audio+metadata, never before saving.
-            self._prune(record.id)
+            try:
+                self._prune(record.id)
+            except OSError as exc:
+                logger.error(f"Recording {record.id} was saved, but older recordings could not be pruned: {exc}")
         return record
 
     def update(self, recording_id: str, **changes) -> None:
@@ -162,21 +179,36 @@ class RecordingStore:
                                  f"{(CHANNELS, SAMPLE_WIDTH, SAMPLE_RATE)}")
             return audio.readframes(audio.getnframes())
 
+    def _own_files(self, suffixes: tuple[str, ...]) -> list[Path]:
+        """Files in the folder named as a recording id plus one of `suffixes`,
+        readable or not; anything else there is not ours."""
+        found = []
+        for path in self.base_dir.iterdir():
+            recording_id = path.name.split(".", 1)[0]
+            try:
+                self.audio_path(recording_id)
+            except ValueError:
+                continue
+            if path.name.removeprefix(recording_id) in suffixes:
+                found.append(path)
+        return found
+
     def clear(self) -> None:
         with self._lock:
+            if not self.base_dir.exists():
+                return  # Removed from outside: nothing is left to clear.
             # Include damaged files and interrupted atomic writes: clearing
             # history must not leave private audio behind just because its
             # header or metadata cannot be parsed.
-            for path in self.base_dir.iterdir():
-                recording_id = path.name.split(".", 1)[0]
-                try:
-                    self.audio_path(recording_id)
-                except ValueError:
-                    continue  # Not one of ours.
-                if path.name in {recording_id + suffix for suffix in (".wav", ".json", ".wav.tmp", ".json.tmp")}:
-                    path.unlink(missing_ok=True)
+            for path in self._own_files((_AUDIO_SUFFIX, _METADATA_SUFFIX, *_TEMP_SUFFIXES)):
+                path.unlink(missing_ok=True)
 
     def _prune(self, newest_id: str) -> None:
+        # Every write here holds the lock, so a temporary file seen now was
+        # left by a write that a crash or a kill interrupted; recovery.py
+        # still holds that audio.
+        for path in self._own_files(_TEMP_SUFFIXES):
+            path.unlink(missing_ok=True)
         total = 0
         records = self.list_recordings()
         records.sort(key=lambda r: r.id != newest_id)

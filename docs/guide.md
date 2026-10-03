@@ -103,8 +103,8 @@ the newest even if it alone exceeds that budget; older recordings are removed
 as new ones are saved. Export recordings you want to keep permanently.
 
 The live PCM recovery spill is written during capture for crash recovery.
-At the next launch a leftover spill is moved into Recordings as an ordinary
-entry. **Recover Last Recording** retries audio that never reached the recognizer
+At the next launch every leftover spill (one per capture that could not be
+archived) is moved into Recordings as an ordinary entry. **Recover Last Recording** retries audio that never reached the recognizer
 first, then the newest capture without a transcript.
 **Clear History & Recordings…** deletes both transcript history and retained audio
 after confirmation, and is unavailable during an active operation.

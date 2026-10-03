@@ -1,13 +1,19 @@
 from parakeet_dictation import recovery
 
 
-def _write_in_progress(tmp_path, size: int) -> None:
-    recovery.in_progress_path(tmp_path).write_bytes(b"\x01\x02" * (size // 2))
+def _write_in_progress(tmp_path, size: int, sample: bytes = b"\x01\x02") -> bytes:
+    pcm = sample * (size // 2)
+    recovery.in_progress_path(tmp_path).write_bytes(pcm)
+    return pcm
+
+
+def _legacy_path(tmp_path):
+    return tmp_path / recovery.LEGACY_NAME
 
 
 def test_promote_missing_file_returns_false(tmp_path):
     assert recovery.promote_in_progress(tmp_path) is False
-    assert not recovery.last_recording_path(tmp_path).exists()
+    assert recovery.unsaved_recordings(tmp_path) == []
 
 
 def test_promote_too_short_file_deletes_it(tmp_path):
@@ -15,60 +21,62 @@ def test_promote_too_short_file_deletes_it(tmp_path):
 
     assert recovery.promote_in_progress(tmp_path) is False
     assert not recovery.in_progress_path(tmp_path).exists()
-    assert not recovery.last_recording_path(tmp_path).exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_promote_moves_recoverable_file(tmp_path):
-    _write_in_progress(tmp_path, recovery.MIN_RECOVERABLE_BYTES)
+    pcm = _write_in_progress(tmp_path, recovery.MIN_RECOVERABLE_BYTES)
 
     assert recovery.promote_in_progress(tmp_path) is True
     assert not recovery.in_progress_path(tmp_path).exists()
-    assert recovery.last_recording_path(tmp_path).exists()
+    assert [recovery.load_unsaved(path) for path in recovery.unsaved_recordings(tmp_path)] == [pcm]
 
 
-def test_promote_overwrites_previous_last_recording(tmp_path):
-    recovery.last_recording_path(tmp_path).write_bytes(b"old" * recovery.MIN_RECOVERABLE_BYTES)
+def test_each_failed_dictation_keeps_its_own_audio_whatever_its_length(tmp_path):
+    # A long capture, a shorter one, then a longer one: with one slot, the
+    # shorter was deleted and the longest replaced the first.
+    kept = []
+    for seconds, sample in ((60, b"\x01\x00"), (10, b"\x02\x00"), (90, b"\x03\x00")):
+        kept.append(_write_in_progress(tmp_path, recovery.MIN_RECOVERABLE_BYTES * 2 * seconds, sample))
+        assert recovery.promote_in_progress(tmp_path) is True
+    assert [recovery.load_unsaved(path) for path in recovery.unsaved_recordings(tmp_path)] == kept
+
+
+def test_a_recording_left_by_an_earlier_version_is_the_oldest(tmp_path):
+    legacy = b"\x09\x00" * recovery.MIN_RECOVERABLE_BYTES
+    _legacy_path(tmp_path).write_bytes(legacy)
+    newer = _write_in_progress(tmp_path, recovery.MIN_RECOVERABLE_BYTES)
+    assert recovery.promote_in_progress(tmp_path) is True  # A crash leftover never overwrites it.
+    assert [recovery.load_unsaved(path) for path in recovery.unsaved_recordings(tmp_path)] == [legacy, newer]
+
+
+def test_numbering_continues_after_the_oldest_was_adopted(tmp_path):
+    for sample in (b"\x01\x00", b"\x02\x00"):
+        _write_in_progress(tmp_path, recovery.MIN_RECOVERABLE_BYTES, sample)
+        recovery.promote_in_progress(tmp_path)
+    oldest, newest = recovery.unsaved_recordings(tmp_path)
+    recovery.discard_unsaved(oldest)
+    third = _write_in_progress(tmp_path, recovery.MIN_RECOVERABLE_BYTES, b"\x03\x00")
+    recovery.promote_in_progress(tmp_path)
+    assert recovery.unsaved_recordings(tmp_path)[0] == newest
+    assert recovery.load_unsaved(recovery.unsaved_recordings(tmp_path)[-1]) == third
+
+
+def test_too_short_and_unrelated_files_are_not_offered(tmp_path):
+    _legacy_path(tmp_path).write_bytes(b"x" * 10)
+    (tmp_path / "unsaved-recording-x.pcm").write_bytes(b"x" * recovery.MIN_RECOVERABLE_BYTES)
+    (tmp_path / "settings.json").write_text("{}")
+    assert recovery.unsaved_recordings(tmp_path) == []
+    assert recovery.unsaved_recordings(tmp_path / "missing") == []
+
+
+def test_discard_every_unsaved_leaves_other_files(tmp_path):
+    _legacy_path(tmp_path).write_bytes(b"x" * 10)
     _write_in_progress(tmp_path, recovery.MIN_RECOVERABLE_BYTES)
-
-    assert recovery.promote_in_progress(tmp_path) is True
-    assert recovery.last_recording_path(tmp_path).read_bytes().startswith(b"\x01\x02")
-
-
-def test_promote_only_if_larger_keeps_longer_existing_recording(tmp_path):
-    existing = b"L" * (recovery.MIN_RECOVERABLE_BYTES * 4)
-    recovery.last_recording_path(tmp_path).write_bytes(existing)
-    _write_in_progress(tmp_path, recovery.MIN_RECOVERABLE_BYTES)
-
-    assert recovery.promote_in_progress(tmp_path, only_if_larger=True) is False
-    # The shorter capture is dropped so it can't resurface at next launch;
-    # the longer preserved recording survives untouched.
-    assert not recovery.in_progress_path(tmp_path).exists()
-    assert recovery.last_recording_path(tmp_path).read_bytes() == existing
-
-
-def test_promote_only_if_larger_replaces_shorter_existing_recording(tmp_path):
-    recovery.last_recording_path(tmp_path).write_bytes(b"S" * recovery.MIN_RECOVERABLE_BYTES)
-    _write_in_progress(tmp_path, recovery.MIN_RECOVERABLE_BYTES * 4)
-
-    assert recovery.promote_in_progress(tmp_path, only_if_larger=True) is True
-    assert recovery.last_recording_path(tmp_path).read_bytes().startswith(b"\x01\x02")
-
-
-def test_promote_only_if_larger_with_no_existing_recording(tmp_path):
-    _write_in_progress(tmp_path, recovery.MIN_RECOVERABLE_BYTES)
-
-    assert recovery.promote_in_progress(tmp_path, only_if_larger=True) is True
-    assert recovery.last_recording_path(tmp_path).exists()
-
-
-def test_has_last_recording(tmp_path):
-    assert recovery.has_last_recording(tmp_path) is False
-
-    recovery.last_recording_path(tmp_path).write_bytes(b"x" * 10)
-    assert recovery.has_last_recording(tmp_path) is False
-
-    recovery.last_recording_path(tmp_path).write_bytes(b"x" * recovery.MIN_RECOVERABLE_BYTES)
-    assert recovery.has_last_recording(tmp_path) is True
+    recovery.promote_in_progress(tmp_path)
+    (tmp_path / "settings.json").write_text("{}")
+    recovery.discard_every_unsaved(tmp_path)
+    assert [path.name for path in tmp_path.iterdir()] == ["settings.json"]
 
 
 def test_discard_in_progress_is_idempotent(tmp_path):
@@ -79,24 +87,16 @@ def test_discard_in_progress_is_idempotent(tmp_path):
     assert not recovery.in_progress_path(tmp_path).exists()
 
 
-def test_discard_last_recording_is_idempotent(tmp_path):
-    recovery.discard_last_recording(tmp_path)  # nothing to remove — no error
+def test_discard_unsaved_is_idempotent(tmp_path):
+    path = _legacy_path(tmp_path)
+    recovery.discard_unsaved(path)  # nothing to remove — no error
 
-    recovery.last_recording_path(tmp_path).write_bytes(b"x" * recovery.MIN_RECOVERABLE_BYTES)
-    recovery.discard_last_recording(tmp_path)
-    assert not recovery.last_recording_path(tmp_path).exists()
-
-
-def test_load_last_recording_missing_returns_none(tmp_path):
-    assert recovery.load_last_recording(tmp_path) is None
+    path.write_bytes(b"x" * recovery.MIN_RECOVERABLE_BYTES)
+    recovery.discard_unsaved(path)
+    assert not path.exists()
 
 
-def test_load_last_recording_too_short_returns_none(tmp_path):
-    recovery.last_recording_path(tmp_path).write_bytes(b"x" * 10)
-    assert recovery.load_last_recording(tmp_path) is None
-
-
-def test_load_last_recording_returns_bytes(tmp_path):
-    payload = b"\x03\x04" * recovery.MIN_RECOVERABLE_BYTES
-    recovery.last_recording_path(tmp_path).write_bytes(payload)
-    assert recovery.load_last_recording(tmp_path) == payload
+def test_load_unsaved_missing_or_too_short_returns_none(tmp_path):
+    assert recovery.load_unsaved(_legacy_path(tmp_path)) is None
+    _legacy_path(tmp_path).write_bytes(b"x" * 10)
+    assert recovery.load_unsaved(_legacy_path(tmp_path)) is None

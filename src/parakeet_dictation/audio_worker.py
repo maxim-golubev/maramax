@@ -16,7 +16,7 @@ import time
 
 from .capture import CaptureSnapshot
 from .helper_protocol import Event, Operation, event, parse
-from .recorder import AudioRecorder, lid_closed
+from .recorder import AudioRecorder, default_input_device, lid_closed
 
 # Speech that is still in the driver (or in a Bluetooth link) when the user
 # presses stop would otherwise lose its last syllable.
@@ -172,10 +172,13 @@ class AudioHelper:
     def _stream_key(request: dict) -> tuple:
         """What decides which device a request opens. A kept-warm stream is
         reused only for an identical key; the lid matters because closing it
-        switches the built-in microphone off."""
+        switches the built-in microphone off, and Automatic follows a system
+        default input chosen since the stream opened (AirPods connecting)."""
         device = request.get("device")
         prefer_builtin = bool(request.get("prefer_builtin", True))
-        return device, prefer_builtin, (lid_closed() if device is None and prefer_builtin else None)
+        if device is not None:
+            return device, prefer_builtin, None, None
+        return device, prefer_builtin, (lid_closed() if prefer_builtin else None), default_input_device()
 
     def _record(self, request: dict):
         key = self._stream_key(request)

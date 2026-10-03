@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 
-from .atomic_file import set_aside, write_text_atomically
+from .atomic_file import remove_leftovers, set_aside, write_text_atomically
 from .logger_config import logger
 
 
@@ -40,9 +40,14 @@ class HistoryEntry:
 _STORED_FIELDS = tuple(f.name for f in fields(HistoryEntry) if f.name not in ("raw_text", "unrecognized"))
 
 
+def _legacy_history(support_dir: Path) -> Path:
+    """Where the app kept transcripts under its earlier name."""
+    return support_dir.parent / "ParakeetDictation" / "history.json"
+
+
 def adopt_legacy_history(support_dir: Path) -> None:
     """Copy the transcript history of the app's earlier name, once."""
-    legacy = support_dir.parent / "ParakeetDictation" / "history.json"
+    legacy = _legacy_history(support_dir)
     current = support_dir / "history.json"
     if current.exists() or not legacy.exists():
         return
@@ -72,12 +77,17 @@ class HistoryStore:
             set_aside(self.path, str(exc))
             return []
 
+        originals: dict = {}
         try:
-            originals = json.loads(self.originals_path.read_text(encoding="utf-8"))
-            if not isinstance(originals, dict):
-                originals = {}
-        except (OSError, ValueError):
-            originals = {}  # Only the pre-replacement wording is lost.
+            loaded = json.loads(self.originals_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("history originals are not an object")
+            originals = loaded
+        except FileNotFoundError:
+            pass  # History from before this file existed, or adopted from the earlier name.
+        except (ValueError, OSError) as exc:
+            # The next save would otherwise overwrite every pre-replacement text.
+            set_aside(self.originals_path, str(exc))
 
         entries = []
         for item in payload:
@@ -99,6 +109,8 @@ class HistoryStore:
                    for entry in entries]
         originals = {entry.id: entry.raw_text for entry in entries
                      if entry.raw_text and entry.raw_text != entry.text}
+        # Something outside the app may have removed the folder since.
+        self.base_dir.mkdir(parents=True, exist_ok=True)
         write_text_atomically(self.originals_path, json.dumps(originals, indent=2))
         write_text_atomically(self.path, json.dumps(payload, indent=2))
 
@@ -129,10 +141,15 @@ class HistoryStore:
         return entry
 
     def clear(self) -> bool:
+        """Erase every transcript on disk: this history, the copies of it set
+        aside as unreadable, and the history of the app's earlier name."""
         with self._lock:
             self._entries = []
             try:
                 self._save()
+                for path in (self.path, self.originals_path):
+                    remove_leftovers(path)
+                _legacy_history(self.base_dir).unlink(missing_ok=True)
                 return True
             except Exception as exc:
                 logger.error(f"Failed to clear history on disk: {exc}")

@@ -23,6 +23,7 @@ m.paInt16, m.paContinue, m.paComplete, m.paInputOverflow = 8, 0, 1, 2
 STATE = {"devices": ["MacBook Pro Microphone", "AirPods"], "default": 1, "opens": 0}
 VANISH_AFTER = %(vanish_after)d   # buffers the first stream delivers before its device disappears
 MUTE_FIRST = %(mute_first)d       # the first stream opens but never delivers
+DEFAULT_MOVES = %(default_moves)d # the system default input changes before the second request
 
 class Stream:
     def __init__(self, callback, index):
@@ -60,6 +61,15 @@ m.PyAudio = PyAudio
 sys.modules["pyaudio"] = m
 import parakeet_dictation.recorder as recorder
 recorder.lid_closed = lambda: False  # Independent of this Mac's real lid.
+REQUESTS = []
+
+def default_input_device():  # What CoreAudio would say; PortAudio's copy is STATE.
+    REQUESTS.append(True)
+    if DEFAULT_MOVES and len(REQUESTS) == 2:
+        STATE["default"] = 0
+    return STATE["default"]
+
+recorder.default_input_device = default_input_device
 if %(leaks_session)d:
     # What a wedged close leaves behind: PortAudio could not be shut down.
     released = recorder.AudioRecorder.cleanup
@@ -69,9 +79,10 @@ main()
 '''
 
 
-def helper(vanish_after=0, mute_first=False, leaks_session=False):
+def helper(vanish_after=0, mute_first=False, leaks_session=False, default_moves=False):
     return [sys.executable, '-u', '-c', FAKE_AUDIO % {
-        "vanish_after": vanish_after, "mute_first": int(mute_first), "leaks_session": int(leaks_session)}]
+        "vanish_after": vanish_after, "mute_first": int(mute_first), "leaks_session": int(leaks_session),
+        "default_moves": int(default_moves)}]
 
 
 def recorder_for(tmp_path, cmd, device=None, prefer_builtin=True, **kwargs):
@@ -164,7 +175,7 @@ time.sleep(60)
     assert recorder.stop() == expected
     assert recorder.reset_count == 1
     assert recorder.preserve_recovery()
-    assert recovery.load_last_recording(tmp_path) == expected
+    assert [recovery.load_unsaved(path) for path in recovery.unsaved_recordings(tmp_path)] == [expected]
     recorder.cleanup()
 
 
@@ -305,6 +316,20 @@ def test_changing_microphone_does_not_reuse_a_warm_stream(tmp_path):
     assert wait_for(lambda: recorder.capture_snapshot().audio_seconds > 0.05)
     pcm = recorder.stop()
     assert set(pcm[::2]) == {1}
+    recorder.cleanup()
+
+
+def test_automatic_follows_a_new_default_input_instead_of_a_warm_stream(tmp_path):
+    recorder = recorder_for(tmp_path, helper(default_moves=True), prefer_builtin=False)
+    recorder.keep_warm_seconds = 5
+    assert recorder.start()
+    assert recorder.capture_snapshot().device_name == "AirPods"
+    recorder.stop()
+    assert wait_for(recorder._accepting.is_set)  # Kept warm on AirPods.
+    assert recorder.start()                      # The user picked another input meanwhile.
+    assert not recorder.warm_start
+    assert recorder.capture_snapshot().device_name == "MacBook Pro Microphone"
+    recorder.stop()
     recorder.cleanup()
 
 

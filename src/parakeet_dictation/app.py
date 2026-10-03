@@ -136,7 +136,7 @@ class DictationApp(rumps.App):
         self.recordings = RecordingStore(self._support_dir / "recordings")
         # A leftover in-progress capture means a previous session crashed or
         # hung mid-recording — keep it recoverable.
-        self._leftover_found = self.recorder.preserve_recovery() or recovery.has_last_recording(self._support_dir)
+        self._leftover_found = self.recorder.preserve_recovery() or bool(recovery.unsaved_recordings(self._support_dir))
         if self._leftover_found:
             logger.info("Found unsaved recording from a previous session")
             threading.Thread(target=self._adopt_recovered_audio, daemon=True).start()
@@ -270,20 +270,22 @@ class DictationApp(rumps.App):
         self.recorder.keep_warm_seconds = self.config.keep_mic_ready_seconds
 
     def _adopt_recovered_audio(self) -> None:
-        """Move a capture left behind by a crash into Recordings, where it
-        can be played, exported, and transcribed like any other."""
-        try:
-            pcm = recovery.load_last_recording(self._support_dir)
-            if not pcm:
-                return
-            record = self.recordings.save(whole_samples(pcm), {"device_name": "Unknown microphone"})
-            if record is None:
-                return
-            self.recordings.update(record.id, message="Recovered after an interrupted session")
-            recovery.discard_last_recording(self._support_dir)
-        except Exception as exc:
-            # The spill file stays, so Recover Last Recording still works.
-            logger.error(f"Could not move recovered audio into Recordings: {exc}")
+        """Move captures left behind by a crash or a failed archive into
+        Recordings, oldest first, where they can be played, exported, and
+        transcribed like any other."""
+        for unsaved in recovery.unsaved_recordings(self._support_dir):
+            try:
+                pcm = recovery.load_unsaved(unsaved)
+                if not pcm:
+                    continue
+                record = self.recordings.save(whole_samples(pcm), {"device_name": "Unknown microphone"})
+                if record is None:
+                    continue
+                self.recordings.update(record.id, message="Recovered after an interrupted session")
+                recovery.discard_unsaved(unsaved)
+            except Exception as exc:
+                # The file stays, so Recover Last Recording still works.
+                logger.error(f"Could not move recovered audio {unsaved.name} into Recordings: {exc}")
 
     def _start_model_watchdog(self) -> None:
         threading.Thread(target=self._wait_for_model_readiness, daemon=True).start()
@@ -623,12 +625,12 @@ class DictationApp(rumps.App):
 
     def _settle_spill(self, record) -> bool:
         """After a dictation the audio lives in exactly one place: the
-        archive when it was written, otherwise the recovery spill. True when
-        it is kept somewhere."""
+        archive when it was written, otherwise an unsaved recording of its
+        own. True when it is kept somewhere."""
         if record is not None:
             self.recorder.discard_recovery()
             return True
-        return self.recorder.preserve_recovery(only_if_larger=True)
+        return self.recorder.preserve_recovery()
 
     def _transcribe_recording_worker(self, session: int) -> None:
         record = None
@@ -687,21 +689,22 @@ class DictationApp(rumps.App):
 
             # Transcription succeeded — always publish the result even if
             # cancel was requested while inference was running. The cancel
-            # only interrupts via _check_cancel raising TranscriptionError;
-            # if we got here, the work is done and shouldn't be discarded.
+            # only interrupts by raising TranscriptionCancelled; if we got
+            # here, the work is done and shouldn't be discarded.
             raw_text = text
             result_text, delivered = self._publish_transcript(text, Source.MICROPHONE, "Live Dictation", session)
             outcome = RecordingStatus.DONE
             result_message = self._capture_warning
             if self._capture_warning:
                 self._push_status(self._capture_warning, revert_after=8)
+        except TranscriptionCancelled:
+            outcome = RecordingStatus.CANCELLED
+            result_message = "Cancelled — audio kept for retry" if audio_kept else "Cancelled — could not save audio"
+            self._push_status(result_message, revert_after=8)
         except TranscriptionError as exc:
-            if self._cancel_event.is_set():
-                outcome = RecordingStatus.CANCELLED
-                result_message = "Cancelled — audio kept for retry" if audio_kept else "Cancelled — could not save audio"
-            else:
-                logger.error(str(exc))
-                result_message = f"{exc} — recording saved (see Recordings)" if audio_kept else str(exc)
+            # A real failure stays one even when Esc was pressed meanwhile.
+            logger.error(str(exc))
+            result_message = f"{exc} — recording saved (see Recordings)" if audio_kept else str(exc)
             self._push_status(result_message, revert_after=8)
         except Exception:
             # The worker must always hand the UI back; the audio is settled
@@ -790,12 +793,11 @@ class DictationApp(rumps.App):
             # Same invariant as mic transcription: if transcribe_file returned
             # text, publish it even if cancel was requested mid-inference.
             self._publish_transcript(text, Source.FILE, filename, session)
+        except TranscriptionCancelled:
+            self._push_status("Cancelled", revert_after=5)
         except TranscriptionError as exc:
-            if self._cancel_event.is_set():
-                self._push_status("Cancelled", revert_after=5)
-            else:
-                logger.error(str(exc))
-                self._push_status(str(exc), revert_after=5)
+            logger.error(str(exc))
+            self._push_status(str(exc), revert_after=5)
         except Exception:
             logger.exception(f"Unexpected error transcribing {filename}")
             self._push_status("Transcription failed unexpectedly", revert_after=5)
@@ -806,22 +808,24 @@ class DictationApp(rumps.App):
 
     def recover_last_recording(self) -> None:
         """Transcribe the capture most in need of it: audio that never
-        reached the recognizer, else the newest without a transcript, else a
-        spill file that could not be moved into the archive, else simply the
-        newest recording."""
+        reached the recognizer, else the newest without a transcript, else
+        the newest unsaved recording that could not be moved into the
+        archive, else simply the newest recording."""
         records = self.recordings.list_recordings()
         candidate = recovery_candidate(records)
+        unsaved = recovery.unsaved_recordings(self._support_dir)
         if candidate is not None:
             self.transcribe_recording(candidate.id)
-        elif recovery.has_last_recording(self._support_dir):
-            self.transcribe_recording(None)
+        elif unsaved:
+            self.transcribe_recording(unsaved[-1])
         elif records:
             self.transcribe_recording(records[0].id)
         else:
             self._push_status("No recording to recover", revert_after=5)
 
-    def transcribe_recording(self, recording_id: str | None) -> None:
-        """Transcribe an archived recording, or the recovery spill for None."""
+    def transcribe_recording(self, recording: str | Path) -> None:
+        """Transcribe an archived recording (its id) or an unsaved recording
+        kept for recovery (its file)."""
         if not self._can_begin_transcribing():
             return
         self._previous_app = self._paste_target.current()
@@ -830,14 +834,14 @@ class DictationApp(rumps.App):
             self._recordings_window.stop_playback()
         self._show_transcribing_window()
         self._show_status("Transcribing saved recording…")
-        threading.Thread(target=self._recover_worker, args=(session, recording_id), daemon=True).start()
+        threading.Thread(target=self._recover_worker, args=(session, recording), daemon=True).start()
 
-    def _recover_worker(self, session: int, recording_id: str | None) -> None:
+    def _recover_worker(self, session: int, recording: str | Path) -> None:
         try:
             # Loaded here, not on the menu-click (main) thread: an hour of
             # PCM is ~115 MB.
-            pcm_bytes = (self.recordings.load_pcm(recording_id) if recording_id is not None
-                         else recovery.load_last_recording(self._support_dir))
+            pcm_bytes = (self.recordings.load_pcm(recording) if isinstance(recording, str)
+                         else recovery.load_unsaved(recording))
             if not pcm_bytes:
                 self._push_status("No recording to recover", revert_after=5)
                 return
@@ -847,32 +851,33 @@ class DictationApp(rumps.App):
             text = self._final_transcribe_pcm(pcm_bytes)
             if not text:
                 cancelled = self._cancel_event.is_set()
-                if recording_id is not None and not cancelled:
+                if isinstance(recording, str) and not cancelled:
                     # It has been tried now, so Recover Last Recording moves
                     # on to audio that has not.
-                    self.recordings.update(recording_id, status=RecordingStatus.FAILED,
+                    self.recordings.update(recording, status=RecordingStatus.FAILED,
                                            message="No transcript returned")
                 self._push_status("Cancelled" if cancelled
                                   else "No transcript returned — recording kept for retry", revert_after=8)
                 return
 
             published, _ = self._publish_transcript(text, Source.RECOVERY, "Recovered Recording", session)
-            if recording_id is None:
-                # The spill becomes an ordinary recording.
+            if isinstance(recording, Path):
+                # The unsaved recording becomes an ordinary one.
                 record = self.recordings.save(pcm_bytes)
                 if record is None:
                     return
+                recovery.discard_unsaved(recording)
                 recording_id = record.id
-                recovery.discard_last_recording(self._support_dir)
+            else:
+                recording_id = recording
             self.recordings.update(recording_id, status=RecordingStatus.DONE, text=published, raw_text=text,
                                    message="")
-        except TranscriptionError as exc:
+        except TranscriptionCancelled:
             # The audio stays where it is: recovery can be retried.
-            if self._cancel_event.is_set():
-                self._push_status("Cancelled", revert_after=5)
-            else:
-                logger.error(str(exc))
-                self._push_status(str(exc), revert_after=5)
+            self._push_status("Cancelled", revert_after=5)
+        except TranscriptionError as exc:
+            logger.error(str(exc))
+            self._push_status(str(exc), revert_after=5)
         except Exception:
             logger.exception("Unexpected recovery error")
             self._push_status("Recovery failed unexpectedly", revert_after=5)
@@ -967,12 +972,13 @@ class DictationApp(rumps.App):
 
                 try:
                     text = self._final_transcribe_file(item.path, _progress, self._queue_cancel_event)
+                except TranscriptionCancelled:
+                    self.queue.set_status(item.id, QueueStatus.CANCELLED)
+                    self._refresh_queue_on_main()
+                    continue
                 except TranscriptionError as exc:
-                    if self._queue_cancel_event.is_set():
-                        self.queue.set_status(item.id, QueueStatus.CANCELLED)
-                    else:
-                        self.queue.set_status(item.id, QueueStatus.FAILED, error=str(exc))
-                        logger.error(f"Queue item failed: {item.filename}: {exc}")
+                    self.queue.set_status(item.id, QueueStatus.FAILED, error=str(exc))
+                    logger.error(f"Queue item failed: {item.filename}: {exc}")
                     self._refresh_queue_on_main()
                     continue
                 except Exception as exc:
@@ -1292,7 +1298,7 @@ class DictationApp(rumps.App):
             self._push_status(f"Could not clear recordings: {exc}", revert_after=8)
             return
         self.recorder.discard_recovery()
-        recovery.discard_last_recording(self._support_dir)
+        recovery.discard_every_unsaved(self._support_dir)
         cleared = self.history_store.clear()
         self.current_transcript = ""
         self.overlay_controller.set_current_text("")

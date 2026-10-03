@@ -52,17 +52,53 @@ def test_wav_is_recoverable_without_usable_metadata(tmp_path, metadata):
 
 
 def test_failed_metadata_write_does_not_remove_audio(tmp_path, monkeypatch):
+    from parakeet_dictation import recordings
+
     store = RecordingStore(tmp_path)
 
-    def fail(_record):
+    def fail(*_args):
         raise OSError("disk full")
 
-    monkeypatch.setattr(store, "_write_metadata", fail)
-    with pytest.raises(OSError):
-        store.save(b"\x01\x02" * 16000)
+    monkeypatch.setattr(recordings, "write_text_atomically", fail)
+    # The audio is in place, so the caller is told it was saved and does not
+    # keep a second copy for recovery.
+    saved = store.save(b"\x01\x02" * 16000)
+    assert saved is not None
     records = RecordingStore(tmp_path).list_recordings()
-    assert len(records) == 1
+    assert [record.id for record in records] == [saved.id]
+    assert [path.suffix for path in tmp_path.iterdir()] == [".wav"]
     assert RecordingStore(tmp_path).load_pcm(records[0].id) == b"\x01\x02" * 16000
+
+
+def test_failed_pruning_does_not_unsave_the_new_recording(tmp_path, monkeypatch):
+    store = RecordingStore(tmp_path)
+
+    def fail(_newest_id):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(store, "_prune", fail)
+    assert store.save(b"\x01\x02" * 16000) is not None
+
+
+def test_archive_folder_removed_while_running_is_made_again(tmp_path):
+    import shutil
+
+    store = RecordingStore(tmp_path / "recordings")
+    shutil.rmtree(tmp_path / "recordings")
+    store.clear()  # Nothing left to clear is not an error.
+    record = store.save(b"\x01\x02" * 16000)
+    assert [entry.id for entry in store.list_recordings()] == [record.id]
+
+
+def test_writes_interrupted_by_a_crash_are_swept_with_the_next_save(tmp_path):
+    store = RecordingStore(tmp_path)
+    for suffix in (".wav.tmp", ".json.tmp"):
+        (tmp_path / (("e" * 32) + suffix)).write_bytes(b"private audio from a killed save")
+    unrelated = tmp_path / "notes.tmp"
+    unrelated.write_text("keep")
+    record = store.save(b"\x01\x02" * 16000)
+    assert sorted(path.name for path in tmp_path.iterdir()) == sorted(
+        [f"{record.id}.wav", f"{record.id}.json", "notes.tmp"])
 
 
 def test_retention_count_and_byte_budget(tmp_path):

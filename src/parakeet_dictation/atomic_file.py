@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob
 import os
 from pathlib import Path
 
@@ -40,3 +41,12 @@ def set_aside(path: Path, why: str) -> None:
         logger.error(f"{path.name} could not be read ({why}); kept as {kept.name} and starting fresh")
     except OSError as exc:
         logger.error(f"{path.name} could not be read ({why}) and could not be set aside: {exc}")
+
+
+def remove_leftovers(path: Path) -> None:
+    """Delete what this module may have left beside `path`: copies set aside
+    by set_aside() and the temporary file of an interrupted write. For a
+    caller erasing the file's contents for good."""
+    for leftover in (path.with_name(path.name + ".tmp"), path.with_name(path.name + ".corrupt"),
+                     *path.parent.glob(f"{glob.escape(path.name)}.corrupt-*")):
+        leftover.unlink(missing_ok=True)

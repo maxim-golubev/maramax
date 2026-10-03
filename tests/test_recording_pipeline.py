@@ -115,7 +115,39 @@ def test_archive_write_failure_keeps_spill_and_publishes_transcript(tmp_path, mo
     monkeypatch.setattr(controller.recordings, "save", fail)
     controller._transcribe_recording_worker(1)
     assert published == ["Words"]
-    assert recovery.load_last_recording(tmp_path) == pcm  # The spill is the only copy, so it is kept.
+    # The spill is the only copy, so it is kept.
+    assert [recovery.load_unsaved(path) for path in recovery.unsaved_recordings(tmp_path)] == [pcm]
+
+
+def test_every_dictation_keeps_its_audio_while_archiving_keeps_failing(tmp_path, monkeypatch):
+    controller, statuses, _, _ = pipeline(tmp_path, monkeypatch, b"")
+
+    def fail(*_args):
+        raise OSError("Disk full")
+
+    monkeypatch.setattr(controller.recordings, "save", fail)
+    captures = [b"\x01\x00" * 16000 * 60, b"\x02\x00" * 16000 * 10, b"\x03\x00" * 16000 * 90]
+    for pcm in captures:
+        recovery.in_progress_path(tmp_path).write_bytes(pcm)
+        controller.recorder.stop = lambda pcm=pcm: pcm
+        controller._transcribe_recording_worker(1)
+        assert statuses[-1] == "No transcript returned — audio kept for retry"
+    # A shorter capture used to be deleted, and a longer one replaced the first.
+    assert [recovery.load_unsaved(path) for path in recovery.unsaved_recordings(tmp_path)] == captures
+
+
+def test_a_recording_saved_without_its_details_is_not_also_kept_for_recovery(tmp_path, monkeypatch):
+    from parakeet_dictation import recordings
+
+    def fail(*_args):
+        raise OSError("No space left on device")
+
+    controller, _, published, _ = pipeline(tmp_path, monkeypatch, b"\x01\x02" * 16000, "Words")
+    monkeypatch.setattr(recordings, "write_text_atomically", fail)
+    controller._transcribe_recording_worker(1)
+    assert published == ["Words"]
+    assert len(controller.recordings.list_recordings()) == 1
+    assert spill_files(tmp_path) == []  # Otherwise the next launch archives it a second time.
 
 
 def test_inference_error_keeps_the_audio_once_and_finishes_ui(tmp_path, monkeypatch):
@@ -152,13 +184,29 @@ def test_cancelled_dictation_is_archived_as_cancelled(tmp_path, monkeypatch):
 
     def cancelled(_pcm):
         controller._cancel_event.set()
-        raise module.TranscriptionError("Cancelled")
+        raise module.TranscriptionCancelled("Cancelled")
 
     controller._final_transcribe_pcm = cancelled
     controller._transcribe_recording_worker(1)
     assert statuses[-1] == "Cancelled — audio kept for retry"
     assert controller.recordings.list_recordings()[0].status == "cancelled"
     assert spill_files(tmp_path) == []
+
+
+def test_a_real_failure_after_esc_is_reported_as_a_failure(tmp_path, monkeypatch):
+    controller, statuses, _, _ = pipeline(tmp_path, monkeypatch, b"\x01\x02" * 16000)
+    logged = []
+    monkeypatch.setattr(module.logger, "error", logged.append)
+
+    def failed(_pcm):
+        controller._cancel_event.set()  # Esc, while the model was failing to load.
+        raise module.TranscriptionError("Model failed to load")
+
+    controller._final_transcribe_pcm = failed
+    controller._transcribe_recording_worker(1)
+    assert statuses[-1] == "Model failed to load — recording saved (see Recordings)"
+    assert controller.recordings.list_recordings()[0].status == "failed"
+    assert logged == ["Model failed to load"]
 
 
 def test_actual_pcm_wins_over_a_snapshot_taken_before_the_first_frame(tmp_path, monkeypatch):
@@ -175,7 +223,7 @@ def test_total_storage_failure_does_not_claim_the_audio_was_saved(tmp_path, monk
         raise OSError("Disk full")
 
     monkeypatch.setattr(controller.recordings, "save", fail)
-    controller.recorder.preserve_recovery = lambda **_kwargs: False
+    controller.recorder.preserve_recovery = lambda: False
     controller._transcribe_recording_worker(1)
     assert "could not save audio" in statuses[-1]
 

@@ -79,8 +79,11 @@ def test_switching_inputs_pauses_the_disconnect_deadline():
     now[0] = 6
     assert meter.snapshot().health == "reconnecting"
     meter.set_reconnecting(False)  # The replacement device gets a fresh wait.
+    assert meter.snapshot().health == "waiting"
+    now[0] = 6.5
+    meter.feed(b"\x10\x00" * 512)
     assert meter.snapshot().health == "receiving"
-    now[0] = 9.5
+    now[0] = 10
     assert meter.snapshot().health == "disconnected"
 
 
@@ -131,6 +134,20 @@ def test_helper_repairs_a_route_before_the_app_gives_up_on_it():
     assert audio_worker.STALL_SECONDS < capture.STALLED_SECONDS
     assert audio_worker.NO_AUDIO_SECONDS < capture.NO_FRAME_SECONDS
     assert audio_worker.SILENT_ROUTE_SECONDS < capture.QUIET_SECONDS
+
+    # A replacement for a stream that had delivered: the helper gives it
+    # NO_AUDIO_SECONDS for a first buffer before reopening again, so the app
+    # must still be waiting then, not reporting a disconnection.
+    now = [0.0]
+    meter = CaptureMeter(clock=lambda: now[0])
+    meter.mark_open()
+    meter.feed(b"\x10\x00" * 512)
+    now[0] = 1.6
+    meter.set_reconnecting(True)
+    now[0] = 2.0
+    meter.set_reconnecting(False)
+    now[0] += audio_worker.NO_AUDIO_SECONDS + 0.1
+    assert meter.snapshot().health == "waiting"
 
 
 def test_route_failure_is_judged_on_what_the_current_stream_delivered():

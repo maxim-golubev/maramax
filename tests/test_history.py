@@ -84,6 +84,46 @@ def test_originals_are_retained_without_breaking_older_history_readers(tmp_path)
     assert json.loads(store.originals_path.read_text()) == {}
 
 
+def test_unreadable_originals_are_set_aside_not_overwritten(tmp_path):
+    store = HistoryStore(base_dir=tmp_path)
+    store.add_entry("microphone", "Dictation", "Maramax", raw_text="mara max")
+    store.originals_path.write_text("{truncated")
+    reopened = HistoryStore(base_dir=tmp_path)
+    reopened.add_entry("microphone", "Next", "words")
+    assert (tmp_path / "history-originals.json.corrupt").read_text() == "{truncated"
+    assert json.loads(store.originals_path.read_text()) == {}
+
+
+def test_history_folder_removed_while_running_is_made_again(tmp_path):
+    import shutil
+
+    store = HistoryStore(base_dir=tmp_path / "Maramax")
+    shutil.rmtree(tmp_path / "Maramax")
+    store.add_entry("microphone", "Next", "words")
+    assert len(HistoryStore(base_dir=tmp_path / "Maramax").list_entries()) == 1
+
+
+def test_clear_leaves_no_transcript_anywhere(tmp_path):
+    secret = "my bank PIN is 1234"
+    legacy = tmp_path / "ParakeetDictation" / "history.json"
+    legacy.parent.mkdir()
+    legacy.write_text(json.dumps([{"id": "legacy", "created_at": "2026-03-09T00:00:00+00:00",
+                                   "source_kind": "microphone", "source_label": "Legacy", "text": secret}]))
+    support = tmp_path / "Maramax"
+    adopt_legacy_history(support)
+    (support / "history.json.corrupt").write_text(secret)        # Set aside once as unreadable,
+    (support / "history.json.corrupt-2").write_text(secret)      # and again,
+    (support / "history-originals.json.corrupt").write_text(secret)
+    (support / "history.json.tmp").write_text(secret)            # and a write a crash interrupted.
+    store = HistoryStore(base_dir=support)
+    store.add_entry("microphone", "Dictation", secret, raw_text=secret + " raw")
+    unrelated = support / "settings.json"
+    unrelated.write_text("{}")
+    assert store.clear()
+    assert [path for path in tmp_path.rglob("*") if path.is_file() and secret in path.read_text()] == []
+    assert unrelated.exists()
+
+
 def test_unreadable_history_is_set_aside_not_overwritten(tmp_path):
     (tmp_path / "history.json").write_text("")  # What a power loss can leave behind.
     store = HistoryStore(base_dir=tmp_path)

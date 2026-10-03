@@ -48,7 +48,8 @@ class CaptureSnapshot:
     callbacks: int
     overflow_count: int
     device_name: str
-    # Seconds from the capture request until the device reported itself open.
+    # Seconds from the capture request until the device reported itself open
+    # (for a replacement input, until it was reopened).
     open_delay: float | None = None
     # Seconds since the helper began opening a replacement input, if it is.
     reconnecting_seconds: float | None = None
@@ -126,18 +127,17 @@ class CaptureMeter:
 
     def set_reconnecting(self, reconnecting: bool) -> None:
         """A replacement stream is being opened mid-recording. Clearing the
-        flag restarts whichever frame deadline applies, so the new device
-        gets a fair wait for its first buffer."""
+        flag treats the new device as just opened: until its first buffer
+        it gets the no-buffer deadline, which outlasts the helper's own, so
+        a slow replacement is repaired again rather than given up on."""
         with self._lock:
             now = self._clock()
             if reconnecting:
                 self._reconnecting_since = now
                 return
             self._reconnecting_since = None
-            if self._last is None:
-                self._opened = now
-            else:
-                self._last = now
+            self._opened = now
+            self._last = None
 
     def feed(self, pcm: bytes, overflow: bool = False) -> None:
         # An empty callback isn't evidence that an audio route is working.

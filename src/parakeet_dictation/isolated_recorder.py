@@ -250,7 +250,7 @@ class IsolatedAudioRecorder:
             if cancel.is_set():
                 self.last_error = RuntimeError("Microphone connection cancelled")
                 return False
-            self.preserve_recovery(only_if_larger=True)
+            self.preserve_recovery()
             record = request(Operation.RECORD, device=self.device_name, prefer_builtin=self.prefer_builtin)
             for attempt in range(2):
                 # Taking the helper first also reaps a finished one, so its
@@ -453,10 +453,10 @@ class IsolatedAudioRecorder:
             if locked:
                 self._data_lock.release()
 
-    def preserve_recovery(self, only_if_larger=False) -> bool:
-        """Keep what was spilled as the recoverable last recording."""
+    def preserve_recovery(self) -> bool:
+        """Keep what was spilled as an unsaved recording of its own."""
         self._close_spill()
-        return recovery.promote_in_progress(self._recovery_dir, only_if_larger)
+        return recovery.promote_in_progress(self._recovery_dir)
 
     def discard_recovery(self) -> None:
         """The capture is safe elsewhere (or unwanted): drop the spill."""

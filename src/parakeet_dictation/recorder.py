@@ -64,6 +64,37 @@ def lid_closed() -> bool:
         return False
 
 
+class _PropertyAddress(ctypes.Structure):
+    """CoreAudio's AudioObjectPropertyAddress."""
+    _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("element", ctypes.c_uint32)]
+
+
+def default_input_device() -> int | None:
+    """CoreAudio's identifier of the system default input as it is now, or
+    None when it cannot be read. PortAudio cannot tell: it fixes its device
+    list, default included, when it initializes."""
+    try:
+        core_audio = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+        get = core_audio.AudioObjectGetPropertyData
+        get.restype = ctypes.c_int32
+        get.argtypes = [ctypes.c_uint32, ctypes.POINTER(_PropertyAddress), ctypes.c_uint32, ctypes.c_void_p,
+                        ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+        # kAudioHardwarePropertyDefaultInputDevice of kAudioObjectSystemObject,
+        # global scope, main element.
+        address = _PropertyAddress(int.from_bytes(b"dIn ", "big"), int.from_bytes(b"glob", "big"), 0)
+        device = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(ctypes.sizeof(device))
+        status = get(1, ctypes.byref(address), 0, None, ctypes.byref(size), ctypes.byref(device))
+        if status != 0:
+            raise OSError(f"AudioObjectGetPropertyData returned {status}")
+        return device.value
+    except Exception as exc:
+        # Unknown compares equal to unknown, so a kept-warm stream is then
+        # reused as it was before the default was checked.
+        logger.debug(f"Default input device unavailable: {exc}")
+        return None
+
+
 class AudioRecorder:
     def __init__(self, device_name: str | None = None, prefer_builtin: bool = True):
         # None records from Automatic; a name is resolved strictly.

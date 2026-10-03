@@ -337,7 +337,7 @@ def test_crash_leftover_is_moved_into_recordings_once(monkeypatch, tmp_path):
 
     app, _ = controller(monkeypatch)
     pcm = b"\x01\x00" * 16000
-    recovery.last_recording_path(tmp_path).write_bytes(pcm + b"\x07")  # An interrupted write: odd length.
+    (tmp_path / recovery.LEGACY_NAME).write_bytes(pcm + b"\x07")  # 0.6.x's slot, an interrupted write.
     app.recordings = RecordingStore(tmp_path / "recordings")
     app._support_dir = tmp_path
     app._adopt_recovered_audio()
@@ -347,7 +347,60 @@ def test_crash_leftover_is_moved_into_recordings_once(monkeypatch, tmp_path):
     assert records[0].status == "saved"
     assert "interrupted" in records[0].message
     assert app.recordings.load_pcm(records[0].id) == pcm
-    assert not recovery.has_last_recording(tmp_path)
+    assert recovery.unsaved_recordings(tmp_path) == []
+
+
+def test_every_unsaved_recording_is_adopted_oldest_first(monkeypatch, tmp_path):
+    from parakeet_dictation import recovery
+
+    app, _ = controller(monkeypatch)
+    app.recordings = RecordingStore(tmp_path / "recordings")
+    app._support_dir = tmp_path
+    captures = [bytes([n, 0]) * 16000 for n in (1, 2, 3)]
+    for pcm in captures:
+        recovery.in_progress_path(tmp_path).write_bytes(pcm)
+        recovery.promote_in_progress(tmp_path)
+    app._adopt_recovered_audio()
+    newest_first = [app.recordings.load_pcm(record.id) for record in app.recordings.list_recordings()]
+    assert newest_first == captures[::-1]
+    assert recovery.unsaved_recordings(tmp_path) == []
+
+
+def test_recover_transcribes_an_unsaved_recording_into_the_archive(monkeypatch, tmp_path):
+    from parakeet_dictation import recovery
+
+    app, _ = controller(monkeypatch)
+    app.recordings = RecordingStore(tmp_path / "recordings")
+    app._support_dir = tmp_path
+    pcm = b"\x01\x00" * 16000
+    recovery.in_progress_path(tmp_path).write_bytes(pcm)
+    recovery.promote_in_progress(tmp_path)
+    chosen = []
+    app.transcribe_recording = chosen.append
+    app.recover_last_recording()
+    assert chosen == recovery.unsaved_recordings(tmp_path)
+    app._final_transcribe_pcm = lambda _pcm: "Words"
+    app._publish_transcript = lambda text, *_args: (text, True)
+    app._recover_worker(0, chosen[0])
+    records = app.recordings.list_recordings()
+    assert [(record.status, record.text) for record in records] == [("done", "Words")]
+    assert app.recordings.load_pcm(records[0].id) == pcm
+    assert recovery.unsaved_recordings(tmp_path) == []
+
+
+def test_a_media_failure_after_esc_is_reported_and_logged(monkeypatch):
+    app, calls = controller(monkeypatch)
+    logged = []
+    monkeypatch.setattr(module.logger, "error", logged.append)
+
+    def failed(*_args):
+        app._cancel_event.set()
+        raise module.TranscriptionError("Could not process talk.mp4: invalid data")
+
+    app._final_transcribe_file = failed
+    app._transcribe_file_worker("/tmp/talk.mp4", "talk.mp4", 0)
+    assert calls[-1] == "Could not process talk.mp4: invalid data"
+    assert logged == ["Could not process talk.mp4: invalid data"]
 
 
 def test_microphone_settings_reach_the_recorder_through_one_place(monkeypatch):
