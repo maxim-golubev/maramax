@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import math
+
 import objc
 from AppKit import (
-    NSBezelBorder, NSButton, NSColor, NSLineBreakByTruncatingTail, NSMakeRect, NSScrollView, NSTableColumn,
-    NSTableView, NSTableViewLastColumnOnlyAutoresizingStyle, NSTableViewStyleFullWidth, NSTextField,
-    NSTextFieldRoundedBezel,
+    NSBezelBorder, NSButton, NSColor, NSLayoutConstraint, NSLineBreakByTruncatingTail, NSMakeRect, NSScrollView,
+    NSTableCellView, NSTableColumn, NSTableHeaderCell, NSTableView, NSTableViewLastColumnOnlyAutoresizingStyle,
+    NSTableViewStyleFullWidth, NSTextField, NSTextFieldRoundedBezel, NSTextView,
 )
 from Foundation import NSIndexSet, NSObject
 
 from .corrections import MAX_RULES, RuleRefused, apply_replacements, edited_rules, find_rule, rule_key
-from .layout import small_text, spacer, stack
+from .layout import aligned_width, small_text, spacer, stack
 
 HEARD = "heard"
 REPLACEMENT = "replacement"
@@ -23,6 +25,13 @@ EMPTY_GUIDE = "No replacements yet. Type what the transcript says and how it sho
 # Shown in place of a line break in a replacement of several lines.
 _LINE_BREAK = " ⏎ "
 _DELETE_KEYS = ("\x7f", "\uf728")  # Delete, Forward Delete
+# How far right of its column a cell's text starts beyond its leading
+# constraint: the list's border, the cell's place in its column, and the
+# label's own padding (measured; tests/test_preferences.py holds it to the
+# fields above the list).
+_CELL_TEXT_OFFSET = 5
+# How far left of its column's text a header cell draws its title (measured likewise).
+_HEADER_TEXT_SHIFT = 2
 
 
 def count_text(count: int) -> str:
@@ -39,6 +48,15 @@ def displayed_rules(rules: list[dict[str, str]]) -> list[dict[str, str]]:
 def editable_in_place(text: str) -> bool:
     """A table cell edits one line; a replacement of several lines is changed by adding it again."""
     return "\n" not in text
+
+
+class RuleHeaderCell(NSTableHeaderCell):
+    """A column title that starts where the column's text does."""
+
+    def drawingRectForBounds_(self, bounds):
+        rect = objc.super(RuleHeaderCell, self).drawingRectForBounds_(bounds)
+        return NSMakeRect(rect.origin.x + _HEADER_TEXT_SHIFT, rect.origin.y,
+                          rect.size.width - _HEADER_TEXT_SHIFT, rect.size.height)
 
 
 class RuleTable(NSTableView):
@@ -67,26 +85,37 @@ class ReplacementsEditor(NSObject):
         # What the list was before the last removal, while Undo can still bring it back.
         self._before_removal = None
         add = NSButton.buttonWithTitle_target_action_("Add", self, "addRule:")
-        field_width = (width - add.fittingSize().width - 2 * GAP) / 2
+        # Whole points, so no edge falls between pixels; Add takes what is
+        # left, so its bezel ends where the list does.
+        field_width = math.floor((width - aligned_width(add) - 2 * GAP) / 2)
+        add.widthAnchor().constraintEqualToConstant_(width - 2 * field_width - 2 * GAP).setActive_(True)
         self.heard = self._field(_TITLES[HEARD], field_width)
         self.replacement = self._field(_TITLES[REPLACEMENT], field_width)
         add_row = stack([self.heard, self.replacement, add], horizontal=True, spacing=GAP)
 
         self.table = RuleTable.alloc().initWithFrame_(NSMakeRect(0, 0, width, 100))
+        self.table.setStyle_(NSTableViewStyleFullWidth)
+        # The second column starts where the second field does, so each
+        # column's text sits under the text of the field that adds to it.
+        first_width = field_width + GAP - self.table.intercellSpacing().width
         for identifier in (HEARD, REPLACEMENT):
             column = NSTableColumn.alloc().initWithIdentifier_(identifier)
-            column.setTitle_(_TITLES[identifier])
-            column.setEditable_(True)
-            column.dataCell().setLineBreakMode_(NSLineBreakByTruncatingTail)
-            column.setWidth_(field_width + GAP / 2 if identifier == HEARD else width - field_width)
+            header = RuleHeaderCell.alloc().initTextCell_(_TITLES[identifier])
+            header.setFont_(column.headerCell().font())
+            column.setHeaderCell_(header)
+            column.setWidth_(first_width if identifier == HEARD else width - first_width)
             self.table.addTableColumn_(column)
-        self.table.setStyle_(NSTableViewStyleFullWidth)
         self.table.setColumnAutoresizingStyle_(NSTableViewLastColumnOnlyAutoresizingStyle)
         self.table.setUsesAlternatingRowBackgroundColors_(True)
         self.table.setAllowsMultipleSelection_(True)
         self.table.setAllowsColumnReordering_(False)
         self.table.setDataSource_(self)
         self.table.setDelegate_(self)
+        self.table.setTarget_(self)
+        self.table.setDoubleAction_("editRule:")
+        # Cell text starts where a field's text does; measured, not assumed.
+        self._cell_inset = (self.heard.cell().drawingRectForBounds_(NSMakeRect(0, 0, field_width, 22)).origin.x
+                            - _CELL_TEXT_OFFSET)
         scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, width, 100))
         scroll.setDocumentView_(self.table)
         scroll.setHasVerticalScroller_(True)
@@ -115,7 +144,11 @@ class ReplacementsEditor(NSObject):
 
         self.view = stack([add_row, scroll, list_row, self.note], spacing=6)
         self.view.setCustomSpacing_afterView_(10, add_row)
-        self.trial_view = stack([self.trial, self.trial_result], spacing=6)
+        # The sentence with replacements applied starts where the typed one does.
+        result_row = stack([self.trial_result])
+        result_row.setEdgeInsets_((0, self.trial.cell().drawingRectForBounds_(NSMakeRect(0, 0, width, 22)).origin.x
+                                   + self.trial_result.alignmentRectInsets().left, 0, 0))
+        self.trial_view = stack([self.trial, result_row], spacing=6)
         self._say(GUIDE if owner.config.replacements else EMPTY_GUIDE)
         self.refresh()
         self._on_resize = on_resize
@@ -190,8 +223,11 @@ class ReplacementsEditor(NSObject):
     def _finish_cell_edit(self):
         """A cell edit still open belongs to the list as it is now: save it
         before an action changes the list under its row number."""
-        if self.table.editedRow() >= 0:
-            self.table.window().makeFirstResponder_(self.table)
+        window = self.table.window()
+        responder = window.firstResponder() if window is not None else None
+        if (isinstance(responder, NSTextView) and responder.isFieldEditor()
+                and isinstance(responder.delegate(), NSTextField) and self.table.rowForView_(responder.delegate()) >= 0):
+            window.makeFirstResponder_(self.table)
 
     @objc.python_method
     def _save(self, rules, heard, message):
@@ -208,21 +244,54 @@ class ReplacementsEditor(NSObject):
     def numberOfRowsInTableView_(self, table):
         return len(self.rules)
 
-    def tableView_objectValueForTableColumn_row_(self, table, column, row):
-        text = self.rules[row][str(column.identifier())]
-        return text if editable_in_place(text) else _LINE_BREAK.join(text.splitlines())
+    def tableView_viewForTableColumn_row_(self, table, column, row):
+        identifier = str(column.identifier())
+        cell = table.makeViewWithIdentifier_owner_(identifier, self) or self._cell(identifier)
+        text = self.rules[row][identifier]
+        cell.textField().setStringValue_(text if editable_in_place(text) else _LINE_BREAK.join(text.splitlines()))
+        cell.textField().setEditable_(editable_in_place(text))
+        return cell
 
-    def tableView_shouldEditTableColumn_row_(self, table, column, row):
-        if editable_in_place(self.rules[row][str(column.identifier())]):
-            return True
-        self._say("This replacement has several lines. To change it, remove it and add it again.")
-        return False
+    @objc.python_method
+    def _cell(self, identifier):
+        """One line of text, centred in the row, edited in place."""
+        field = NSTextField.labelWithString_("")
+        field.setLineBreakMode_(NSLineBreakByTruncatingTail)
+        field.cell().setUsesSingleLineMode_(True)
+        field.setTarget_(self)
+        field.setAction_("ruleEdited:")
+        field.cell().setSendsActionOnEndEditing_(True)  # Tab or a click away saves, as Return does.
+        field.setTranslatesAutoresizingMaskIntoConstraints_(False)
+        cell = NSTableCellView.alloc().initWithFrame_(NSMakeRect(0, 0, 100, 24))
+        cell.setIdentifier_(identifier)
+        cell.addSubview_(field)
+        cell.setTextField_(field)
+        NSLayoutConstraint.activateConstraints_([
+            field.leadingAnchor().constraintEqualToAnchor_constant_(cell.leadingAnchor(), self._cell_inset),
+            field.trailingAnchor().constraintEqualToAnchor_constant_(cell.trailingAnchor(), -self._cell_inset),
+            field.centerYAnchor().constraintEqualToAnchor_(cell.centerYAnchor()),
+        ])
+        return cell
 
-    def tableView_setObjectValue_forTableColumn_row_(self, table, value, column, row):
-        if not 0 <= row < len(self.rules):
+    def editRule_(self, sender):
+        """A double-click: edit the clicked cell where it is."""
+        del sender
+        row, column = self.table.clickedRow(), self.table.clickedColumn()
+        if not (0 <= row < len(self.rules) and column >= 0):
+            return
+        identifier = str(self.table.tableColumns()[column].identifier())
+        if not editable_in_place(self.rules[row][identifier]):
+            self._say("This replacement has several lines. To change it, remove it and add it again.")
+            return
+        self.table.editColumn_row_withEvent_select_(column, row, None, True)
+
+    def ruleEdited_(self, sender):
+        """A cell's text field finished editing (Return, Tab, or a click away)."""
+        row, column = self.table.rowForView_(sender), self.table.columnForView_(sender)
+        if not (0 <= row < len(self.rules) and column >= 0):
             return  # The list changed under the edit.
         changed = dict(self.rules[row])
-        changed[str(column.identifier())] = str(value or "")
+        changed[str(self.table.tableColumns()[column].identifier())] = str(sender.stringValue())
         if changed == self.rules[row]:
             return
         result = edited_rules(self.rules, changed[HEARD], changed[REPLACEMENT], at=row)

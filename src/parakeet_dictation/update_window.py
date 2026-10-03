@@ -63,8 +63,11 @@ class UpdateProgressWindow(NSObject):
         self.detail.setFrame_(NSMakeRect(TEXT_LEFT, HEIGHT - 90, inner, 16))
         self.cancel = NSButton.buttonWithTitle_target_action_("Cancel", self, "cancel:")
         self.cancel.setKeyEquivalent_("\x1b")
+        # Placed by its bezel, so it ends where the progress bar does.
         size = self.cancel.fittingSize()
-        self.cancel.setFrame_(NSMakeRect(WIDTH - MARGIN - size.width, 12, size.width, size.height))
+        bezel = self.cancel.alignmentRectForFrame_(NSMakeRect(0, 0, size.width, size.height))
+        self.cancel.setFrame_(self.cancel.frameForAlignmentRect_(
+            NSMakeRect(WIDTH - MARGIN - bezel.size.width, MARGIN, bezel.size.width, bezel.size.height)))
         for view in (icon, self.title, self.bar, self.detail, self.cancel):
             content.addSubview_(view)
         return self

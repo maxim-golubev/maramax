@@ -49,12 +49,15 @@ src/parakeet_dictation/
                        alignment rectangle (_place) from one set of constants.
   preferences.py       PreferencesController: the Settings window, a toolbar of General, Microphone, and Words over pages
                        laid out with NSStackView.
-  replacements_editor.py ReplacementsEditor: the Words tab's list of every rule (an NSTableView, alphabetical), edited in
-                       place, with Add, Remove / Delete, Undo, and Try it. Each edit goes through edited_rules().
+  replacements_editor.py ReplacementsEditor: the Words tab's list of every rule (a view-based NSTableView, alphabetical:
+                       each cell a text field centred in its row), edited in place, with Add, Remove / Delete, Undo, and
+                       Try it. Each edit goes through edited_rules(). Column text, titles, and Add line up with the fields
+                       above, measured from the fields (tests/test_preferences.py checks the drawn pixels).
   recordings_window.py RecordingsController: playback, WAV export, Transcribe Again.
   main_thread.py       call_later(): delayed main-thread callbacks that also fire while a modal dialog is open.
   layout.py            What the native windows are laid out with: stack() (rows on the first baseline, columns on the
-                       leading edge), spacer(), small_text() for help and notes.
+                       leading edge), spacer(), aligned_width() (a button's width without the margin it draws no
+                       bezel in, so rows end on the page's edge), small_text() for help and notes.
 
   updater.py           Replacing the app with a newer GitHub release: latest_release() (asks GitHub) / newer_release() (pure),
                        download() (a delta when one is published for this version, else the whole app; SHA-256, bundle

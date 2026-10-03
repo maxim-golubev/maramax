@@ -13,7 +13,7 @@ from Foundation import NSObject
 from . import __version__
 from .config import Delivery
 from .hotkeys import STOP
-from .layout import small_text, stack
+from .layout import aligned_width, small_text, stack
 from .replacements_editor import ReplacementsEditor
 from .shortcut_picker import ShortcutPicker
 
@@ -211,9 +211,11 @@ class PreferencesController(NSObject):
         self.device_picker = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 100, 25), False)
         self.device_picker.setTarget_(self)
         self.device_picker.setAction_("selectDevice:")
-        self.device_picker.widthAnchor().constraintEqualToConstant_(400).setActive_(True)
-        picker_row = stack([self.device_picker, self._button("Refresh", "refreshDevices:")],
-                                 horizontal=True, spacing=ROW_GAP)
+        refresh = self._button("Refresh", "refreshDevices:")
+        # The row ends where the page's text does.
+        self.device_picker.widthAnchor().constraintEqualToConstant_(
+            CONTENT_WIDTH - aligned_width(refresh) - ROW_GAP).setActive_(True)
+        picker_row = stack([self.device_picker, refresh], horizontal=True, spacing=ROW_GAP)
 
         self.keep_ready = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 100, 25), False)
         self.keep_ready.setTarget_(self)

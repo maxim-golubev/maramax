@@ -12,7 +12,7 @@ from Foundation import NSObject
 
 from .config import AppConfig, Delivery
 from .hotkeys import STOP
-from .layout import small_text, spacer
+from .layout import aligned_width, small_text, spacer
 from .main_thread import call_later
 from .shortcut_picker import ShortcutPicker
 
@@ -86,6 +86,10 @@ class WelcomeController(NSObject):
         self.forward = NSButton.buttonWithTitle_target_action_("Continue", self, "goForward:")
         self.forward.setKeyEquivalent_("\r")
         row = self._stack([self.counter, spacer(), self.back, self.forward], horizontal=True)
+        # One width for both (once they share a parent), whatever they say, so
+        # neither moves from step to step when "Continue" becomes "Done".
+        self.forward.widthAnchor().constraintEqualToConstant_(aligned_width(self.forward)).setActive_(True)
+        self.back.widthAnchor().constraintEqualToAnchor_(self.forward.widthAnchor()).setActive_(True)
         constraints = []
         for page in [*self.pages, row]:
             page.setTranslatesAutoresizingMaskIntoConstraints_(False)
@@ -155,8 +159,9 @@ class WelcomeController(NSObject):
                                                                  "openAccessibility:")
         self.permission_note = small_text("", CONTENT_WIDTH)
         self.permission_row = self._stack([self.permission, self.permission_note], horizontal=True, spacing=8)
-        return self._stack([
-            self._title("When you finish speaking"),
+        title = self._title("When you finish speaking")
+        page = self._stack([
+            title,
             self.copy_choice,
             self._indented(small_text("Paste it yourself with Cmd+V. Nothing needs extra permission.",
                                       CONTENT_WIDTH)),
@@ -165,7 +170,13 @@ class WelcomeController(NSObject):
                                       "Maramax turned on under Privacy & Security → Accessibility in "
                                       "System Settings.", CONTENT_WIDTH)),
             self._indented(self.permission_row),
-        ], spacing=6)
+        ], spacing=10)
+        # As in Settings: the title stands apart as on every step, and each
+        # choice's explanation sits close under it.
+        page.setCustomSpacing_afterView_(12, title)
+        for choice in (self.copy_choice, self.paste_choice):
+            page.setCustomSpacing_afterView_(3, choice)
+        return page
 
     @objc.python_method
     def _indented(self, view):

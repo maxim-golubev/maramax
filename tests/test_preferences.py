@@ -40,9 +40,18 @@ def add(heard, replacement):
     editor.heard.setStringValue_(heard)
     editor.replacement.setStringValue_(replacement)
     editor.addRule_(None)
+def cell(column, row):
+    return editor.table.viewAtColumn_row_makeIfNecessary_(
+        editor.table.columnWithIdentifier_(column.identifier()), row, True).textField()
 def shown(column):
-    return [str(editor.tableView_objectValueForTableColumn_row_(editor.table, column, row))
-            for row in range(editor.numberOfRowsInTableView_(editor.table))]
+    return [str(cell(column, row).stringValue()) for row in range(editor.numberOfRowsInTableView_(editor.table))]
+def type_into(column, row, text):
+    """What finishing an edit in a cell does: its text field sends its action."""
+    cell(column, row).setStringValue_(text)
+    editor.ruleEdited_(cell(column, row))
+def field_editor():
+    responder = panel.panel.firstResponder()
+    return responder if responder.isKindOfClass_(__import__("AppKit").NSTextView) else None
 def note():
     return str(editor.note.stringValue())
 assert "No replacements yet" in note()
@@ -67,13 +76,13 @@ editor.controlTextDidChange_(SimpleNamespace(object=lambda: editor.heard))
 assert editor._selected_rows() == [2] and "already in the list" in note()
 editor.heard.setStringValue_("")
 # Changed in place: only that rule changes.
-editor.tableView_setObjectValue_forTableColumn_row_(editor.table, "Lyra!", replacement_column, 1)
+type_into(replacement_column, 1, "Lyra!")
 assert sorted(map(str, saved()), key=str) == sorted(map(str, [{"heard": "Kairos", "replacement": "Cairos"},
     {"heard": "lira", "replacement": "Lyra!"}, {"heard": "mara max", "replacement": "Maramax"}]))
-editor.tableView_setObjectValue_forTableColumn_row_(editor.table, "kairos", heard_column, 1)   # Taken by another.
+type_into(heard_column, 1, "kairos")   # Taken by another.
 assert "already in the list" in note() and "not saved" in note()
 assert {"heard": "lira", "replacement": "Lyra!"} in saved() and shown(heard_column)[1] == "lira"
-editor.tableView_setObjectValue_forTableColumn_row_(editor.table, "  ", replacement_column, 1)  # Empty.
+type_into(replacement_column, 1, "  ")  # Empty.
 assert {"heard": "lira", "replacement": "Lyra!"} in saved()
 # Remove takes the selected rules (Delete does the same), and Undo brings them back.
 editor._select([0, 2])
@@ -85,9 +94,9 @@ assert len(saved()) == 3 and editor.undo.isHidden()
 # Through AppKit, as a double-click does: the cell's editor opens, and Return saves.
 panel.show_tab(2)
 editor.table.editColumn_row_withEvent_select_(1, 1, None, True)
-assert str(editor.table.currentEditor().string()) == "Lyra!"
-editor.table.currentEditor().setString_("Lyra")
-editor.table.currentEditor().insertNewline_(None)
+assert str(field_editor().string()) == "Lyra!"
+field_editor().setString_("Lyra")
+field_editor().insertNewline_(None)
 assert {"heard": "lira", "replacement": "Lyra"} in saved() and note() == "Change saved."
 editor._select([1])
 from AppKit import NSEvent, NSEventTypeKeyDown
@@ -99,8 +108,7 @@ assert [rule["heard"] for rule in saved()] == ["Kairos", "mara max"] and note() 
 add("sig", "Kind regards,\nMaxim")
 row = shown(heard_column).index("sig")
 assert shown(replacement_column)[row] == "Kind regards, ⏎ Maxim"
-assert not editor.tableView_shouldEditTableColumn_row_(editor.table, replacement_column, row)
-assert editor.tableView_shouldEditTableColumn_row_(editor.table, heard_column, row)
+assert not cell(replacement_column, row).isEditable() and cell(heard_column, row).isEditable()
 # Try it shows a sentence with the replacements applied.
 editor.trial.setStringValue_("mara max met kairos")
 editor.controlTextDidChange_(SimpleNamespace(object=lambda: editor.trial))
@@ -176,7 +184,7 @@ assert panel.keep_ready.titleOfSelectedItem() == "1 minute"
 assert panel.model_retry.isHidden()
 assert set(panel.options) == set(_SETTING_LABELS)
 # Every tab's window ends the same distance below its content.
-from parakeet_dictation.preferences import MARGIN, duration_label
+from parakeet_dictation.preferences import CONTENT_WIDTH, MARGIN, duration_label
 content = panel.panel.contentView()
 for index, page in enumerate(panel.pages):
     panel.show_tab(index)
@@ -256,18 +264,69 @@ assert [rule["heard"] for rule in saved()] == ["alpha", "beta", "gamma"]   # Sav
 panel.show_tab(2)
 editor._select([0])
 editor.table.editColumn_row_withEvent_select_(1, 0, None, True)
-editor.table.currentEditor().setString_("X")
+field_editor().setString_("X")
 panel.refresh()                                   # A refresh for another reason leaves the edit open...
-assert editor.table.currentEditor() is not None and str(editor.table.currentEditor().string()) == "X"
+assert field_editor() is not None and str(field_editor().string()) == "X"
 editor.removeRules_(None)                         # ...and Remove first saves it, to alpha.
 assert saved() == [{"heard": "beta", "replacement": "BETA"}, {"heard": "gamma", "replacement": "GAMMA"}], saved()
 editor.undoRemoval_(None)
 assert saved()[0] == {"heard": "alpha", "replacement": "X"} and len(saved()) == 3
 editor._select([2])
 editor.table.editColumn_row_withEvent_select_(1, 2, None, True)
-editor.table.currentEditor().setString_("G")
+field_editor().setString_("G")
 add("aardvark", "Aardvark")                       # Sorts above the row being edited.
 assert {"heard": "gamma", "replacement": "G"} in saved() and {"heard": "beta", "replacement": "BETA"} in saved()
+from AppKit import NSAppearance
+panel.panel.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameAqua"))
+def ink_left(rect):
+    """Where the first dark pixel inside `rect` (window points) is drawn."""
+    rep = content.bitmapImageRepForCachingDisplayInRect_(content.bounds())
+    content.cacheDisplayInRect_toBitmapImageRep_(content.bounds(), rep)
+    scale, height = rep.pixelsWide() / content.bounds().size.width, content.bounds().size.height
+    rows = range(int((height - rect.origin.y - rect.size.height) * scale), int((height - rect.origin.y) * scale))
+    for x in range(int(rect.origin.x * scale), int((rect.origin.x + rect.size.width) * scale)):
+        for y in rows:
+            colour = rep.colorAtX_y_(x, y)
+            if colour.redComponent() + colour.greenComponent() + colour.blueComponent() < 1.2:
+                return x / scale
+    raise AssertionError(f"nothing drawn in {rect}")
+# Each column's text is centred in its row and starts where the text of the
+# field that adds to it does, so the fields read as the list's next row.
+content.layoutSubtreeIfNeeded()
+def text_rect(field):
+    return field.convertRect_toView_(field.cell().drawingRectForBounds_(field.bounds()), None)
+row_rect = editor.table.convertRect_toView_(editor.table.rectOfRow_(0), None)
+for column, field in ((heard_column, editor.heard), (replacement_column, editor.replacement)):
+    text = text_rect(cell(column, 0))
+    assert abs(text.origin.x - text_rect(field).origin.x) < 0.5, (text, text_rect(field))
+    assert abs((text.origin.y + text.size.height / 2) - (row_rect.origin.y + row_rect.size.height / 2)) < 0.5
+    # Its title starts where its text does, as drawn: the header pads its title inside its own rectangle.
+    header = editor.table.headerView()
+    column_index = editor.table.columnWithIdentifier_(column.identifier())
+    title_ink = ink_left(header.convertRect_toView_(header.headerRectOfColumn_(column_index), None))
+    cell_ink = ink_left(editor.table.convertRect_toView_(editor.table.frameOfCellAtColumn_row_(column_index, 0), None))
+    assert abs(title_ink - cell_ink) <= 1, (title_ink, cell_ink)   # Within a glyph's own side bearing.
+def visible(view):
+    return view.convertRect_toView_(view.alignmentRectForFrame_(view.frame()), None) if view.superview() is None else \
+        view.superview().convertRect_toView_(view.alignmentRectForFrame_(view.frame()), None)
+list_rect = editor.table.enclosingScrollView().convertRect_toView_(editor.table.enclosingScrollView().bounds(), None)
+add_button = editor.heard.superview().views()[-1]
+assert abs(visible(add_button).origin.x + visible(add_button).size.width - (list_rect.origin.x + list_rect.size.width)) < 0.5
+assert editor.heard.frame().size.width == int(editor.heard.frame().size.width)   # Edges on whole points.
+editor.trial.setStringValue_("Kairos")
+editor.controlTextDidChange_(SimpleNamespace(object=lambda: editor.trial))
+content.layoutSubtreeIfNeeded()
+result = editor.trial_result
+result_text = result.convertRect_toView_(result.cell().drawingRectForBounds_(result.bounds()), None)
+assert abs(result_text.origin.x - text_rect(editor.trial).origin.x) < 0.5     # Under the typed sentence.
+editor.trial.setStringValue_("")
+editor.controlTextDidChange_(SimpleNamespace(object=lambda: editor.trial))
+# On the Microphone tab the picker and Refresh end where the page's text does.
+panel.show_tab(1)
+content.layoutSubtreeIfNeeded()
+refresh = panel.device_picker.superview().views()[-1]
+assert abs(visible(refresh).origin.x + visible(refresh).size.width - (MARGIN + CONTENT_WIDTH)) < 0.5
+panel.show_tab(2)
 # The window grows with the Words page: a long Try it result is never cut off.
 editor.trial.setStringValue_("alpha beta gamma " * 30)
 editor.controlTextDidChange_(SimpleNamespace(object=lambda: editor.trial))

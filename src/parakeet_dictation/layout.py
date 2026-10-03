@@ -1,4 +1,4 @@
-"""The pieces Maramax's native windows are laid out with: stacks, a spacer, and the small grey explanatory text."""
+"""The pieces Maramax's native windows are laid out with: stacks, a spacer, widths, and small grey text."""
 
 from __future__ import annotations
 
@@ -26,6 +26,13 @@ def spacer():
     view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
     view.setContentHuggingPriority_forOrientation_(NSLayoutPriorityDefaultLow - 1, 0)
     return view
+
+
+def aligned_width(control):
+    """A control's natural width as auto layout and the eye measure it:
+    without the margin a push button draws no bezel in."""
+    size = control.fittingSize()
+    return control.alignmentRectForFrame_(NSMakeRect(0, 0, size.width, size.height)).size.width
 
 
 def small_text(text, width):

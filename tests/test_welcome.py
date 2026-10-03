@@ -328,3 +328,24 @@ for function, args in scheduled[:]:
     function(*args)                                          # One second later.
 assert len(scheduled) == 3 and scheduled[-1][1] == (2,)      # The older watch ended.
 ''')
+
+
+def test_the_step_buttons_stay_put_and_every_title_stands_as_far_from_its_step():
+    run(r'''
+from parakeet_dictation.welcome import STEPS, WelcomeController
+welcome = WelcomeController.alloc().initWithDelegate_(owner)
+root = welcome.panel.contentView()
+def visible(view):
+    return view.superview().convertRect_toView_(view.alignmentRectForFrame_(view.frame()), None)
+places, gaps = set(), set()
+for step in range(1, STEPS):                     # Back shows from the second step.
+    welcome.show_step(step)
+    root.layoutSubtreeIfNeeded()
+    back, forward = visible(welcome.back), visible(welcome.forward)
+    places.add((round(back.origin.x, 1), round(back.size.width, 1), round(forward.origin.x, 1)))
+    page = welcome.pages[step]
+    title, first = page.arrangedSubviews()[0], page.arrangedSubviews()[1]
+    gaps.add(round(visible(title).origin.y - (visible(first).origin.y + visible(first).size.height), 1))
+assert len(places) == 1, places                  # "Continue" becoming "Done" moves nothing.
+assert len(gaps) == 1, gaps                      # One distance from title to content on every step.
+''')

@@ -367,3 +367,12 @@ assert str(rendered_notes([]).string()) == NO_NOTES
 bad = rendered_notes(note_blocks("[bad](https://x.test/a|b)"))   # A URL macOS cannot parse: plain text.
 assert str(bad.string()) == "bad" and bad.attribute_atIndex_effectiveRange_("NSLink", 0, None)[0] is None
 ''')
+
+
+def test_the_progress_window_cancel_ends_where_the_bar_does():
+    run(r'''
+from parakeet_dictation.update_window import UpdateProgressWindow
+window = UpdateProgressWindow.alloc().initWithCancel_(lambda: None)
+cancel, bar = visible_rect(window.cancel), visible_rect(window.bar)
+assert abs((cancel.origin.x + cancel.size.width) - (bar.origin.x + bar.size.width)) < 0.5, (cancel, bar)
+''')

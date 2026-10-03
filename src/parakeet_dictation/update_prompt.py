@@ -288,6 +288,8 @@ def rendered_notes(blocks: list[Block]):
         if block.kind is BlockKind.HEADING:
             size = 13
             style.setParagraphSpacingBefore_(0 if index == 0 else 8)
+        elif block.kind is BlockKind.PARAGRAPH and index > 0 and blocks[index - 1].kind is BlockKind.BULLET:
+            style.setParagraphSpacingBefore_(6)  # Text after a list stands apart from its last item.
         elif block.kind is BlockKind.BULLET:
             style.setHeadIndent_(BULLET_INDENT)
             style.setTabStops_([NSTextTab.alloc().initWithTextAlignment_location_options_(0, BULLET_INDENT, {})])

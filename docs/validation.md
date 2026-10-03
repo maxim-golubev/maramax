@@ -638,3 +638,29 @@ its views moved to `layout.py`.
   in 2.7 s, kept the user's settings, and its first check, 57 s after launch,
   found itself the newest release. The 0.8.0 updater itself is first
   exercised live by the next release.
+
+## 0.8.1 visual audit — October 2, 2026
+
+The Words list drew its text at the top of each row: a cell-based table
+top-aligns text and cannot centre it. It is now view-based, each cell a text
+field centred in its row. Every window was then rendered off-screen in Light
+and Dark at 2x and measured by its drawn pixels rather than its frames, which
+include margins nothing is drawn in. Found and fixed:
+
+- Words: the column split sat 12 pt right of the gap between the fields
+  above; column titles started 2 pt left of their text; Add ended 13 pt short
+  of the list; the Try it result started 11.5 pt left of the typed sentence;
+  field widths fell on half points. All now start where the field text above
+  them starts (36.0 pt and 269.0 pt in both, by ink).
+- Microphone: the picker and Refresh ended 38 pt short of the page's edge.
+- Welcome: Back moved 23 pt on the last step, where "Done" is narrower than
+  "Continue"; step 3's title stood 6 pt from its content against 12 pt on the
+  other steps, and its explanations sat as far from their choice as from the
+  next one (now 3 pt, as in Settings).
+- Update progress: Cancel ended 6 pt inside the progress bar's edge.
+- Release notes: a paragraph after a list now stands apart from the list.
+
+Checked and consistent: the transcript window, the dictation bar, Recordings,
+the Software Update window's edges, and Dark mode throughout. Tests now hold
+each of these alignments, the column titles by measuring drawn pixels. 476
+tests pass.
