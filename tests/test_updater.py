@@ -13,17 +13,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from parakeet_dictation import bundle_delta, update_offer, update_window, updater
+from parakeet_dictation import bundle_delta, update_offer, update_prompt, update_window, updater
 from parakeet_dictation.config import AppConfig
 
 
 @pytest.fixture(autouse=True)
 def no_real_dialogs(monkeypatch):
-    """A test that reaches a real alert would put it on the screen and wait for a click."""
+    """A test that reaches a real alert or window would put it on the screen and wait for a click."""
     def refuse(*args, **kwargs):
         raise AssertionError("a test tried to show a real dialog")
     monkeypatch.setattr(update_offer.rumps, "alert", refuse)
-    monkeypatch.setattr(update_offer, "NSAlert", SimpleNamespace(alloc=refuse))
+    monkeypatch.setattr(update_offer, "UpdatePromptWindow", SimpleNamespace(alloc=refuse))
 
 
 def release_payload(tag="v0.5.2", assets=("Maramax-0.5.2.zip", "Maramax-0.5.2.zip.sha256"), body="Fixes."):
@@ -251,9 +251,34 @@ def test_the_kept_previous_copy_and_read_only_folders_are_refused_before_downloa
     updater.ensure_installable(fake_bundle(tmp_path / "Applications"), updates)
 
 
+def test_a_copy_left_hidden_by_a_failed_swap_is_not_updated_in_place(tmp_path):
+    """Running from .Maramax-replaced.app, the swap would move that folder
+    onto itself and delete it, leaving no Maramax at all."""
+    (tmp_path / "Applications").mkdir()
+    hidden = fake_bundle(tmp_path / "old", version="0.5.1").rename(tmp_path / "Applications" / updater.REPLACED_NAME)
+    with pytest.raises(updater.UpdateError, match="Rename it to Maramax.app"):
+        updater.ensure_installable(hidden, tmp_path / "updates")
+    staged = fake_bundle(tmp_path / "new").rename(tmp_path / "Applications" / updater.STAGED_NAME)
+    script = tmp_path / "install.sh"
+    (tmp_path / "updates").mkdir()
+    exited = subprocess.Popen(["true"])
+    exited.wait()
+    script.write_text(updater.swap_script(
+        pid=exited.pid, staged_app=staged, installed_app=hidden, previous_app=tmp_path / "updates" / "previous" / "M.app",
+        staging=tmp_path / "updates" / "download", result_path=tmp_path / "updates" / "last-install",
+        log_path=tmp_path / "update.log"))
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "open").write_text("#!/bin/sh\n")
+    (fake_bin / "open").chmod(0o755)
+    subprocess.run(["/bin/sh", str(script)], env={"PATH": f"{fake_bin}:/usr/bin:/bin"}, check=False, timeout=30)
+    assert version_of(hidden) == "0.5.1"      # The script refuses too: nothing was deleted.
+    assert updater.take_install_result(tmp_path / "updates" / "last-install") is updater.InstallResult.NOT_MOVED_ASIDE
+
+
 # -- The swap after quitting --
 
-def run_swap(tmp_path, *, staged, pid=None, failing_mv_source=None):
+def run_swap(tmp_path, *, staged, pid=None, failing_mv_sources=()):
     """Run the real script with `open` (and optionally `mv`) replaced."""
     installed = tmp_path / "Applications" / "Maramax.app"
     fake_bin = tmp_path / "bin"
@@ -261,8 +286,9 @@ def run_swap(tmp_path, *, staged, pid=None, failing_mv_source=None):
     opened = tmp_path / "opened.txt"
     (fake_bin / "open").write_text(f'#!/bin/sh\necho "$1" >> "{opened}"\n')
     (fake_bin / "open").chmod(0o755)
-    if failing_mv_source is not None:
-        (fake_bin / "mv").write_text(f'#!/bin/sh\n[ "$1" = "{failing_mv_source}" ] && exit 1\nexec /bin/mv "$@"\n')
+    if failing_mv_sources:
+        refusals = "".join(f'[ "$1" = "{source}" ] && exit 1\n' for source in failing_mv_sources)
+        (fake_bin / "mv").write_text(f'#!/bin/sh\n{refusals}exec /bin/mv "$@"\n')
         (fake_bin / "mv").chmod(0o755)
     if pid is None:
         exited = subprocess.Popen(["true"])
@@ -299,15 +325,24 @@ def test_the_swap_installs_the_new_app_and_keeps_the_old_one(tmp_path):
 
 def test_a_swap_that_cannot_place_the_new_app_restores_the_old_one(tmp_path):
     staged = staged_beside(tmp_path)
-    installed, result, opened = run_swap(tmp_path, staged=staged, failing_mv_source=str(staged))
+    installed, result, opened = run_swap(tmp_path, staged=staged, failing_mv_sources=[staged])
     assert result is updater.InstallResult.NOT_PLACED and version_of(installed) == "0.5.1"
     assert opened == [str(installed)]
+
+
+def test_a_swap_that_cannot_put_either_app_in_place_opens_the_old_one_and_says_so(tmp_path):
+    staged = staged_beside(tmp_path)
+    replaced = tmp_path / "Applications" / updater.REPLACED_NAME
+    installed, result, opened = run_swap(tmp_path, staged=staged, failing_mv_sources=[staged, replaced])
+    assert result is updater.InstallResult.NOT_RESTORED and not installed.exists()
+    assert version_of(replaced) == "0.5.1" and opened == [str(replaced)]
+    assert ".Maramax-replaced.app" in update_offer.install_failure(result)
 
 
 def test_a_swap_that_cannot_move_the_old_app_aside_changes_nothing(tmp_path):
     staged = staged_beside(tmp_path)
     installed = tmp_path / "Applications" / "Maramax.app"
-    _, result, opened = run_swap(tmp_path, staged=staged, failing_mv_source=str(installed))
+    _, result, opened = run_swap(tmp_path, staged=staged, failing_mv_sources=[installed])
     assert result is updater.InstallResult.NOT_MOVED_ASIDE and version_of(installed) == "0.5.1"
     assert not staged.exists() and opened == [str(installed)]
 
@@ -411,9 +446,28 @@ def test_every_failed_install_has_something_to_say():
         assert (message is None) is (result is updater.InstallResult.INSTALLED)
 
 
-def test_release_notes_are_shown_without_markdown():
-    notes = "## New\n**Updates itself.** See [the guide](https://x.test) and `START HERE.md`."
-    assert update_offer.plain_notes(notes) == "New\nUpdates itself. See the guide and START HERE.md."
+def test_release_notes_are_read_as_headings_bullets_and_paragraphs():
+    from parakeet_dictation.update_prompt import Block, BlockKind, Emphasis, Link, Run, note_blocks
+
+    notes = ("## New\r\n\n- **Updates itself.** See [the guide](https://x.test)\n  and `START HERE.md`.\n"
+             "* _quietly_ fixed\n\nUpdating from 0.6.3 downloads\nabout 4 MB.\n\n[odd](javascript:alert(1)) snake_case")
+    assert note_blocks(notes) == [
+        Block(BlockKind.HEADING, (Run("New", Emphasis.PLAIN),)),
+        Block(BlockKind.BULLET, (Run("Updates itself.", Emphasis.STRONG), Run(" See ", Emphasis.PLAIN),
+                                 Link("the guide", "https://x.test"), Run(" and ", Emphasis.PLAIN),
+                                 Run("START HERE.md", Emphasis.CODE), Run(".", Emphasis.PLAIN))),
+        Block(BlockKind.BULLET, (Run("quietly", Emphasis.ITALIC), Run(" fixed", Emphasis.PLAIN))),
+        Block(BlockKind.PARAGRAPH, (Run("Updating from 0.6.3 downloads about 4 MB.", Emphasis.PLAIN),)),
+        # Only web links are links: the notes are not covered by the release's signature.
+        Block(BlockKind.PARAGRAPH, (Run("[odd](javascript:alert(1)) snake_case", Emphasis.PLAIN),)),
+    ]
+    assert note_blocks("") == [] and note_blocks("\n  \n") == []
+
+
+def test_the_offer_says_what_installing_does():
+    assert update_prompt.offer_text("0.8.0", "0.7.0") == (
+        "Maramax 0.8.0 is now available—you have 0.7.0. Would you like to install it now?")
+    assert "about 4.0 MB" in update_prompt.install_note("4.0 MB")
 
 
 class FakeWindow:
@@ -431,9 +485,33 @@ class FakeWindow:
         return lambda *args, **kwargs: FakeWindow.shown.append((name, args))
 
 
-def offer(monkeypatch, tmp_path, answer=None, busy=False, modal=None):
+class FakePrompt:
+    """The Software Update window: records what it was asked to show."""
+    shown: list = []    # (call, keyword arguments)
+    offered: list = []  # the versions it showed
+
+    @classmethod
+    def alloc(cls):
+        return cls()
+
+    def initWithChoice_(self, on_choice):
+        self.on_choice = on_choice
+        return self
+
+    def show(self, **kwargs):
+        FakePrompt.shown.append(("show", kwargs))
+        FakePrompt.offered.append(kwargs["version"])
+
+    def withdraw(self):
+        FakePrompt.shown.append(("withdraw", {}))
+
+
+def offer(monkeypatch, tmp_path, busy=False, modal=None):
     FakeWindow.shown = []
+    FakePrompt.shown = []
+    FakePrompt.offered = []
     monkeypatch.setattr(update_offer, "UpdateProgressWindow", FakeWindow)
+    monkeypatch.setattr(update_offer, "UpdatePromptWindow", FakePrompt)
     alerts = []
     monkeypatch.setattr(update_offer.rumps, "alert", lambda **kwargs: alerts.append(kwargs) or 1)
     monkeypatch.setattr(update_offer, "NSApplication",
@@ -445,9 +523,7 @@ def offer(monkeypatch, tmp_path, answer=None, busy=False, modal=None):
         menu_item=item, current_version="0.5.1", installed_app=None, support_dir=tmp_path, config=config,
         save_settings=lambda: saved.append(True) or True, is_busy=lambda: busy, quit_app=lambda: None,
         on_change=lambda: None)
-    asked = []
-    controller._ask = lambda release: asked.append(release.version) or answer
-    return controller, item, config, alerts, saved, asked
+    return controller, item, config, alerts, saved, FakePrompt.offered
 
 
 def a_release():
@@ -455,15 +531,58 @@ def a_release():
 
 
 def test_skipping_a_version_is_remembered(monkeypatch, tmp_path):
-    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path,
-                                                          answer=update_offer.NSAlertThirdButtonReturn)
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
     release = a_release()
     controller._checked(release, asked=False)
     assert asked == ["0.5.2"]
+    controller._answered(update_prompt.Choice.SKIP)
     assert config.skipped_update_version == "0.5.2" and saved
     assert item.title == "Install Maramax 0.5.2…"
     controller._checked(release, asked=False)   # The next daily check stays quiet.
     assert asked == ["0.5.2"]
+
+
+def test_an_offer_takes_the_keyboard_only_when_the_user_asked(monkeypatch, tmp_path):
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
+    controller._checked(a_release(), asked=False)
+    name, shown = FakePrompt.shown[-1]
+    assert name == "show" and shown["activate"] is False and shown["notes"] == "Fixes."
+    assert shown["current_version"] == "0.5.1" and shown["size"] == "2 KB"
+    controller._answered(update_prompt.Choice.LATER)
+    assert controller.can_check() and config.skipped_update_version is None and not saved
+    assert item.title == "Install Maramax 0.5.2…"      # Later keeps the offer in the menu.
+    controller._checked(a_release(), asked=True)
+    assert FakePrompt.shown[-1][1]["activate"] is True
+
+
+def test_an_unanswered_offer_is_taken_back_by_the_next_check(monkeypatch, tmp_path):
+    """A window left behind another app must not stop the daily check, nor
+    install, days later, a release GitHub has since replaced."""
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
+    started = []
+    monkeypatch.setattr(update_offer.threading, "Thread",
+                        lambda **kwargs: SimpleNamespace(start=lambda: started.append(kwargs["args"])))
+    monkeypatch.setattr(update_offer, "call_later", lambda *args: None)
+    controller._checked(a_release(), asked=False)
+    assert controller.can_check()                     # Settings' Check Now still works.
+    controller._scheduled_check()
+    assert FakePrompt.shown[-1][0] == "withdraw" and started == [(False,)]
+    assert item.title == "Checking for Updates…"
+    newer = updater.newer_release("0.5.1", release_payload(tag="v0.5.3", assets=(
+        "Maramax-0.5.3.zip", "Maramax-0.5.3.zip.sha256")))
+    controller._checked(newer, asked=False)
+    assert asked == ["0.5.2", "0.5.3"]
+    controller.check_requested()                       # The menu item, too, asks again.
+    assert FakePrompt.shown[-1][0] == "withdraw" and started[-1] == (True,)
+
+
+def test_install_update_starts_the_download(monkeypatch, tmp_path):
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
+    downloads = []
+    controller._download = downloads.append
+    controller._checked(a_release(), asked=False)
+    controller._answered(update_prompt.Choice.INSTALL)
+    assert [release.version for release in downloads] == ["0.5.2"] and controller.can_check()
 
 
 def test_an_automatic_check_never_alerts_about_a_failure_or_no_update(monkeypatch, tmp_path):
@@ -476,7 +595,8 @@ def test_an_automatic_check_never_alerts_about_a_failure_or_no_update(monkeypatc
 def test_a_requested_check_reports_that_the_app_is_current(monkeypatch, tmp_path):
     controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
     controller._checked(None, asked=True)
-    assert alerts[0]["title"] == "Maramax is up to date"
+    assert alerts[0] == {"title": "You’re up to date!",
+                         "message": "Maramax 0.5.1 is currently the newest version available."}
 
 
 def test_a_failed_check_is_shown_until_one_succeeds(monkeypatch, tmp_path):
@@ -1003,6 +1123,7 @@ def test_check_now_asks_again_even_with_a_release_already_known(monkeypatch, tmp
     monkeypatch.setattr(update_offer.threading, "Thread",
                         lambda **kwargs: SimpleNamespace(start=lambda: started.append(kwargs["args"])))
     controller._checked(a_release(), asked=False)
+    controller._answered(update_prompt.Choice.LATER)
     asked.clear()
     controller.check_requested()
     # A fresh check (asked=True), which offers what the release page says now.

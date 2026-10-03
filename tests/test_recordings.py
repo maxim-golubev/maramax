@@ -3,7 +3,7 @@ import threading
 
 import pytest
 
-from parakeet_dictation.recordings import RecordingStore
+from parakeet_dictation.recordings import RecordingStatus, RecordingStore
 
 
 def test_audio_survives_an_empty_transcription_and_restart(tmp_path):
@@ -103,16 +103,31 @@ def test_writes_interrupted_by_a_crash_are_swept_with_the_next_save(tmp_path):
 
 def test_retention_count_and_byte_budget(tmp_path):
     store = RecordingStore(tmp_path, limit=2, max_bytes=100000)
-    first = store.save(bytes(32000))
-    store.save(bytes(32000))
-    newest = store.save(bytes(32000))
+
+    def transcribed(pcm):
+        record = store.save(pcm)
+        store.update(record.id, status=RecordingStatus.DONE, text="words")
+        return record
+    first = transcribed(bytes(32000))
+    transcribed(bytes(32000))
+    newest = transcribed(bytes(32000))
     assert len(store.list_recordings()) == 2
     assert not store.audio_path(first.id).exists()
     assert store.audio_path(newest.id).exists()
 
     # Keep a new capture even when it exceeds the whole storage budget.
-    large = store.save(bytes(200000))
+    large = transcribed(bytes(200000))
     assert [r.id for r in store.list_recordings()] == [large.id]
+
+
+def test_audio_moved_in_after_a_crash_is_not_pruned_as_it_arrives(tmp_path):
+    """After a crash every unsaved recording is moved in at once, and each
+    spill is deleted once archived; none may push out another."""
+    store = RecordingStore(tmp_path, limit=2, max_bytes=100000)
+    adopted = [store.adopt(bytes(32000)) for _ in range(4)]
+    assert {r.id for r in store.list_recordings()} == {r.id for r in adopted}
+    newest = store.save(bytes(32000))
+    assert len(store.list_recordings()) == 2 and store.audio_path(newest.id).exists()   # The next save prunes.
 
 
 def test_recording_identifiers_cannot_escape_storage(tmp_path):

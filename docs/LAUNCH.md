@@ -26,13 +26,14 @@ runs at a time. Settings, history, and recordings are shared between versions.
 ## Updates
 
 Maramax keeps itself up to date. Once a day it asks GitHub whether a newer
-version has been published and offers it: **Install and Relaunch**, **Later**,
-or **Skip This Version** (Return means Later, so a keystroke meant for another
-app never installs anything). **Check for Updates…** in the menu, or **Check
+version has been published and offers it in a **Software Update** window with
+the release notes: **Install Update**, **Remind Me Later**, or **Skip This
+Version**. A daily offer appears without taking the keyboard, so typing meant
+for another app never reaches it. **Check for Updates…** in the menu, or **Check
 Now** in **Settings → General**, asks right away; the top of Settings shows the
 version you have.
 
-**Install and Relaunch** shows the download in a small window (only the files
+**Install Update** shows the download in a small window (only the files
 that changed, when possible), accepts it only if it carries Maramax's release
 signature, waits until Maramax is idle (not dictating, transcribing, or saving
 audio), and restarts it as the new version. Settings, history, and recordings

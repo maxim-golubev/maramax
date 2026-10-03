@@ -588,3 +588,37 @@ def test_the_echo_filter_reads_the_hint_that_corrections_writes():
     assert transcription.context_echo(hint, hint) is transcription.Echo.CERTAIN
     assert transcription.context_echo("Maramax, Parakeet.", hint) is transcription.Echo.POSSIBLE
     assert transcription.context_echo("Maramax is ready.", hint) is transcription.Echo.NONE
+
+
+def test_the_high_accuracy_model_loads_only_once_the_standard_one_is_ready(monkeypatch):
+    """Two large loads at once contend, and without the standard model
+    nothing is dictated at all."""
+    from parakeet_dictation import app as module
+
+    loads, refreshed = [], []
+    controller = object.__new__(DictationApp)
+    controller.config = AppConfig(high_accuracy=False)
+    controller.qwen = SimpleNamespace(start_loading=lambda: loads.append("qwen"), status_message=lambda: "Loading…")
+    controller._save_settings = lambda: True
+    controller._show_settings_changed = lambda: None
+    controller._push_status = lambda message, revert_after=0: None
+    controller._prepare_recorder = lambda: None
+    controller._hotkey_error_message = None
+    controller._leftover_found = False
+    monkeypatch.setattr(module.AppHelper, "callAfter", lambda function, *args: refreshed.append(function))
+    ready = [False]
+    controller.transcriber = SimpleNamespace(is_ready=lambda: ready[0], status_message=lambda: "Model failed")
+
+    controller.toggle_setting("high_accuracy")      # Turned on while Parakeet is still loading.
+    assert loads == []
+
+    def fails():
+        raise transcription.TranscriptionError("download failed")
+    controller.transcriber.wait_until_ready = fails
+    controller._wait_for_model_readiness()
+    assert loads == [] and refreshed                 # Settings still hears about it.
+
+    ready[0] = True
+    controller.transcriber.wait_until_ready = lambda: None
+    controller._wait_for_model_readiness()           # Ready (or ready after Retry Speech Model).
+    assert loads == ["qwen"]

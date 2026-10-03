@@ -21,6 +21,7 @@ from __future__ import annotations
 import enum
 import hashlib
 import json
+import math
 import os
 import plistlib
 import re
@@ -60,6 +61,7 @@ class InstallResult(enum.StrEnum):
     STAGED_MISSING = "staged-missing"  # the new app was gone from beside the old one
     NOT_MOVED_ASIDE = "not-moved-aside"
     NOT_PLACED = "not-placed"          # the old app was put back
+    NOT_RESTORED = "not-restored"      # neither app is in place; the old one was opened from beside it
 
 
 class UpdateCancelled(UpdateError):
@@ -211,6 +213,11 @@ def ensure_installable(installed_app: Path, updates_dir: Path) -> None:
     if installed_app.resolve().is_relative_to(updates_dir.resolve()):
         raise UpdateError(f"This is the copy kept from the last update ({installed_app}). "
                           "Open the installed Maramax to update it.")
+    if installed_app.name in (REPLACED_NAME, STAGED_NAME):
+        # The swap would move this very folder aside onto itself, and delete it.
+        raise UpdateError(f"This copy runs from {installed_app}, left by an update that could not finish. "
+                          f"Rename it to Maramax.app (in Finder, Cmd+Shift+. shows hidden files), open it, "
+                          "and update again.")
     if not os.access(installed_app.parent, os.W_OK):
         raise UpdateError(f"Maramax cannot replace itself: {installed_app.parent} is not writable "
                           "(move Maramax.app into Applications first)")
@@ -420,28 +427,34 @@ finish() {{
   exit 0
 }}
 echo "$(date '+%Y-%m-%d %H:%M:%S') installing $staged"
-waited=0
+# By the clock: each sleep forks, so counting them would wait longer than meant.
+deadline=$(( $(date +%s) + {math.ceil(QUIT_WAIT_SECONDS)} ))
 while kill -0 {pid} 2>/dev/null; do
-  if [ "$waited" -ge {int(QUIT_WAIT_SECONDS * 10)} ]; then
+  if [ "$(date +%s)" -ge "$deadline" ]; then
     rm -rf "$staged"
     echo {r.NOT_QUIT} > "$result"
     echo "Maramax (pid {pid}) did not quit; nothing was changed"
     exit 0
   fi
   sleep 0.1
-  waited=$((waited + 1))
 done
 # Let LaunchServices notice the exit before the new copy asks it to launch.
 sleep 1
 if [ ! -f "$staged/Contents/Info.plist" ]; then finish {r.STAGED_MISSING}; fi
+if [ "$installed" = "$replaced" ] || [ "$installed" = "$staged" ]; then finish {r.NOT_MOVED_ASIDE}; fi
 rm -rf "$replaced"
 if [ -e "$replaced" ] || ! mv "$installed" "$replaced"; then
   rm -rf "$staged"
   finish {r.NOT_MOVED_ASIDE}
 fi
 if ! mv "$staged" "$installed"; then
-  mv "$replaced" "$installed"
-  finish {r.NOT_PLACED}
+  if mv "$replaced" "$installed"; then finish {r.NOT_PLACED}; fi
+  # Nothing is installed: open the old app where it is, so Maramax still runs
+  # (and reads this outcome, which is written first).
+  echo {r.NOT_RESTORED} > "$result"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') {r.NOT_RESTORED}"
+  open "$replaced"
+  exit 0
 fi
 # The old version is kept for rollback; if it cannot be moved, it stays hidden beside the new one.
 mkdir -p "$(dirname "$previous")"

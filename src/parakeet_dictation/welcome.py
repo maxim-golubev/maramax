@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import objc
 from AppKit import (
-    NSApplication, NSBackingStoreBuffered, NSButton, NSColor, NSFont, NSFontWeightSemibold, NSLayoutAttributeLeading,
-    NSLayoutConstraint, NSLayoutPriorityDefaultLow, NSMakeRect, NSPanel, NSStackView, NSTextField,
-    NSUserInterfaceLayoutOrientationHorizontal, NSView,
+    NSApplication, NSBackingStoreBuffered, NSButton, NSFont, NSFontWeightSemibold, NSLayoutAttributeLeading,
+    NSLayoutConstraint, NSMakeRect, NSPanel, NSStackView, NSTextField, NSUserInterfaceLayoutOrientationHorizontal,
     NSUserInterfaceLayoutOrientationVertical, NSWindowStyleMaskClosable, NSWindowStyleMaskTitled,
 )
 from Foundation import NSObject
 
 from .config import AppConfig, Delivery
 from .hotkeys import STOP
+from .layout import small_text, spacer
 from .main_thread import call_later
 from .shortcut_picker import ShortcutPicker
 
@@ -81,11 +81,11 @@ class WelcomeController(NSObject):
         self.picker = ShortcutPicker.alloc().initWithOwner_width_onResize_(delegate, CONTENT_WIDTH, self._fit_window)
         root = self.panel.contentView()
         self.pages = [self._welcome_page(), self._shortcut_page(), self._result_page(), self._try_page()]
-        self.counter = self._small("")
+        self.counter = small_text("", CONTENT_WIDTH)
         self.back = NSButton.buttonWithTitle_target_action_("Back", self, "goBack:")
         self.forward = NSButton.buttonWithTitle_target_action_("Continue", self, "goForward:")
         self.forward.setKeyEquivalent_("\r")
-        row = self._stack([self.counter, _spacer(), self.back, self.forward], horizontal=True)
+        row = self._stack([self.counter, spacer(), self.back, self.forward], horizontal=True)
         constraints = []
         for page in [*self.pages, row]:
             page.setTranslatesAutoresizingMaskIntoConstraints_(False)
@@ -125,20 +125,11 @@ class WelcomeController(NSObject):
         label.setPreferredMaxLayoutWidth_(CONTENT_WIDTH)
         return label
 
-    @objc.python_method
-    def _small(self, text):
-        label = NSTextField.wrappingLabelWithString_(text)
-        label.setFont_(NSFont.systemFontOfSize_(11))
-        label.setTextColor_(NSColor.secondaryLabelColor())
-        label.setSelectable_(False)
-        label.setPreferredMaxLayoutWidth_(CONTENT_WIDTH)
-        return label
-
     # -- The four steps --
 
     @objc.python_method
     def _welcome_page(self):
-        self.model_status = self._small("")
+        self.model_status = small_text("", CONTENT_WIDTH)
         return self._stack([
             self._title("Welcome to Maramax", 20),
             self._body("Dictation that runs entirely on this Mac. Press a shortcut, speak, press it again, and the "
@@ -162,16 +153,17 @@ class WelcomeController(NSObject):
             "Copy it and paste it into the app you are using", self, "choosePaste:")
         self.permission = NSButton.buttonWithTitle_target_action_("Open Accessibility Settings", self,
                                                                  "openAccessibility:")
-        self.permission_note = self._small("")
+        self.permission_note = small_text("", CONTENT_WIDTH)
         self.permission_row = self._stack([self.permission, self.permission_note], horizontal=True, spacing=8)
         return self._stack([
             self._title("When you finish speaking"),
             self.copy_choice,
-            self._indented(self._small("Paste it yourself with Cmd+V. Nothing needs extra permission.")),
+            self._indented(small_text("Paste it yourself with Cmd+V. Nothing needs extra permission.",
+                                      CONTENT_WIDTH)),
             self.paste_choice,
-            self._indented(self._small("Maramax presses Cmd+V for you in the app you were typing in. This needs "
-                                       "Maramax turned on under Privacy & Security → Accessibility in "
-                                       "System Settings.")),
+            self._indented(small_text("Maramax presses Cmd+V for you in the app you were typing in. This needs "
+                                      "Maramax turned on under Privacy & Security → Accessibility in "
+                                      "System Settings.", CONTENT_WIDTH)),
             self._indented(self.permission_row),
         ], spacing=6)
 
@@ -184,12 +176,13 @@ class WelcomeController(NSObject):
     @objc.python_method
     def _try_page(self):
         self.try_text = self._body("")
-        self.recording_note = self._small("")
+        self.recording_note = small_text("", CONTENT_WIDTH)
         return self._stack([
             self._title("Try it"),
             self.try_text,
             self.recording_note,
-            self._small("Settings and Recordings are in the menu bar icon; this window is under More → Welcome."),
+            small_text("Settings and Recordings are in the menu bar icon; this window is under More → Welcome.",
+                       CONTENT_WIDTH),
         ], spacing=12)
 
     # -- Showing --
@@ -282,10 +275,3 @@ class WelcomeController(NSObject):
         del notification
         self.picker.stop_recording()  # Never leave the global shortcut paused.
         self.delegate.finish_welcome()
-
-
-def _spacer():
-    """A view that takes up the free width in a horizontal row."""
-    spacer = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 1, 1))
-    spacer.setContentHuggingPriority_forOrientation_(NSLayoutPriorityDefaultLow - 1, 0)
-    return spacer

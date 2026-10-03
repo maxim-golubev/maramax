@@ -124,6 +124,24 @@ class RecordingStore:
         return sorted(records, key=lambda r: (r.created_at, r.id), reverse=True)
 
     def save(self, pcm: bytes, diagnostics: dict | None = None) -> Recording | None:
+        """Archive a capture, then prune the archive back to its budget."""
+        with self._lock:
+            record = self._archive(pcm, diagnostics)
+            if record is not None:
+                # Pruning is after durable audio+metadata, never before saving.
+                try:
+                    self._prune(record.id)
+                except OSError as exc:
+                    logger.error(f"Recording {record.id} was saved, but older recordings could not be pruned: {exc}")
+        return record
+
+    def adopt(self, pcm: bytes, diagnostics: dict | None = None) -> Recording | None:
+        """Archive audio a crash left behind, without pruning: when several are
+        moved in at once, each may be the only copy of its dictation, and one
+        must not push out another. The next save applies the budget again."""
+        return self._archive(pcm, diagnostics)
+
+    def _archive(self, pcm: bytes, diagnostics: dict | None) -> Recording | None:
         if not pcm:
             return None
         if len(pcm) % SAMPLE_WIDTH:
@@ -157,11 +175,6 @@ class RecordingStore:
                 self._write_metadata(record)
             except OSError as exc:
                 logger.error(f"Recording {record.id} was saved without its details: {exc}")
-            # Pruning is after durable audio+metadata, never before saving.
-            try:
-                self._prune(record.id)
-            except OSError as exc:
-                logger.error(f"Recording {record.id} was saved, but older recordings could not be pruned: {exc}")
         return record
 
     def update(self, recording_id: str, **changes) -> None:

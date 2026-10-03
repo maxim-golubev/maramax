@@ -44,6 +44,9 @@ class IsolatedAudioRecorder:
         self._start_timeout = start_timeout
         self._stop_timeout = stop_timeout
         self._operation_lock = threading.Lock()
+        # Listing runs in a one-shot helper of its own, so it never holds up a
+        # recording: one listing at a time is all this lock guards.
+        self._listing_lock = threading.Lock()
         self._data_lock = threading.Lock()
         self._ready = threading.Event()
         self._done = threading.Event()
@@ -188,7 +191,7 @@ class IsolatedAudioRecorder:
             self._operation_lock.release()
 
     def list_input_devices(self):
-        if self.recording or not self._operation_lock.acquire(blocking=False):
+        if self.recording or not self._listing_lock.acquire(blocking=False):
             return None
         process = None
         try:
@@ -228,7 +231,7 @@ class IsolatedAudioRecorder:
             if process is not None:
                 self._kill(process)
                 self._close_pipes(process)
-            self._operation_lock.release()
+            self._listing_lock.release()
 
     # -- Recording --
 
@@ -320,6 +323,12 @@ class IsolatedAudioRecorder:
             self._operation_lock.release()
 
     def _open_spill(self):
+        if recovery.unkept_in_progress(self._recovery_dir):
+            # An earlier capture could not be set aside as an unsaved
+            # recording; opening the spill would truncate the only copy.
+            logger.error("An earlier capture is still in the recovery file; this one is kept in memory only")
+            self._spill = None
+            return
         try:
             self._recovery_dir.mkdir(parents=True, exist_ok=True)
             self._spill = recovery.in_progress_path(self._recovery_dir).open("wb")
@@ -425,10 +434,20 @@ class IsolatedAudioRecorder:
                 # device afterwards, on its own time.
                 if not self._done.wait(timeout=self._stop_timeout):
                     self.last_error = RuntimeError("Microphone stopped responding; received audio was retained")
+                    # Killed while it is still the current helper, so its
+                    # reader keeps the audio already in the pipe, up to EOF,
+                    # before the helper is detached.
+                    was_running = process.poll() is None
+                    self._kill(process)
+                    if self._reader is not None:
+                        self._reader.join(timeout=2)
+                    resets = self.reset_count
                     try:
-                        self._retire_process()
+                        self._retire_process()  # Counts the helper if it is somehow still running.
                     except RuntimeError as exc:
                         self.last_error = exc
+                    if was_running and self.reset_count == resets:
+                        self.reset_count += 1
                 if self.last_error is not None:
                     logger.warning(f"Recording ended abnormally: {self.last_error}")
             self._in_flight = False

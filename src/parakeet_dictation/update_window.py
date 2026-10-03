@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import objc
 from AppKit import (
-    NSApplication, NSBackingStoreBuffered, NSButton, NSColor, NSFont, NSFontWeightSemibold, NSMakeRect, NSPanel,
-    NSProgressIndicator, NSProgressIndicatorStyleBar, NSTextField, NSWindowStyleMaskTitled,
+    NSApplication, NSBackingStoreBuffered, NSButton, NSColor, NSFont, NSFontWeightSemibold, NSImageView, NSMakeRect,
+    NSPanel, NSProgressIndicator, NSProgressIndicatorStyleBar, NSTextField, NSWindowStyleMaskTitled,
 )
 from Foundation import NSObject
 
-WIDTH = 440
+WIDTH = 480
 HEIGHT = 136
 MARGIN = 20
+ICON = 64
+# The text column starts right of the app icon, as in the Software Update window.
+TEXT_LEFT = MARGIN + ICON + 16
 
 
 def download_size(size: int) -> str:
@@ -44,23 +47,25 @@ class UpdateProgressWindow(NSObject):
         self.panel.setReleasedWhenClosed_(False)
         self.panel.setHidesOnDeactivate_(False)
         content = self.panel.contentView()
-        inner = WIDTH - 2 * MARGIN
+        inner = WIDTH - TEXT_LEFT - MARGIN
+        icon = NSImageView.imageViewWithImage_(NSApplication.sharedApplication().applicationIconImage())
+        icon.setFrame_(NSMakeRect(MARGIN, HEIGHT - MARGIN - ICON, ICON, ICON))
         self.title = NSTextField.labelWithString_("")
         self.title.setFont_(NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold))
-        self.title.setFrame_(NSMakeRect(MARGIN, HEIGHT - 40, inner, 18))
-        self.bar = NSProgressIndicator.alloc().initWithFrame_(NSMakeRect(MARGIN, HEIGHT - 68, inner, 20))
+        self.title.setFrame_(NSMakeRect(TEXT_LEFT, HEIGHT - 40, inner, 18))
+        self.bar = NSProgressIndicator.alloc().initWithFrame_(NSMakeRect(TEXT_LEFT, HEIGHT - 68, inner, 20))
         self.bar.setStyle_(NSProgressIndicatorStyleBar)
         self.bar.setMinValue_(0.0)
         self.bar.setMaxValue_(1.0)
         self.detail = NSTextField.labelWithString_("")
         self.detail.setFont_(NSFont.systemFontOfSize_(11))
         self.detail.setTextColor_(NSColor.secondaryLabelColor())
-        self.detail.setFrame_(NSMakeRect(MARGIN, HEIGHT - 90, inner, 16))
+        self.detail.setFrame_(NSMakeRect(TEXT_LEFT, HEIGHT - 90, inner, 16))
         self.cancel = NSButton.buttonWithTitle_target_action_("Cancel", self, "cancel:")
         self.cancel.setKeyEquivalent_("\x1b")
         size = self.cancel.fittingSize()
         self.cancel.setFrame_(NSMakeRect(WIDTH - MARGIN - size.width, 12, size.width, size.height))
-        for view in (self.title, self.bar, self.detail, self.cancel):
+        for view in (icon, self.title, self.bar, self.detail, self.cancel):
             content.addSubview_(view)
         return self
 

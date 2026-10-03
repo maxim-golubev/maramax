@@ -4,12 +4,44 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass
 
 MAX_RULES = 100
 MAX_HEARD_CHARS = 200
 MAX_REPLACEMENT_CHARS = 2000
 # A replacement longer than this is a snippet to insert, not a word to listen for.
 MAX_VOCABULARY_TERM_CHARS = 40
+# How much of an existing replacement a refusal quotes.
+_QUOTED_CHARS = 40
+
+
+@dataclass(frozen=True)
+class RuleRefused:
+    """Why a rule cannot be saved, in words for the person who typed it."""
+    reason: str
+
+
+def _cleaned(heard: str, replacement: str) -> tuple[str, str]:
+    # One space between words, so "open ai" and "open  ai" are one rule.
+    return " ".join(unicodedata.normalize("NFC", heard).split()), replacement.strip()
+
+
+def _malformed(heard: str, replacement: str) -> str | None:
+    """What is wrong with a cleaned rule on its own, or None."""
+    if not heard:
+        return "Enter the words the transcript says."
+    if not replacement:
+        return "Enter what to write instead."
+    if len(heard) > MAX_HEARD_CHARS:
+        return f"What the transcript says can be up to {MAX_HEARD_CHARS} characters."
+    if len(replacement) > MAX_REPLACEMENT_CHARS:
+        return f"A replacement can be up to {MAX_REPLACEMENT_CHARS:,} characters."
+    return None
+
+
+def rule_key(heard: str) -> str:
+    """What makes two rules one rule: the same words heard, however spaced or capitalized."""
+    return _cleaned(heard, "")[0].casefold()
 
 
 def normalize_rules(value: object) -> list[dict[str, str]]:
@@ -23,19 +55,44 @@ def normalize_rules(value: object) -> list[dict[str, str]]:
         heard, replacement = item.get("heard"), item.get("replacement")
         if not isinstance(heard, str) or not isinstance(replacement, str):
             continue
-        # One space between words, so "open ai" and "open  ai" are one rule.
-        heard = " ".join(unicodedata.normalize("NFC", heard).split())
-        replacement = replacement.strip()
-        if (not heard or not replacement or len(heard) > MAX_HEARD_CHARS
-                or len(replacement) > MAX_REPLACEMENT_CHARS):
+        heard, replacement = _cleaned(heard, replacement)
+        if _malformed(heard, replacement) is not None or rule_key(heard) in seen:
             continue
-        if heard.casefold() in seen:
-            continue
-        seen.add(heard.casefold())
+        seen.add(rule_key(heard))
         rules.append({"heard": heard, "replacement": replacement})
         if len(rules) == MAX_RULES:
             break
     return rules
+
+
+def find_rule(rules: list[dict[str, str]], heard: str) -> int | None:
+    """The index of the rule for these heard words, or None."""
+    key = rule_key(heard)
+    return next((index for index, rule in enumerate(rules) if rule_key(rule["heard"]) == key), None)
+
+
+def edited_rules(rules: list[dict[str, str]], heard: str, replacement: str,
+                 at: int | None) -> list[dict[str, str]] | RuleRefused:
+    """`rules` with this rule added (`at` None) or put in place of rules[at];
+    or why it cannot be. A rule for words another rule already covers is
+    refused, never merged: saving one rule must not change another."""
+    heard, replacement = _cleaned(heard, replacement)
+    problem = _malformed(heard, replacement)
+    if problem is not None:
+        return RuleRefused(problem)
+    existing = find_rule(rules, heard)
+    if existing is not None and existing != at:
+        other = rules[existing]
+        shown = " ".join(other["replacement"].split())
+        if len(shown) > _QUOTED_CHARS:
+            shown = shown[: _QUOTED_CHARS - 1] + "…"
+        return RuleRefused(f"“{other['heard']}” is already in the list, replaced with “{shown}”.")
+    rule = {"heard": heard, "replacement": replacement}
+    if at is not None:
+        return [rule if index == at else other for index, other in enumerate(rules)]
+    if len(rules) >= MAX_RULES:
+        return RuleRefused(f"Up to {MAX_RULES} replacements are supported. Remove one to add another.")
+    return [*rules, rule]
 
 
 def _matcher(heard: str) -> str:

@@ -73,8 +73,11 @@ class HistoryStore:
             if not isinstance(payload, list):
                 raise ValueError("history is not a list")
         except (ValueError, OSError) as exc:
-            # The next save would otherwise overwrite every transcript.
+            # The next save would otherwise overwrite every transcript, and
+            # the pre-replacement texts that belong with them.
             set_aside(self.path, str(exc))
+            if self.originals_path.exists():
+                set_aside(self.originals_path, f"set aside with {self.path.name}: {exc}")
             return []
 
         originals: dict = {}

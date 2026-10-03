@@ -179,6 +179,46 @@ time.sleep(60)
     recorder.cleanup()
 
 
+def test_a_stop_timeout_keeps_the_audio_already_in_the_pipe(tmp_path):
+    """The helper sent the tail but never DONE, and the app's reader was
+    behind (here: held up by the data lock, as a stalled disk write would).
+    Retiring the helper must not drop what is already in the pipe."""
+    body = '''
+print(json.dumps({"event":"ready","device":"Fake"}),flush=True)
+print(json.dumps({"event":"audio","pcm":base64.b64encode(b'\\x01\\x00' * 1600).decode()}),flush=True)
+sys.stdin.readline()
+for _ in range(3):
+    print(json.dumps({"event":"audio","pcm":base64.b64encode(b'\\x02\\x00' * 1600).decode()}),flush=True)
+time.sleep(60)
+'''
+    recorder = recorder_for(tmp_path, command(body), stop_timeout=.15)
+    assert recorder.start()
+    assert wait_for(lambda: len(recorder.frames) == 1)
+    recorder._data_lock.acquire()
+    threading.Timer(0.6, recorder._data_lock.release).start()
+    pcm = recorder.stop()
+    assert pcm == b'\x01\x00' * 1600 + b'\x02\x00' * 4800, len(pcm)
+    assert recorder.reset_count == 1 and "stopped responding" in str(recorder.last_error)
+    recorder.cleanup()
+
+
+def test_a_capture_that_could_not_be_set_aside_is_never_truncated(tmp_path, monkeypatch):
+    in_progress_path(tmp_path).write_bytes(b'\x05\x00' * 16000)
+    monkeypatch.setattr(recovery, "promote_in_progress", lambda base_dir: False)   # The rename failed.
+    body = '''
+print(json.dumps({"event":"ready","device":"Fake"}),flush=True)
+print(json.dumps({"event":"audio","pcm":base64.b64encode(b'\\x01\\x00' * 1600).decode()}),flush=True)
+sys.stdin.readline()
+print(json.dumps({"event":"done"}),flush=True)
+time.sleep(60)
+'''
+    recorder = recorder_for(tmp_path, command(body))
+    assert recorder.start()
+    assert recorder.stop() == b'\x01\x00' * 1600    # This capture is kept in memory instead.
+    assert in_progress_path(tmp_path).read_bytes() == b'\x05\x00' * 16000
+    recorder.cleanup()
+
+
 def test_helper_crash_retains_received_audio(tmp_path):
     body = '''
 print(json.dumps({"event":"ready","device":"Fake"}),flush=True)

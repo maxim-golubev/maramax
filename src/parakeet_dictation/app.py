@@ -318,7 +318,7 @@ class DictationApp(rumps.App):
                 pcm = recovery.load_unsaved(unsaved)
                 if not pcm:
                     continue
-                record = self.recordings.save(whole_samples(pcm), {"device_name": "Unknown microphone"})
+                record = self.recordings.adopt(whole_samples(pcm), {"device_name": "Unknown microphone"})
                 if record is None:
                     continue
                 self.recordings.update(record.id, message="Recovered after an interrupted session")
@@ -336,14 +336,14 @@ class DictationApp(rumps.App):
         except TranscriptionError as exc:
             logger.error(str(exc))
             self._push_status(self.transcriber.status_message())
-            return
+            return  # Without the standard model nothing is dictated: Qwen waits for a retry.
         finally:
-            # Stagger the heavy Qwen load until Parakeet is up so dictation
-            # is usable seconds after launch and the loads don't contend.
-            if self.config.high_accuracy:
-                self.qwen.start_loading()
             AppHelper.callAfter(self._refresh_preferences)
 
+        # Stagger the heavy Qwen load until Parakeet is up so dictation is
+        # usable seconds after launch and the loads don't contend.
+        if self.config.high_accuracy:
+            self.qwen.start_loading()
         self._prepare_recorder()
         self._push_status("Ready" if self._hotkey_error_message is None else self._hotkey_error_message)
         if self._leftover_found:
@@ -911,6 +911,9 @@ class DictationApp(rumps.App):
                 return
             pcm_bytes = whole_samples(pcm_bytes)
             if not any(pcm_bytes):
+                if isinstance(recording, str):
+                    # Tried now, so Recover Last Recording moves on to audio that has not been.
+                    self.recordings.update(recording, status=RecordingStatus.FAILED, message="Digital silence")
                 raise TranscriptionError("This recording contains digital silence — choose another microphone")
             text = self._final_transcribe_pcm(pcm_bytes)
             if not text:
@@ -1106,7 +1109,9 @@ class DictationApp(rumps.App):
         # stop the transcript still stops it being typed into another app.
         should_paste = (self.config.paste_to_active_app and source is Source.MICROPHONE
                         and not self._cancel_event.is_set())
-        if not (self.config.auto_copy_to_clipboard or should_paste):
+        # Pasting copies whatever the copy setting says (Settings shows it so),
+        # for a transcript that is not pasted as much as for one that is.
+        if self.config.delivery() is Delivery.KEPT:
             self._push_status("Transcript ready", revert_after=5)
             return text, True
         copied = self._copy_text_with_feedback(
@@ -1199,9 +1204,12 @@ class DictationApp(rumps.App):
             self._push_status("Grant Accessibility access to enable auto-paste", revert_after=8)
             self.open_accessibility_settings()
         elif name == "high_accuracy":
-            if value:
+            if value and self.transcriber.is_ready():
                 self.qwen.start_loading()
                 self._push_status(self.qwen.status_message(), revert_after=8)
+            elif value:
+                # The model watchdog starts it once Parakeet is up (or after Retry Speech Model).
+                self._push_status("The high-accuracy model loads once the standard model is ready", revert_after=8)
             else:
                 self.qwen.unload()
                 self._push_status("High-accuracy model unloaded", revert_after=5)

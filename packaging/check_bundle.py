@@ -43,6 +43,7 @@ def check(args: argparse.Namespace) -> dict:
         "parakeet_dictation.recordings_window", "mlx.core", "parakeet_mlx", "parakeet_mlx.alignment",
         "parakeet_dictation.preferences", "parakeet_dictation.instance",
         "parakeet_dictation.updater", "parakeet_dictation.update_offer", "parakeet_dictation.update_window",
+        "parakeet_dictation.update_prompt", "parakeet_dictation.replacements_editor",
         "parakeet_dictation.welcome", "parakeet_dictation.shortcut_picker",
         "qwen3_asr_mlx", "pyaudio", "soundfile", "scipy", "numpy",
         "tokenizers", "huggingface_hub", "httpx", "certifi", "AppKit",
@@ -107,11 +108,13 @@ def check(args: argparse.Namespace) -> dict:
         preferences = PreferencesController.alloc().initWithDelegate_labels_(delegate, _SETTING_LABELS)
         recordings = RecordingsController.alloc().initWithDelegate_store_(delegate, store)
         overlay = OverlayController.alloc().initWithDelegate_(delegate)
+        from parakeet_dictation.update_prompt import UpdatePromptWindow
         from parakeet_dictation.update_window import UpdateProgressWindow
         from parakeet_dictation.welcome import WelcomeController
         update_window = UpdateProgressWindow.alloc().initWithCancel_(lambda: None)
+        update_prompt = UpdatePromptWindow.alloc().initWithChoice_(lambda choice: None)
         welcome = WelcomeController.alloc().initWithDelegate_(delegate)
-        for controller in (preferences, recordings, overlay, update_window, welcome):
+        for controller in (preferences, recordings, overlay, update_window, update_prompt, welcome):
             assert not controller.panel.isVisible()
         assert recordings.sound is None
         pcm = b"\x01\x00" * 16000
@@ -130,7 +133,7 @@ def check(args: argparse.Namespace) -> dict:
         "imports": origins,
         "component_check_seconds": round(time.perf_counter() - started, 3),
         "checks": ["isolated bundled imports", "TLS certificates", "spectrogram front end", "hidden passive panel",
-                   "hidden settings, transcript, and recovery windows",
+                   "hidden settings, transcript, recovery, and update windows",
                    "audio archive round trip and deletion"],
         "microphone_opened": False,
         "audio_played": False,

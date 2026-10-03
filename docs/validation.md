@@ -578,3 +578,49 @@ queue that was never started.
   this connection, so this was the delta); Maramax quit, and 0.7.0 was
   running 3.6 s later with its shortcut registered and its seal intact, the
   previous version kept in `updates/previous`.
+
+## 0.8.0 word replacements, Settings, the Software Update window, and an audit — October 2, 2026
+
+### The replacement that disappeared
+
+`settings.json` on this Mac held two rules (`Meramax → Maramax`, `Lira →
+Lyra`) while `history-originals.json` showed a third, `Kairos → Cairos`,
+applied to dictations through October 2. 0.7.0's Words tab kept the last rule
+it had shown (after a save or a pick from its popup) as the one "being
+edited", so a new rule typed into the empty-looking form replaced it. The list
+now shows every rule, a new rule is always added, and words another rule
+covers are refused with that rule pointed out (`edited_rules()`, tested
+against exactly this sequence).
+
+### Audit
+
+Four reviewers, one per area (audio, recognition and storage, updates and
+packaging, windows and the controller), read their modules in full and
+traced each finding end to end; a fifth reviewed the finished change set.
+Nothing could install an unverified update or let a delta escape the bundle,
+and no race or hang was found in the recording pipeline. Fixed, each with a
+test that fails on the old code where one could be written:
+
+- Words tab: a cell still being edited was saved into another rule's row when
+  Remove, Add, or Undo changed the list; the page did not grow with its note.
+- Updates: an automatic offer left behind another app stopped the daily
+  check and could later install a superseded release (any check now
+  withdraws a waiting offer); the app's quit watchdog (15 s) gave up before
+  the swap script (60 s, which counting forked sleeps stretched to about
+  68 s; it now waits by the clock); a swap that could not roll back claimed
+  it had, and the copy it then opened would have deleted itself on its next
+  update (refused now, by `ensure_installable` and by the script).
+- Audio: a stop timeout dropped audio already in the pipe (6,400 of 22,400
+  bytes kept in the test); a start truncated a crash spill that could not be
+  set aside; adopting many crash leftovers pruned some of them as they
+  arrived; device listing shared the recording lock, so the Microphone tab
+  during a Bluetooth route change could make a dictation report "busy";
+  Recover Last Recording kept choosing a silent recording.
+- With pasting on, files and recoveries were not copied although Settings
+  said so; a corrupt `history.json` was set aside but its originals were then
+  overwritten; Qwen loaded alongside, or without, Parakeet.
+
+474 tests pass (456 before); ruff and mypy are clean. Off-screen renders of
+every Settings tab, the Software Update window, and the progress window were
+checked in Light and Dark; the welcome renders pixel-identical to 0.7.0 after
+its views moved to `layout.py`.

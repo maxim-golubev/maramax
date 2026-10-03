@@ -91,6 +91,12 @@ def promote_in_progress(base_dir: Path) -> bool:
         return False
 
 
+def unkept_in_progress(base_dir: Path) -> bool:
+    """Whether the recovery file still holds a capture worth keeping, which
+    promote_in_progress() could not set aside: a new spill must not truncate it."""
+    return _size_of(in_progress_path(base_dir)) >= MIN_RECOVERABLE_BYTES
+
+
 def _discard(path: Path, what: str) -> None:
     try:
         path.unlink(missing_ok=True)

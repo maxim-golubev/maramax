@@ -19,7 +19,8 @@ Everything the app does and where it keeps things. For a first launch, see [the 
   only while recording from the compact bar; it is released afterward.
 - Results copy to the clipboard by default. With **Paste into the active app** off,
   turning **Copy the transcript to the clipboard** off is honoured however a
-  dictation is finished (pasting needs the clipboard). **Settings → Paste
+  dictation is finished. Pasting needs the clipboard, so while it is on every
+  transcript is copied and the copy checkbox shows checked. **Settings → Paste
   into the active app** enables insertion too, into the app you were last working
   in. In compact mode, insertion is skipped if you switch to a different app while
   dictating; the text stays copied. If the clipboard changes before insertion, or
@@ -32,8 +33,14 @@ Everything the app does and where it keeps things. For a first launch, see [the 
 - Capture continues for a fifth of a second after you press stop, so a last
   syllable still travelling through the driver or a Bluetooth link is not cut off.
 
-**Settings…** opens native controls for these preferences and your word
-replacements. Enter a phrase the recognizer gets wrong and its desired spelling.
+**Settings…** opens native controls for these preferences (General,
+Microphone, and Words). **Words** lists every word replacement, alphabetically:
+type a phrase the recognizer gets wrong and its desired spelling, then **Add**
+(or Return). Words that already have a replacement are refused, and that one is
+pointed out, rather than either rule being changed; double-click a replacement
+in the list to change it, and **Remove** (or Delete) removes the selected ones,
+with **Undo** to bring them back. **Try it** shows a sentence of yours with the
+replacements applied.
 Replacements match whole words or phrases without case sensitivity and apply
 once, preferring longer phrases. They apply to dictation and recording retries;
 the original transcript is retained in history and recording details. Imported
@@ -111,7 +118,8 @@ archived) is moved into Recordings as an ordinary entry. **More → Recover Last
 Recording** transcribes audio that never reached the recognizer first, then the
 newest capture without a transcript, then an unsaved recording that could not be
 moved into Recordings, and otherwise the newest recording. A recovery that
-returns no text marks that recording as tried, so the next press moves on.
+returns no text marks that recording as tried, so the next press moves on to
+audio that has not been tried yet.
 **Clear History & Recordings…** deletes both transcript history and retained audio
 after confirmation, and is unavailable during an active operation.
 
@@ -129,8 +137,11 @@ anything. A settings or history file that cannot be read is renamed to
 
 Maramax checks GitHub for a newer release once a day (turn it off in **Settings
 → General**); **Check for Updates…** in the menu or **Check Now** in Settings
-asks right away, and the top of Settings shows your version. Choosing **Install
-and Relaunch** opens a small window with the download's progress; Maramax then
+asks right away, and the top of Settings shows your version. A newer version is
+offered in a **Software Update** window with its release notes; **Remind Me
+Later** offers it again at the next check, and **Skip This Version** keeps the
+daily check quiet about it. Choosing **Install Update** opens a small window
+with the download's progress; Maramax then
 restarts by itself as soon as it is idle (not dictating, transcribing, or
 saving audio). An update downloads only the files that changed since your
 version when it can, and is accepted only if it carries Maramax's own release

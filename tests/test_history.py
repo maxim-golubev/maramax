@@ -167,3 +167,13 @@ def test_failed_write_leaves_no_temporary_file(tmp_path, monkeypatch):
         pass
     assert sorted(path.name for path in tmp_path.iterdir()) == ["settings.json"]
     assert (tmp_path / "settings.json").read_text() == "old"
+
+
+def test_unreadable_history_takes_its_original_texts_aside_with_it(tmp_path):
+    """The next save would otherwise rewrite the originals with the new entry
+    alone, losing the pre-replacement texts of everything set aside."""
+    (tmp_path / "history.json").write_text("{not a list")
+    (tmp_path / "history-originals.json").write_text('{"a": "mara max"}')
+    store = HistoryStore(base_dir=tmp_path)
+    store.add_entry("microphone", "Next", "Maramax", raw_text="mara max")
+    assert (tmp_path / "history-originals.json.corrupt").read_text() == '{"a": "mara max"}'

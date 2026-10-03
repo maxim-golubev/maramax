@@ -1,4 +1,4 @@
-"""The transcript window, dictation bar, and Recordings window, built off-screen in a separate process."""
+"""The transcript window, dictation bar, Recordings, and the update windows, built off-screen in a separate process."""
 
 import subprocess
 import sys
@@ -336,4 +336,34 @@ assert window.panel.screen() is None                 # On a display that was unp
 window._place_on_a_screen()
 assert window.panel.screen() is not None
 assert not window.panel.isVisible()
+''')
+
+
+def test_the_software_update_window_answers_once_and_closing_it_means_later():
+    run(r'''
+from parakeet_dictation.update_prompt import Choice, NO_NOTES, UpdatePromptWindow, note_blocks, rendered_notes
+answers = []
+window = UpdatePromptWindow.alloc().initWithChoice_(answers.append)
+assert not window.panel.isVisible() and str(window.panel.title()) == "Software Update"
+# Return installs and Esc is Remind Me Later, once the window has the keyboard (an
+# automatic offer never takes it: show(activate=False) only orders it in front).
+assert str(window.install.keyEquivalent()) == "\r" and str(window.later.keyEquivalent()) == "\x1b"
+window._waiting = True                      # As show() leaves it, without putting it on screen.
+window.installUpdate_(None)
+window.remindLater_(None)                   # The offer was answered already.
+window.windowWillClose_(None)
+assert answers == [Choice.INSTALL]
+window._waiting = True
+window.windowWillClose_(None)               # The close button or Cmd+W.
+assert answers == [Choice.INSTALL, Choice.LATER]
+window._waiting = True
+window.skipVersion_(None)
+assert answers[-1] is Choice.SKIP and not window.panel.isVisible()
+text = rendered_notes(note_blocks("## New\n- **Bold** and [a link](https://x.test)\n\nDone."))
+assert str(text.string()) == "New\n\u2022\tBold and a link\nDone."
+link = text.attribute_atIndex_effectiveRange_("NSLink", str(text.string()).index("a link"), None)[0]
+assert str(link.absoluteString()) == "https://x.test"
+assert str(rendered_notes([]).string()) == NO_NOTES
+bad = rendered_notes(note_blocks("[bad](https://x.test/a|b)"))   # A URL macOS cannot parse: plain text.
+assert str(bad.string()) == "bad" and bad.attribute_atIndex_effectiveRange_("NSLink", 0, None)[0] is None
 ''')

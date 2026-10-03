@@ -256,3 +256,15 @@ def test_crash_during_recognition_leaves_one_copy_not_two(tmp_path, monkeypatch)
     controller._final_transcribe_pcm = recognizing
     controller._transcribe_recording_worker(1)
     assert seen == [([], ["saved"])]  # Archived and waiting; nothing for the next launch to duplicate.
+
+
+def test_recovering_digital_silence_marks_it_tried_so_the_next_press_moves_on(tmp_path, monkeypatch):
+    controller, statuses, _, ui = pipeline(tmp_path, monkeypatch, b"")
+    silent = controller.recordings.save(bytes(32000))
+    older = controller.recordings.save(b"\x01\x00" * 16000)
+    controller.recordings.update(older.id, status=module.RecordingStatus.SAVED)
+    controller._recover_worker(1, silent.id)
+    assert "digital silence" in statuses[-1]
+    statuses_now = {record.id: record.status for record in controller.recordings.list_recordings()}
+    assert statuses_now[silent.id] == module.RecordingStatus.FAILED
+    assert module.recovery_candidate(controller.recordings.list_recordings()).id == older.id

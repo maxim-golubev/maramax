@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import enum
 import os
-import re
 import shutil
 import threading
 from collections.abc import Callable
@@ -13,13 +12,14 @@ from pathlib import Path
 from typing import Literal
 
 import rumps
-from AppKit import NSAlert, NSAlertFirstButtonReturn, NSAlertThirdButtonReturn, NSApplication
+from AppKit import NSApplication
 from PyObjCTools import AppHelper
 
 from . import updater
 from .config import AppConfig
 from .logger_config import logger
 from .main_thread import call_later
+from .update_prompt import Choice, UpdatePromptWindow
 from .update_window import UpdateProgressWindow, download_size
 
 CHECK_TITLE = "Check for Updates…"
@@ -32,19 +32,19 @@ CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 IDLE_BEFORE_INSTALL_SECONDS = 3.0
 # Long enough to read "Restarting Maramax…" before the window goes.
 RESTART_NOTICE_SECONDS = 0.8
-# A quit that has not happened by then is not going to.
-QUIT_WATCHDOG_SECONDS = 15.0
+# A quit that has not happened by then is not going to: the swap script has
+# given up waiting for it, so saying so cannot race an install still to come.
+QUIT_WATCHDOG_SECONDS = updater.QUIT_WAIT_SECONDS + 5
 # A new app left staged by a run that quit before installing it is removed
 # this long after launch: by then a swap still running from that quit (if
 # Maramax was reopened at once) has long finished with it.
 LEFTOVER_REMOVAL_SECONDS = 30
-MAX_NOTES_CHARS = 600
 
 
 class Step(enum.Enum):
     IDLE = "idle"
     CHECKING = "checking"
-    PROMPTING = "prompting"      # the "is available" alert is open
+    PROMPTING = "prompting"      # the Software Update window waits for an answer
     DOWNLOADING = "downloading"
     CANCELLING = "cancelling"    # Cancel pressed; the download stops at its next block or timeout
     INSTALLING = "installing"    # downloaded and verified; waiting to quit
@@ -99,6 +99,10 @@ _INSTALL_FAILURES = {
     updater.InstallResult.NOT_MOVED_ASIDE: "macOS did not let Maramax move itself aside, so it was left as it was. "
                                            "You can install the new version by hand from its release page.",
     updater.InstallResult.NOT_PLACED: "The new version could not be put in place, so the previous one was restored.",
+    updater.InstallResult.NOT_RESTORED: "The new version could not be put in place, and the previous one could not "
+                                        "be moved back. It is running from the hidden .Maramax-replaced.app beside "
+                                        "where Maramax was: rename that to Maramax.app in Finder (Cmd+Shift+. "
+                                        "shows hidden files) to keep it.",
 }
 
 
@@ -117,24 +121,6 @@ def ready_to_install(*, idle_now: bool, idle_before: bool) -> bool:
     """Idle on two looks in a row: a dictation that just finished has had
     time to paste and show its outcome."""
     return idle_now and idle_before
-
-
-def plain_notes(markdown: str) -> str:
-    """Release notes as an alert shows them: without Markdown's markup."""
-    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", markdown)        # [label](url) -> label
-    text = re.sub(r"(\*\*|__|`)", "", text)
-    return re.sub(r"(?m)^\s*#+\s*", "", text)
-
-
-def release_message(release: updater.Release, current_version: str) -> str:
-    notes = plain_notes(release.notes)
-    if len(notes) > MAX_NOTES_CHARS:
-        notes = notes[: MAX_NOTES_CHARS - 1].rstrip() + "…"
-    size = (release.delta or release.archive).size
-    message = (f"You have version {current_version}. Installing downloads about "
-               f"{download_size(size)}, replaces Maramax, and opens the new version. "
-               "Your settings, history, and recordings stay as they are.")
-    return f"{message}\n\n{notes}" if notes else message
 
 
 class UpdateOffer:
@@ -160,6 +146,7 @@ class UpdateOffer:
         self._updated_to: str | None = None  # this launch follows an update that installed
         self._cancel = threading.Event()     # one per download, so a cancel cannot outlive it
         self._window: UpdateProgressWindow | None = None
+        self._prompt: UpdatePromptWindow | None = None
 
     def start(self) -> None:
         """Report how the last update went, then begin the automatic checks
@@ -200,12 +187,13 @@ class UpdateOffer:
                            percent=self._percent, last_check=self._last_check, updated_to=self._updated_to)
 
     def can_check(self) -> bool:
-        return self._step is Step.IDLE
+        """A check replaces an offer still waiting for an answer."""
+        return self._step in (Step.IDLE, Step.PROMPTING)
 
     def check_requested(self) -> None:
         """The menu item or Settings' Check Now: ask GitHub (a release found
         earlier may since have been replaced or withdrawn), then offer."""
-        if self._step is not Step.IDLE:
+        if not self.can_check():
             # The title already says what is happening; the window shows more.
             if self._window is not None:
                 self._window.bring_forward()
@@ -227,6 +215,13 @@ class UpdateOffer:
         self._on_change()
 
     def _check(self, asked: bool) -> None:
+        if self._step is Step.PROMPTING:
+            # An offer left unanswered (behind another app, perhaps for days)
+            # must neither go stale nor stop the checks: it is taken back,
+            # and the check offers whatever GitHub says now.
+            assert self._prompt is not None  # PROMPTING is set only once it exists.
+            self._prompt.withdraw()
+            self._set_step(Step.IDLE)
         if self._step is not Step.IDLE:
             return
         self._set_step(Step.CHECKING)
@@ -259,42 +254,38 @@ class UpdateOffer:
         if release is None:
             logger.info(f"Update check: {self._current} is the newest release")
             if asked:
-                rumps.alert(title="Maramax is up to date", message=f"Version {self._current} is the newest release.")
+                rumps.alert(title="You’re up to date!",
+                            message=f"Maramax {self._current} is currently the newest version available.")
             return
         logger.info(f"Maramax {release.version} is available (running {self._current})")
         # An open dialog or file panel counts as busy: the prompt would open behind it.
         if should_prompt(asked=asked, version=release.version, skipped_version=self._config.skipped_update_version,
                          busy=not self._idle()):
-            self._offer(release)
+            self._offer(release, asked)
 
     # -- Offering --
 
-    def _offer(self, release: updater.Release) -> None:
-        # The alert runs a nested event loop in which the daily timer can
-        # fire; PROMPTING keeps a second check from opening a second alert.
+    def _offer(self, release: updater.Release, asked: bool) -> None:
+        """Open the Software Update window. While it waits, PROMPTING keeps
+        the daily check from offering again; the answer comes to _answered."""
         self._set_step(Step.PROMPTING)
-        choice = self._ask(release)
+        if self._prompt is None:
+            self._prompt = UpdatePromptWindow.alloc().initWithChoice_(self._answered)
+        # A check that ran by itself leaves the keyboard where the user is typing.
+        self._prompt.show(version=release.version, current_version=self._current, notes=release.notes,
+                          size=download_size((release.delta or release.archive).size), activate=asked)
+
+    def _answered(self, choice: Choice) -> None:
+        # The window answers once per offer, and nothing else leaves PROMPTING.
+        assert self._step is Step.PROMPTING, self._step
+        release = self._release
+        assert release is not None  # Offered releases are kept until the next check.
         self._set_step(Step.IDLE)
-        if choice == NSAlertFirstButtonReturn:
+        if choice is Choice.INSTALL:
             self._download(release)
-        elif choice == NSAlertThirdButtonReturn:
+        elif choice is Choice.SKIP:
             self._config.skipped_update_version = release.version
             self._save_settings()
-
-    def _ask(self, release: updater.Release) -> int:
-        alert = NSAlert.alloc().init()
-        alert.setMessageText_(f"Maramax {release.version} is available")
-        alert.setInformativeText_(release_message(release, self._current))
-        install = alert.addButtonWithTitle_("Install and Relaunch")
-        later = alert.addButtonWithTitle_("Later")
-        alert.addButtonWithTitle_("Skip This Version")
-        # The prompt can appear while the user is typing elsewhere: Return
-        # must not quit and replace the app, so it means Later.
-        install.setKeyEquivalent_("")
-        later.setKeyEquivalent_("\r")
-        # A menu-bar app's alert would otherwise open behind other windows.
-        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
-        return int(alert.runModal())
 
     # -- Downloading --
 

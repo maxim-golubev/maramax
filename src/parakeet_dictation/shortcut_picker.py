@@ -5,13 +5,13 @@ from __future__ import annotations
 import objc
 from AppKit import (
     NSAccessibilityAnnouncementKey, NSAccessibilityAnnouncementRequestedNotification, NSAccessibilityPriorityHigh,
-    NSAccessibilityPriorityKey, NSAccessibilityPostNotificationWithUserInfo, NSColor, NSEvent, NSEventMaskKeyDown,
-    NSFont, NSMakeRect, NSMenuItem, NSPopUpButton, NSStackView, NSTextField,
-    NSUserInterfaceLayoutOrientationVertical, NSLayoutAttributeLeading, NSWindowDidResignKeyNotification,
+    NSAccessibilityPriorityKey, NSAccessibilityPostNotificationWithUserInfo, NSEvent, NSEventMaskKeyDown,
+    NSMakeRect, NSMenuItem, NSPopUpButton, NSWindowDidResignKeyNotification,
 )
 from Foundation import NSNotificationCenter, NSObject
 
 from .hotkeys import DICTATE_PRESETS, carbon_modifiers
+from .layout import small_text, stack
 
 OTHER = "Other shortcut…"
 # Carbon cannot tell when another app already uses a shortcut, so the user is told how to notice.
@@ -43,23 +43,11 @@ class ShortcutPicker(NSObject):
         self.popup.setAction_("chooseItem:")
         self.popup.setAccessibilityLabel_("Dictation shortcut")
         self.popup.widthAnchor().constraintEqualToConstant_(260).setActive_(True)
-        self.note = self._small_text("", width)
+        self.note = small_text("", width)
         self.note.setHidden_(True)
-        self.view = NSStackView.stackViewWithViews_([self.popup, self.note, self._small_text(HINT, width)])
-        self.view.setOrientation_(NSUserInterfaceLayoutOrientationVertical)
-        self.view.setAlignment_(NSLayoutAttributeLeading)
-        self.view.setSpacing_(4)
+        self.view = stack([self.popup, self.note, small_text(HINT, width)], spacing=4)
         self.refresh()
         return self
-
-    @objc.python_method
-    def _small_text(self, text, width):
-        label = NSTextField.wrappingLabelWithString_(text)
-        label.setFont_(NSFont.systemFontOfSize_(11))
-        label.setTextColor_(NSColor.secondaryLabelColor())
-        label.setSelectable_(False)
-        label.setPreferredMaxLayoutWidth_(width)
-        return label
 
     @objc.python_method
     def refresh(self):

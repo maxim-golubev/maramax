@@ -4,18 +4,17 @@ from __future__ import annotations
 
 import objc
 from AppKit import (
-    NSApplication, NSBackingStoreBuffered, NSButton, NSColor, NSFont, NSFontWeightSemibold,
-    NSGridCell, NSGridRowAlignmentFirstBaseline, NSGridView, NSLayoutAttributeFirstBaseline,
-    NSLayoutAttributeLeading, NSLayoutConstraint, NSMakeRect, NSMenuItem, NSPanel, NSPopUpButton,
-    NSSegmentedControl, NSStackView, NSTextField, NSTextFieldRoundedBezel,
-    NSUserInterfaceLayoutOrientationHorizontal, NSUserInterfaceLayoutOrientationVertical,
-    NSWindowStyleMaskClosable, NSWindowStyleMaskTitled,
+    NSApplication, NSBackingStoreBuffered, NSButton, NSColor, NSFont, NSFontWeightSemibold, NSImage,
+    NSLayoutConstraint, NSMakeRect, NSPanel, NSPopUpButton, NSTextField, NSToolbar, NSToolbarItem,
+    NSWindowStyleMaskClosable, NSWindowStyleMaskTitled, NSWindowToolbarStylePreference,
 )
 from Foundation import NSObject
 
 from . import __version__
-from .corrections import MAX_HEARD_CHARS, MAX_REPLACEMENT_CHARS, MAX_RULES, normalize_rules
+from .config import Delivery
 from .hotkeys import STOP
+from .layout import small_text, stack
+from .replacements_editor import ReplacementsEditor
 from .shortcut_picker import ShortcutPicker
 
 MARGIN = 24
@@ -28,7 +27,7 @@ _HELP = {
                          "Turn off to dictate in the full Maramax window.",
     "auto_start_recording": f"Turn off to open the window first and start with {STOP.label}.",
     "live_preview": "Draft text while you speak. The final transcript always replaces it.",
-    "auto_copy_to_clipboard": "",
+    "auto_copy_to_clipboard": "Always on while Maramax pastes: pasting goes through the clipboard.",
     "paste_to_active_app": "Pastes the result where your cursor is. Needs Accessibility permission: Maramax opens "
                            "System Settings → Privacy & Security → Accessibility; turn Maramax on there.",
     "high_accuracy": "Qwen3-ASR 1.7B, a larger model that reads your word replacements as vocabulary. "
@@ -47,15 +46,15 @@ _SPEECH_MODEL = "Speech model"
 _UPDATES = "Updates"
 _SECTIONS = (
     (_DICTATION, ("compact_dictation", "auto_start_recording", "live_preview")),
-    ("Result", ("auto_copy_to_clipboard", "paste_to_active_app")),
+    ("When a transcript is ready", ("auto_copy_to_clipboard", "paste_to_active_app")),
     (_SPEECH_MODEL, ("high_accuracy",)),
     (_UPDATES, ("check_for_updates",)),
 )
+# Toolbar tabs, as in every Mac app's Settings: a name and an SF Symbol.
+TABS = (("General", "gearshape"), ("Microphone", "mic"), ("Words", "character.book.closed"))
+MICROPHONE_TAB = 1
 _KEEP_READY_CHOICES = (0, 30, 120, 300)
-_DEFAULT_NOTE = "Each replacement is applied once per match; replacements never chain."
-_RULE_TITLE_CHARS = 60
-TABS_TOP = 16
-TABS_TO_PAGE = 20
+PAGE_TOP = 20
 ROW_GAP = 8  # Between controls that share a row.
 
 
@@ -66,12 +65,6 @@ def duration_label(seconds: int) -> str:
     return f"{count} {unit}" if count == 1 else f"{count} {unit}s"
 
 
-def rule_title(rule: dict[str, str]) -> str:
-    """One menu line per rule; a long snippet must not make a 4,000 pt menu."""
-    title = " ".join(f"{rule['heard']} → {rule['replacement']}".split())
-    return title if len(title) <= _RULE_TITLE_CHARS else title[: _RULE_TITLE_CHARS - 1] + "…"
-
-
 class PreferencesController(NSObject):
     def initWithDelegate_labels_(self, delegate, labels):
         self = objc.super(PreferencesController, self).init()
@@ -79,48 +72,37 @@ class PreferencesController(NSObject):
             return None
         self.delegate = delegate
         self.labels = labels
-        self._editing_heard = None
         self.options = {}
-        self.rules = []
         self.device_names = [None]
+        self.selected_tab = 0
         self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, CONTENT_WIDTH + 2 * MARGIN, 480), NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
             NSBackingStoreBuffered, False,
         )
-        self.panel.setTitle_("Maramax Settings")
         self.panel.setReleasedWhenClosed_(False)
         # A menu-bar app has no Dock icon to bring a hidden panel back with.
         self.panel.setHidesOnDeactivate_(False)
         self.panel.setDelegate_(self)
+        toolbar = NSToolbar.alloc().initWithIdentifier_("MaramaxSettings")
+        toolbar.setDelegate_(self)
+        toolbar.setAllowsUserCustomization_(False)
+        self.panel.setToolbar_(toolbar)
+        self.panel.setToolbarStyle_(NSWindowToolbarStylePreference)
         root = self.panel.contentView()
 
-        self.tabs = NSSegmentedControl.alloc().initWithFrame_(NSMakeRect(0, 0, 330, 24))
-        self.tabs.setSegmentCount_(3)
-        for index, title in enumerate(("General", "Microphone", "Words")):
-            self.tabs.setLabel_forSegment_(title, index)
-            self.tabs.setWidth_forSegment_(110, index)
-        self.tabs.setSelectedSegment_(0)
-        self.tabs.setTarget_(self)
-        self.tabs.setAction_("selectTab:")
-        self.tabs.setTranslatesAutoresizingMaskIntoConstraints_(False)
-        root.addSubview_(self.tabs)
-
         self.pages = [self._general_page(), self._microphone_page(), self._words_page()]
-        constraints = [
-            self.tabs.topAnchor().constraintEqualToAnchor_constant_(root.topAnchor(), TABS_TOP),
-            self.tabs.centerXAnchor().constraintEqualToAnchor_(root.centerXAnchor()),
-        ]
-        for index, page in enumerate(self.pages):
+        constraints = []
+        for page in self.pages:
             page.setTranslatesAutoresizingMaskIntoConstraints_(False)
             root.addSubview_(page)
-            page.setHidden_(index != 0)
             constraints += [
-                page.topAnchor().constraintEqualToAnchor_constant_(self.tabs.bottomAnchor(), TABS_TO_PAGE),
+                page.topAnchor().constraintEqualToAnchor_constant_(root.topAnchor(), PAGE_TOP),
                 page.leadingAnchor().constraintEqualToAnchor_constant_(root.leadingAnchor(), MARGIN),
                 page.widthAnchor().constraintEqualToConstant_(CONTENT_WIDTH),
             ]
         NSLayoutConstraint.activateConstraints_(constraints)
         self.update_input_devices([], delegate.config.input_device)
+        self.show_tab(0)
         self.refresh()
         return self
 
@@ -130,29 +112,37 @@ class PreferencesController(NSObject):
         same bottom margin, keeping the title bar where it is."""
         root = self.panel.contentView()
         root.layoutSubtreeIfNeeded()
-        page = self.pages[self.tabs.selectedSegment()]
-        # Pages hang from the top, so the space above one is whatever the
-        # layout made it; measuring it avoids restating the tab control's size.
-        above = root.bounds().size.height - (page.frame().origin.y + page.frame().size.height)
-        height = above + page.fittingSize().height + MARGIN
-        frame = self.panel.frameRectForContentRect_(NSMakeRect(0, 0, CONTENT_WIDTH + 2 * MARGIN, height))
+        height = PAGE_TOP + self.pages[self.selected_tab].fittingSize().height + MARGIN
         current = self.panel.frame()
+        # The title bar and toolbar: whatever the frame holds beyond the content.
+        chrome = current.size.height - root.frame().size.height
         top = current.origin.y + current.size.height
-        self.panel.setFrame_display_(
-            NSMakeRect(current.origin.x, top - frame.size.height, frame.size.width, frame.size.height), True)
+        if abs(current.size.height - (height + chrome)) < 0.5:
+            return  # Refreshed with nothing that changes the height.
+        frame = NSMakeRect(current.origin.x, top - height - chrome, current.size.width, height + chrome)
+        self.panel.setFrame_display_animate_(frame, True, bool(self.panel.isVisible()))
+
+    # -- Toolbar --
+
+    def toolbarAllowedItemIdentifiers_(self, toolbar):
+        return [name for name, _symbol in TABS]
+
+    def toolbarDefaultItemIdentifiers_(self, toolbar):
+        return [name for name, _symbol in TABS]
+
+    def toolbarSelectableItemIdentifiers_(self, toolbar):
+        return [name for name, _symbol in TABS]
+
+    def toolbar_itemForItemIdentifier_willBeInsertedIntoToolbar_(self, toolbar, identifier, flag):
+        symbol = dict(TABS)[str(identifier)]
+        item = NSToolbarItem.alloc().initWithItemIdentifier_(identifier)
+        item.setLabel_(identifier)
+        item.setImage_(NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, identifier))
+        item.setTarget_(self)
+        item.setAction_("selectTab:")
+        return item
 
     # -- Building blocks --
-
-    @objc.python_method
-    def _stack(self, views, horizontal=False, spacing=8):
-        stack = NSStackView.stackViewWithViews_(views)
-        stack.setOrientation_(NSUserInterfaceLayoutOrientationHorizontal if horizontal
-                              else NSUserInterfaceLayoutOrientationVertical)
-        # Leading/baseline alignment works on alignment rectangles, so push
-        # buttons, popups, and text line up on what the eye sees as edges.
-        stack.setAlignment_(NSLayoutAttributeFirstBaseline if horizontal else NSLayoutAttributeLeading)
-        stack.setSpacing_(spacing)
-        return stack
 
     @objc.python_method
     def _header(self, text):
@@ -162,11 +152,7 @@ class PreferencesController(NSObject):
 
     @objc.python_method
     def _help(self, text, width=CONTENT_WIDTH):
-        label = NSTextField.wrappingLabelWithString_(text)
-        label.setFont_(NSFont.systemFontOfSize_(11))
-        label.setTextColor_(NSColor.secondaryLabelColor())
-        label.setSelectable_(False)
-        label.setPreferredMaxLayoutWidth_(width)
+        label = small_text(text, width)
         label.widthAnchor().constraintLessThanOrEqualToConstant_(width).setActive_(True)
         return label
 
@@ -182,16 +168,16 @@ class PreferencesController(NSObject):
         text = _HELP.get(name, "")
         if not text:
             return button
-        indented = self._stack([self._help(text, CONTENT_WIDTH - CHECKBOX_INDENT)])
+        indented = stack([self._help(text, CONTENT_WIDTH - CHECKBOX_INDENT)])
         indented.setEdgeInsets_((0, CHECKBOX_INDENT, 0, 0))
-        return self._stack([button, indented], spacing=3)
+        return stack([button, indented], spacing=3)
 
     @objc.python_method
     def _page(self, groups):
         """Groups are lists of views; space between groups is wider than
         the space inside one."""
         views = [view for group in groups for view in group]
-        page = self._stack(views, spacing=10)
+        page = stack(views, spacing=10)
         for group in groups[:-1]:
             page.setCustomSpacing_afterView_(22, group[-1])
         return page
@@ -203,21 +189,21 @@ class PreferencesController(NSObject):
         # The picker's notes wrap within what the label leaves of the row.
         self.shortcut_picker = ShortcutPicker.alloc().initWithOwner_width_onResize_(
             self.delegate, CONTENT_WIDTH - shortcut_label.fittingSize().width - ROW_GAP, self._fit_window_to_page)
-        shortcut_row = self._stack([shortcut_label, self.shortcut_picker.view], horizontal=True, spacing=ROW_GAP)
+        shortcut_row = stack([shortcut_label, self.shortcut_picker.view], horizontal=True, spacing=ROW_GAP)
         sections[_DICTATION].insert(1, shortcut_row)
         self.model_status = self._help("")
         self.model_retry = self._button("Retry", "retryModel:")
-        sections[_SPEECH_MODEL].append(self._stack([self.model_status, self.model_retry], horizontal=True,
+        sections[_SPEECH_MODEL].append(stack([self.model_status, self.model_retry], horizontal=True,
                                                     spacing=ROW_GAP))
         self.update_check = self._button("Check Now", "checkForUpdates:")
         self.update_status = self._help("", CONTENT_WIDTH - 120)
-        sections[_UPDATES].append(self._stack([self.update_check, self.update_status], horizontal=True,
+        sections[_UPDATES].append(stack([self.update_check, self.update_status], horizontal=True,
                                                spacing=ROW_GAP))
         name = NSTextField.labelWithString_("Maramax")
         name.setFont_(NSFont.systemFontOfSize_weight_(15, NSFontWeightSemibold))
         version = NSTextField.labelWithString_(f"Version {__version__}")
         version.setTextColor_(NSColor.secondaryLabelColor())
-        about = [self._stack([name, version], horizontal=True, spacing=ROW_GAP)]
+        about = [stack([name, version], horizontal=True, spacing=ROW_GAP)]
         return self._page([about, *sections.values()])
 
     @objc.python_method
@@ -226,14 +212,14 @@ class PreferencesController(NSObject):
         self.device_picker.setTarget_(self)
         self.device_picker.setAction_("selectDevice:")
         self.device_picker.widthAnchor().constraintEqualToConstant_(400).setActive_(True)
-        picker_row = self._stack([self.device_picker, self._button("Refresh", "refreshDevices:")],
+        picker_row = stack([self.device_picker, self._button("Refresh", "refreshDevices:")],
                                  horizontal=True, spacing=ROW_GAP)
 
         self.keep_ready = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 100, 25), False)
         self.keep_ready.setTarget_(self)
         self.keep_ready.setAction_("selectKeepReady:")
         self.keep_ready.widthAnchor().constraintEqualToConstant_(140).setActive_(True)
-        keep_row = self._stack([NSTextField.labelWithString_("Keep the microphone connected for"), self.keep_ready],
+        keep_row = stack([NSTextField.labelWithString_("Keep the microphone connected for"), self.keep_ready],
                                horizontal=True, spacing=ROW_GAP)
         return self._page([
             [self._header("Input"), picker_row,
@@ -254,44 +240,13 @@ class PreferencesController(NSObject):
 
     @objc.python_method
     def _words_page(self):
-        self.heard = self._field("e.g. mara max", 200)
-        self.replacement = self._field("e.g. Maramax", 200)
-        grid = NSGridView.gridViewWithViews_([
-            [NSTextField.labelWithString_("When the transcript says"), NSTextField.labelWithString_("Replace with"),
-             NSGridCell.emptyContentView()],
-            [self.heard, self.replacement, self._button("Save", "saveRule:")],
-        ])
-        grid.setRowSpacing_(4)
-        grid.setColumnSpacing_(ROW_GAP)
-        grid.rowAtIndex_(1).setRowAlignment_(NSGridRowAlignmentFirstBaseline)
-
-        self.picker = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 100, 25), False)
-        self.picker.setTarget_(self)
-        self.picker.setAction_("selectRule:")
-        self.picker.widthAnchor().constraintEqualToConstant_(CONTENT_WIDTH).setActive_(True)
-        self.remove = self._button("Remove", "removeRule:")
-        new_rule = self._button("New", "newRule:")
-        rule_buttons = self._stack([self.remove, new_rule], horizontal=True, spacing=ROW_GAP)
-        # Siblings of equal weight get equal width (they share a parent now).
-        new_rule.widthAnchor().constraintEqualToAnchor_(self.remove.widthAnchor()).setActive_(True)
-        self.note = self._help(_DEFAULT_NOTE)
+        self.replacements = ReplacementsEditor.alloc().initWithOwner_width_onResize_(
+            self.delegate, CONTENT_WIDTH, self._fit_window_to_page)
         return self._page([
             [self._option("use_corrections")],
-            [self._header("Add or change a replacement"), grid],
-            [self._header("Saved replacements"), self.picker, rule_buttons, self.note],
+            [self._header("Replacements"), self.replacements.view],
+            [self._header("Try it"), self.replacements.trial_view],
         ])
-
-    @objc.python_method
-    def _field(self, placeholder, width):
-        field = NSTextField.textFieldWithString_("")
-        field.setPlaceholderString_(placeholder)
-        field.setBezelStyle_(NSTextFieldRoundedBezel)
-        field.widthAnchor().constraintEqualToConstant_(width).setActive_(True)
-        # Return saves, as Save does; Tab and clicking away do not.
-        field.setTarget_(self)
-        field.setAction_("saveRule:")
-        field.cell().setSendsActionOnEndEditing_(False)
-        return field
 
     # -- State --
 
@@ -307,6 +262,11 @@ class PreferencesController(NSObject):
         config = self.delegate.config
         for name, button in self.options.items():
             button.setState_(int(getattr(config, name)))
+        # Pasting copies whatever the copy setting says, so while it is on the
+        # copy box shows what happens and cannot be turned off.
+        copy = self.options["auto_copy_to_clipboard"]
+        copy.setState_(int(config.delivery() is not Delivery.KEPT))
+        copy.setEnabled_(config.delivery() is not Delivery.PASTED)
         self.model_status.setStringValue_(self._model_message())
         self.model_retry.setHidden_(self.delegate.transcriber.load_error is None)
         if not self.shortcut_picker.is_recording():
@@ -322,20 +282,7 @@ class PreferencesController(NSObject):
         if config.input_device in self.device_names:
             self.device_picker.selectItemAtIndex_(self.device_names.index(config.input_device))
         self.show_busy_state()
-
-        selected = self.picker.indexOfSelectedItem()
-        self.rules = list(config.replacements)
-        self.picker.removeAllItems()
-        for rule in self.rules:
-            # addItemWithTitle would merge rules whose titles collide.
-            self.picker.menu().addItem_(
-                NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(rule_title(rule), None, ""))
-        if not self.rules:
-            self.picker.addItemWithTitle_("No replacements yet")
-        elif selected >= 0:
-            self.picker.selectItemAtIndex_(min(selected, len(self.rules) - 1))
-        self.picker.setEnabled_(bool(self.rules))
-        self.remove.setEnabled_(bool(self.rules))
+        self.replacements.refresh()
         # The model status line can grow to two lines.
         self._fit_window_to_page()
 
@@ -362,7 +309,7 @@ class PreferencesController(NSObject):
             self.panel.center()
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         self.panel.makeKeyAndOrderFront_(None)
-        if self.tabs.selectedSegment() == 1:
+        if self.selected_tab == MICROPHONE_TAB:
             self.refreshDevices_(None)
 
     def windowWillClose_(self, notification):
@@ -370,13 +317,21 @@ class PreferencesController(NSObject):
         self.shortcut_picker.stop_recording()  # Never leave the global shortcut paused.
 
     def selectTab_(self, sender):
-        index = self.tabs.selectedSegment()
+        names = [name for name, _symbol in TABS]
+        self.show_tab(names.index(str(sender.itemIdentifier())))
+
+    @objc.python_method
+    def show_tab(self, index):
+        self.selected_tab = index
+        name = TABS[index][0]
+        self.panel.toolbar().setSelectedItemIdentifier_(name)
+        self.panel.setTitle_(name)
         if index != 0:
             self.shortcut_picker.stop_recording()  # Keys typed on another tab are typing, not a shortcut.
         for page_index, page in enumerate(self.pages):
             page.setHidden_(page_index != index)
         self._fit_window_to_page()
-        if index == 1:
+        if index == MICROPHONE_TAB:
             self.refreshDevices_(None)
 
     def refreshDevices_(self, sender):
@@ -385,7 +340,7 @@ class PreferencesController(NSObject):
     @objc.python_method
     def shows_microphones(self):
         """Whether the device list is on screen and worth refreshing."""
-        return self.panel.isVisible() and self.tabs.selectedSegment() == 1
+        return self.panel.isVisible() and self.selected_tab == MICROPHONE_TAB
 
     @objc.python_method
     def update_input_devices(self, devices, selected_name, automatic_name=None):
@@ -420,51 +375,3 @@ class PreferencesController(NSObject):
         del sender
         self.delegate.retry_speech_model()
         self.refresh()
-
-    def selectRule_(self, sender):
-        del sender
-        index = self.picker.indexOfSelectedItem()
-        if 0 <= index < len(self.rules):
-            self._editing_heard = self.rules[index]["heard"]
-            self.heard.setStringValue_(self.rules[index]["heard"])
-            self.replacement.setStringValue_(self.rules[index]["replacement"])
-
-    def newRule_(self, sender):
-        del sender
-        self._editing_heard = None
-        self.heard.setStringValue_("")
-        self.replacement.setStringValue_("")
-        self.panel.makeFirstResponder_(self.heard)
-
-    def saveRule_(self, sender):
-        del sender
-        candidate = normalize_rules([{
-            "heard": str(self.heard.stringValue()), "replacement": str(self.replacement.stringValue()),
-        }])
-        if not candidate:
-            self.note.setStringValue_(f"Enter both phrases (up to {MAX_HEARD_CHARS} characters heard and "
-                                      f"{MAX_REPLACEMENT_CHARS:,} for the replacement).")
-            return
-        rule = candidate[0]
-        replaced = {rule["heard"].casefold()}
-        if self._editing_heard is not None:
-            replaced.add(self._editing_heard.casefold())
-        rules = [r for r in self.rules if r["heard"].casefold() not in replaced]
-        if len(rules) >= MAX_RULES:
-            self.note.setStringValue_(f"Up to {MAX_RULES} replacements are supported. Remove one to add another.")
-            return
-        self._editing_heard = rule["heard"]
-        saved = self.delegate.replace_word_rules(rules + [rule])
-        self.refresh()
-        self.picker.selectItemAtIndex_(len(self.rules) - 1)
-        self.note.setStringValue_("Replacement saved." if saved else
-                                  "Replacement works for this session, but settings could not be saved.")
-
-    def removeRule_(self, sender):
-        del sender
-        index = self.picker.indexOfSelectedItem()
-        if 0 <= index < len(self.rules):
-            saved = self.delegate.replace_word_rules([r for i, r in enumerate(self.rules) if i != index])
-            self.refresh()
-            self.newRule_(None)
-            self.note.setStringValue_("Replacement removed." if saved else "Could not save this change to disk.")
