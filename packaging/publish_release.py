@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tomllib
 
-from create_release import ROOT, assets_path, checksum_path, release_paths
+from create_release import ROOT, assets_path, checksum_path, published_path, release_paths
 
 sys.path.insert(0, str(ROOT / "src"))
 from parakeet_dictation.updater import UpdateError, parse_checksum  # noqa: E402
@@ -32,11 +32,16 @@ def _git(root: Path, *args: str) -> str:
     return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
 
 
-def main() -> None:
+def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--notes-file", type=Path, required=True, help="Markdown shown in the update prompt")
-    args = parser.parse_args()
+    # Resolved here: it is checked from this directory but read by gh from the repository's.
+    parser.add_argument("--notes-file", type=lambda text: Path(text).resolve(), required=True,
+                        help="Markdown shown in the update prompt")
+    return parser.parse_args(argv)
 
+
+def main() -> None:
+    args = arguments()
     root = ROOT
     version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
     destination, archive, _ = release_paths(root, version)
@@ -78,6 +83,8 @@ def main() -> None:
     subprocess.run(["gh", "release", "create", tag, *uploads, "--target", commit,
                     "--title", f"Maramax {version}", "--notes-file", str(args.notes_file), "--latest"],
                    cwd=root, check=True)
+    # Copies can now be at this version: the next release's delta starts here.
+    published_path(root, version).write_text(f"{tag} {commit}\n")
 
 
 if __name__ == "__main__":

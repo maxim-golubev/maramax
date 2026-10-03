@@ -214,13 +214,21 @@ def ensure_installable(installed_app: Path, updates_dir: Path) -> None:
     if not os.access(installed_app.parent, os.W_OK):
         raise UpdateError(f"Maramax cannot replace itself: {installed_app.parent} is not writable "
                           "(move Maramax.app into Applications first)")
+    # Renaming a folder also needs write access to the folder itself.
+    if not os.access(installed_app, os.W_OK):
+        raise UpdateError(f"Maramax cannot replace itself: {installed_app} belongs to another user or is "
+                          "read-only (install Maramax.app again as yourself)")
 
 
 def _bundle_info(app: Path) -> dict:
     try:
-        return plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
-    except (OSError, ValueError, plistlib.InvalidFileException, xml.parsers.expat.ExpatError) as exc:
+        info = plistlib.loads((app / "Contents" / "Info.plist").read_bytes())
+    except (OSError, ValueError, RecursionError, plistlib.InvalidFileException,
+            xml.parsers.expat.ExpatError) as exc:
         raise UpdateError(f"{app} is not a readable app bundle: {exc}") from exc
+    if not isinstance(info, dict):
+        raise UpdateError(f"{app}'s Info.plist holds a {type(info).__name__}, not a dictionary")
+    return info
 
 
 Progress = Callable[[int, int], None]   # bytes received, bytes expected
@@ -244,12 +252,16 @@ def download(release: Release, current_version: str, installed_app: Path, stagin
             except UpdateCancelled:
                 raise
             except Exception as exc:
+                if cancelled():
+                    # Cancelled while the delta stalled: stop, not fetch the whole app.
+                    raise UpdateCancelled("The download was cancelled") from exc
                 # A delta is only a shortcut: whatever goes wrong with it, the
                 # whole app is fetched instead.
                 logger.warning(f"The update delta did not produce a verified app ({exc}); downloading the whole app")
         if new_app is None:
             _reset(staging)
             new_app = _from_archive(release, current_version, installed_app, staging, progress, cancelled)
+        _restrict_permissions(new_app)
         staged = _place_beside(new_app, installed_app)
     except OSError as exc:
         shutil.rmtree(staging, ignore_errors=True)
@@ -349,10 +361,22 @@ def _verify(new_app: Path, installed_app: Path, version: str) -> None:
          f"confirm that Maramax {version} was signed by Maramax's release certificate")
 
 
+def _restrict_permissions(app: Path) -> None:
+    """The signature seals contents, not permission bits, which come from the
+    release's ZIP or the delta's manifest: nothing installed may be writable
+    by other users or run as another. (chmod -R does not follow symlinks.)"""
+    _run(["chmod", "-R", "go-w,ug-s", str(app)], f"set the permissions of {app}")
+
+
+def staged_app(installed_app: Path) -> Path:
+    """Where download() places the new app: beside the installed one."""
+    return installed_app.parent / STAGED_NAME
+
+
 def _place_beside(new_app: Path, installed_app: Path) -> Path:
     """Move the verified app next to the installed one, so the swap is a
     rename within one folder (and one volume) once Maramax has quit."""
-    staged = installed_app.parent / STAGED_NAME
+    staged = staged_app(installed_app)
     if staged.exists():
         shutil.rmtree(staged)
     if new_app.stat().st_dev == installed_app.parent.stat().st_dev:

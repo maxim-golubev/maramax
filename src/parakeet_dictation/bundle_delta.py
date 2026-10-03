@@ -17,7 +17,9 @@ import json
 import os
 import shutil
 import stat
-from pathlib import Path
+import unicodedata
+from collections.abc import Iterable
+from pathlib import Path, PurePosixPath
 
 _FILES = "files"
 _MANIFEST = "manifest.json"
@@ -84,14 +86,30 @@ def make(old_app: Path, new_app: Path, delta_dir: Path) -> tuple[int, int]:
 def _inside(root: Path, relative: str) -> Path:
     """`root / relative`, refusing anything that could land outside `root`:
     an absolute path, `..`, or a way through a symlink. A bundle's own tree
-    never lists a path through a link (the walk does not follow them)."""
-    parts = Path(relative).parts
-    if not parts or Path(relative).is_absolute() or ".." in parts:
+    never lists a path through a link (the walk does not follow them), nor
+    writes one as `a//b` or `a/./b`: such a spelling is a second name for
+    an entry the delta may also list as a link."""
+    path = PurePosixPath(relative)
+    parts = path.parts
+    if not parts or path.is_absolute() or ".." in parts:
         raise DeltaError(f"The delta names a path outside the app: {relative!r}")
+    if path.as_posix() != relative:
+        raise DeltaError(f"The delta spells a path in a way the app's own tree never does: {relative!r}")
     for depth in range(1, len(parts)):
         if root.joinpath(*parts[:depth]).is_symlink():
             raise DeltaError(f"The delta reaches through a symlink: {relative!r}")
     return root.joinpath(*parts)
+
+
+def _require_one_name_each(paths: Iterable[str]) -> None:
+    """APFS ignores case and Unicode normalization, so two such spellings
+    name one entry on disk; a bundle's own tree never lists both."""
+    seen: dict[str, str] = {}
+    for path in paths:
+        key = unicodedata.normalize("NFD", path).casefold()
+        if key in seen:
+            raise DeltaError(f"The delta names one entry twice: {seen[key]!r} and {path!r}")
+        seen[key] = path
 
 
 def _remove(path: Path) -> None:
@@ -116,6 +134,7 @@ def apply(delta_dir: Path, app: Path) -> None:
             raise DeltaError(f"Unknown delta format {manifest.get('format')!r}")
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise DeltaError(f"The delta's manifest is unreadable: {exc}") from exc
+    _require_one_name_each(tree)
     try:
         for relative in sorted(deleted, key=_depth, reverse=True):
             _remove(_inside(app, relative))
@@ -137,7 +156,11 @@ def apply(delta_dir: Path, app: Path) -> None:
                     shutil.copy2(source, target)
         for relative, (kind, _, mode) in tree.items():
             if kind != "link":
-                os.chmod(_inside(app, relative), mode)
+                target = _inside(app, relative)
+                # chmod follows a final symlink, which could be anywhere.
+                if target.is_symlink():
+                    raise DeltaError(f"The delta sets permissions through a symlink: {relative!r}")
+                os.chmod(target, mode)
     except OSError as exc:
         raise DeltaError(f"The delta could not be applied: {exc}") from exc
     result = entries(app)

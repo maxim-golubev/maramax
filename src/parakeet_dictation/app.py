@@ -209,7 +209,7 @@ class DictationApp(rumps.App):
 
         self.updates = UpdateOffer(
             menu_item=update_item, current_version=__version__, installed_app=app_bundle(),
-            support_dir=self._support_dir, config=self.config, save_settings=self._save_settings, is_busy=lambda: self.is_busy,
+            support_dir=self._support_dir, config=self.config, save_settings=self._save_settings, is_busy=self._is_in_use,
             quit_app=rumps.quit_application, on_change=self._show_update_status,
         )
 
@@ -248,6 +248,12 @@ class DictationApp(rumps.App):
         if self._recordings_window is not None:
             self._recordings_window.show_busy_state()
         self.refresh_input_devices()  # Not listed while busy; listed again once idle.
+
+    def _is_in_use(self) -> bool:
+        """Busy, or quitting now (to install an update) would cut something
+        short: an outcome still on the bar, or a WAV still being saved."""
+        return (self.is_busy or self.indicator.is_finished()
+                or (self._recordings_window is not None and self._recordings_window.is_saving()))
 
     def _begin_transcribing(self) -> int:
         """Take ownership of the display for a new non-microphone operation."""

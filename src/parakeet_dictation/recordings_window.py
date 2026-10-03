@@ -41,6 +41,7 @@ class RecordingsController(NSObject):
         self.store = store
         self.records = []
         self.sound = None
+        self._saving = None  # the thread copying a WAV out, once Save Audio has been used
         self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, WIDTH, HEIGHT), NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
             NSBackingStoreBuffered, False,
@@ -222,7 +223,13 @@ class RecordingsController(NSObject):
                 message = f"Could not save audio: {exc}"
             AppHelper.callAfter(self.note.setStringValue_, message)
 
-        threading.Thread(target=save, daemon=True).start()
+        self._saving = threading.Thread(target=save, daemon=True)
+        self._saving.start()
+
+    @objc.python_method
+    def is_saving(self):
+        """A WAV is still being copied out: quitting now would cut it short."""
+        return self._saving is not None and self._saving.is_alive()
 
     def retry_(self, sender):
         del sender

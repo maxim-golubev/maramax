@@ -528,3 +528,20 @@ def test_files_added_during_a_recording_wait_in_the_queue(monkeypatch):
     app._phase = Phase.IDLE
     app.queue_add_files(["/x/c.m4a"])
     assert calls[-1] == "activated window"
+
+
+def test_an_update_waits_for_an_outcome_on_the_bar_and_for_audio_being_saved(monkeypatch):
+    app, _ = controller(monkeypatch)
+    showing, saving = [False], [False]
+    app.indicator.is_finished = lambda: showing[0]
+    assert not app._is_in_use()
+    showing[0] = True                       # "No speech detected" is on the bar for its 8 s.
+    assert app._is_in_use()
+    showing[0] = False
+    app._recordings_window = SimpleNamespace(is_saving=lambda: saving[0])
+    assert not app._is_in_use()
+    saving[0] = True                        # Save Audio is still copying the WAV.
+    assert app._is_in_use()
+    saving[0] = False
+    app._phase = Phase.RECORDING
+    assert app._is_in_use()

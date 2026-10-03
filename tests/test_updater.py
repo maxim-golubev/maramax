@@ -5,6 +5,7 @@ import json
 import os
 import plistlib
 import subprocess
+import sys
 import time
 import urllib.error
 import zipfile
@@ -141,10 +142,16 @@ def version_of(app):
     return plistlib.loads((app / "Contents" / "Info.plist").read_bytes())["CFBundleShortVersionString"]
 
 
-def published(tmp_path, identifier="com.maramax.dictation", version="0.5.2", tamper=False):
-    """A release archive laid out as create_release.py makes it, served from files."""
+def published(tmp_path, identifier="com.maramax.dictation", version="0.5.2", tamper=False, modes=None,
+              info_plist=None):
+    """A release archive laid out as create_release.py makes it, served from files.
+    `modes` sets permissions inside the app; `info_plist` replaces its Info.plist."""
     source = tmp_path / "source"
-    fake_bundle(source / f"Maramax-{version}", identifier, version)
+    app = fake_bundle(source / f"Maramax-{version}", identifier, version)
+    for relative, mode in (modes or {}).items():
+        (app / relative).chmod(mode)
+    if info_plist is not None:
+        (app / "Contents" / "Info.plist").write_bytes(info_plist)
     archive = tmp_path / f"Maramax-{version}.zip"
     with zipfile.ZipFile(archive, "w") as zipped:
         for path in sorted(source.rglob("*")):
@@ -233,6 +240,14 @@ def test_the_kept_previous_copy_and_read_only_folders_are_refused_before_downloa
             updater.ensure_installable(app, updates)
     finally:
         os.chmod(locked, 0o755)
+    # A folder that is not writable itself cannot be renamed aside by the swap,
+    # even in a writable Applications folder (another user's copy, or root's).
+    os.chmod(app, 0o555)
+    try:
+        with pytest.raises(updater.UpdateError, match="another user or is read-only"):
+            updater.ensure_installable(app, updates)
+    finally:
+        os.chmod(app, 0o755)
     updater.ensure_installable(fake_bundle(tmp_path / "Applications"), updates)
 
 
@@ -496,7 +511,7 @@ def test_install_and_relaunch_shows_progress_waits_for_idle_then_restarts(monkey
     monkeypatch.setattr(update_offer.threading, "Thread", lambda **kwargs: SimpleNamespace(start=lambda: None))
     controller._quit_app = lambda: quits.append(True)
     controller._installed_app = tmp_path / "Applications" / "Maramax.app"
-    controller._installed_app.parent.mkdir()
+    controller._installed_app.mkdir(parents=True)
     release = a_release()
     controller._download(release)
     controller._show_download_progress(1024, 2048)
@@ -741,6 +756,9 @@ def test_an_update_downloads_only_the_delta_when_one_is_published(tmp_path, code
     old, new = two_versions(tmp_path)
     installed = (tmp_path / "Applications").mkdir() or old.rename(tmp_path / "Applications" / "Maramax.app")
     release = published_with_delta(tmp_path, installed, new)
+    # A copy installed from a browser download carries quarantine on files the delta leaves alone.
+    unchanged = installed / "Contents" / "Resources" / "lib" / "big.bin"
+    subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;00000000;Safari;", str(unchanged)], check=True)
     fetched = []
     staged = updater.download(release, "0.5.1", installed, tmp_path / "staging",
                               lambda received, expected: fetched.append(expected), lambda: False)
@@ -748,6 +766,12 @@ def test_an_update_downloads_only_the_delta_when_one_is_published(tmp_path, code
     assert bundle_delta.entries(staged) == bundle_delta.entries(new)
     assert version_of(installed) == "0.5.1"    # The installed app was only copied.
     assert not (tmp_path / "staging").exists()
+    # The rebuilt app, not the installed one, passed the pinned signature check.
+    assert codesign == [["codesign", "--verify", "--deep", "--strict",
+                         f"-R={updater.signer_requirement('com.maramax.dictation')}",
+                         str(tmp_path / "staging" / "assembled" / "Maramax.app")]]
+    attributes = subprocess.run(["xattr", "-r", str(staged)], capture_output=True, text=True, check=True).stdout
+    assert "com.apple.quarantine" not in attributes
 
 
 def test_a_delta_that_fails_falls_back_to_the_whole_app(tmp_path, codesign):
@@ -779,3 +803,248 @@ def test_skipped_version_and_update_checks_persist(tmp_path):
     loaded = AppConfig.load(path)
     assert loaded.check_for_updates is False and loaded.skipped_update_version == "0.5.2"
     assert AppConfig().check_for_updates is True
+
+
+# -- A delta made by someone without the signing key touches nothing outside the app --
+
+def victim(tmp_path):
+    """A file of the user's outside the app, as a hostile delta would aim at it."""
+    path = tmp_path / "victim"
+    path.write_text("private")
+    path.chmod(0o600)
+    return path
+
+
+def untouched(path):
+    return path.stat().st_mode & 0o7777 == 0o600 and path.read_text() == "private"
+
+
+@pytest.mark.parametrize("link, alias, kind, message", [
+    ("Contents/x", "Contents/./x", "file", "spells a path"),       # pathlib reads both as Contents/x
+    ("Contents/x", "Contents//x", "file", "spells a path"),
+    ("Contents/x", "Contents/X", "dir", "names one entry twice"),  # APFS ignores case...
+    ("Contents/é", "Contents/é", "file", "names one entry twice"),  # ...and Unicode normalization
+])
+def test_a_delta_cannot_set_permissions_through_a_link_it_carries_under_another_name(tmp_path, link, alias,
+                                                                                       kind, message):
+    old, new = two_versions(tmp_path)
+    delta = tmp_path / "delta"
+    bundle_delta.make(old, new, delta)
+    target = victim(tmp_path)
+    (delta / "files" / link).symlink_to(target)
+    manifest = json.loads((delta / "manifest.json").read_text())
+    manifest["carried"].append(link)
+    manifest["tree"][alias] = [kind, "" if kind == "dir" else "0" * 64, 0o777]
+    manifest["tree"][link] = ["link", str(target), 0]
+    (delta / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(bundle_delta.DeltaError) as refused:
+        apply_to_a_clone(tmp_path, old, delta)
+    assert untouched(target)
+    assert message in str(refused.value)    # Refused before anything was changed, not only found out after.
+
+
+def test_permissions_are_never_set_through_a_symlink(tmp_path):
+    """Whatever the tree calls a link that is on disk, chmod is not sent through it."""
+    old, new = two_versions(tmp_path)
+    delta = tmp_path / "delta"
+    bundle_delta.make(old, new, delta)
+    target = victim(tmp_path)
+    (old / "Contents" / "Resources" / "pointer").symlink_to(target)  # In the copy the delta is applied to.
+    manifest = json.loads((delta / "manifest.json").read_text())
+    manifest["tree"]["Contents/Resources/pointer"] = ["file", "0" * 64, 0o777]   # Not carried: left in place.
+    (delta / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(bundle_delta.DeltaError) as refused:
+        apply_to_a_clone(tmp_path, old, delta)
+    assert untouched(target)
+    assert "permissions through a symlink" in str(refused.value)
+
+
+def test_an_installed_update_is_writable_only_by_its_owner(tmp_path, codesign):
+    """The signature does not cover permission bits; the archive sets them, so they are restricted."""
+    installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
+    release = published(tmp_path, modes={"Contents/MacOS/Maramax": 0o6777, "Contents": 0o777})
+    staged = updater.download(release, "0.5.1", installed, tmp_path / "staging", lambda *a: None, lambda: False)
+    modes = {path: path.stat().st_mode & 0o7777 for path in [staged, *staged.rglob("*")]}
+    assert modes[staged / "Contents" / "MacOS" / "Maramax"] == 0o755 and modes[staged / "Contents"] == 0o755
+    assert not [path for path, mode in modes.items() if mode & 0o6022]
+
+
+def test_restricting_a_rebuilt_app_leaves_what_its_links_point_to_alone(tmp_path, codesign):
+    old, new = two_versions(tmp_path)
+    target = victim(tmp_path)
+    target.chmod(0o666)
+    (new / "Contents" / "Resources" / "elsewhere").symlink_to(target)
+    (new / "Contents" / "Resources" / "added.txt").chmod(0o664)   # As the bundle's own PythonApplet.icns is.
+    installed = (tmp_path / "Applications").mkdir() or old.rename(tmp_path / "Applications" / "Maramax.app")
+    staged = updater.download(published_with_delta(tmp_path, installed, new), "0.5.1", installed,
+                              tmp_path / "staging", lambda *a: None, lambda: False)
+    assert (staged / "Contents" / "Resources" / "added.txt").stat().st_mode & 0o777 == 0o644
+    assert target.stat().st_mode & 0o777 == 0o666 and target.read_text() == "private"
+
+
+def test_an_info_plist_that_is_not_a_dictionary_is_refused_and_cleared(tmp_path, codesign):
+    installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
+    release = published(tmp_path, info_plist=plistlib.dumps(["not", "a", "dictionary"]))
+    with pytest.raises(updater.UpdateError, match="not a dictionary"):
+        updater.download(release, "0.5.1", installed, tmp_path / "staging", lambda *a: None, lambda: False)
+    assert not (tmp_path / "staging").exists() and codesign == []
+
+
+# -- The delta's signature check, and its fallback --
+
+def test_a_rebuilt_app_that_fails_the_signature_check_falls_back_to_the_whole_app(tmp_path, monkeypatch):
+    real = updater._run
+    verified = []
+
+    def run(command, what):
+        if command[0] != "codesign":
+            return real(command, what)
+        verified.append(command[-1])
+        if "assembled" in command[-1]:
+            raise updater.UpdateError(f"Could not {what}: a sealed resource is missing or invalid")
+    monkeypatch.setattr(updater, "_run", run)
+    old, new = two_versions(tmp_path)
+    installed = (tmp_path / "Applications").mkdir() or old.rename(tmp_path / "Applications" / "Maramax.app")
+    release = published_with_delta(tmp_path, installed, new)
+    fetched = []
+    staged = updater.download(release, "0.5.1", installed, tmp_path / "staging",
+                              lambda received, expected: fetched.append(expected), lambda: False)
+    assert verified == [str(tmp_path / "staging" / "assembled" / "Maramax.app"),
+                        str(tmp_path / "staging" / "unpacked" / "Maramax-0.5.2" / "Maramax.app")]
+    assert release.archive.size in fetched
+    assert bundle_delta.entries(staged) != bundle_delta.entries(new)   # The archive's app, not the rebuilt one.
+
+
+def test_a_retry_replaces_a_new_app_left_beside_the_installed_one(tmp_path, codesign):
+    installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
+    left = fake_bundle(tmp_path / "earlier", version="0.5.0").rename(installed.parent / updater.STAGED_NAME)
+    (left / "Contents" / "Resources").mkdir()
+    (left / "Contents" / "Resources" / "stale.txt").write_text("from an earlier attempt")
+    staged = updater.download(published(tmp_path), "0.5.1", installed, tmp_path / "staging",
+                              lambda *a: None, lambda: False)
+    assert staged == left and version_of(staged) == "0.5.2"
+    assert not (staged / "Contents" / "Resources" / "stale.txt").exists()
+
+
+# -- Cancelling a download that has stalled --
+
+def test_a_cancel_during_a_failing_delta_stops_instead_of_fetching_the_whole_app(tmp_path, codesign, monkeypatch):
+    old, new = two_versions(tmp_path)
+    installed = (tmp_path / "Applications").mkdir() or old.rename(tmp_path / "Applications" / "Maramax.app")
+    release = published_with_delta(tmp_path, installed, new, corrupt=True)
+    opened, fetched = [], []
+    real_open = updater._open
+    monkeypatch.setattr(updater, "_open", lambda url, version: opened.append(url) or real_open(url, version))
+
+    def progress(received, expected):
+        fetched.append(expected)     # Cancel is pressed while the delta is being read.
+    with pytest.raises(updater.UpdateCancelled):
+        updater.download(release, "0.5.1", installed, tmp_path / "staging", progress, lambda: bool(fetched))
+    assert not {release.archive.url, release.archive.checksum_url} & set(opened)
+    assert not (tmp_path / "staging").exists()
+
+
+def worker_reports(monkeypatch, controller, download):
+    """Run _download_worker with `download` in place of updater.download;
+    returns what it handed to the main thread, undelivered."""
+    handed = []
+    monkeypatch.setattr(update_offer.AppHelper, "callAfter", lambda function, *args: handed.append((function, args)))
+    monkeypatch.setattr(update_offer.updater, "download", download)
+    release = a_release()
+    controller._release = release
+    controller._set_step(update_offer.Step.DOWNLOADING, 0)
+    controller._download_worker(release, controller._paths.updates / "Maramax.app", controller._cancel)
+    return handed
+
+
+def test_a_cancelled_download_that_then_times_out_is_a_stop_not_a_failure(monkeypatch, tmp_path):
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
+    controller._window = FakeWindow()
+
+    def stalled(release, current, installed, staging, progress, cancelled):
+        controller.cancel_requested()            # The user gives up on a stalled network...
+        assert item.title == "Cancelling the Update…" and not controller.can_check()
+        raise updater.UpdateError("Could not download Maramax-0.5.2.zip: timed out")   # ...then the read does.
+    for function, args in worker_reports(monkeypatch, controller, stalled):
+        function(*args)
+    assert alerts == [] and item.title == "Install Maramax 0.5.2…" and controller.can_check()
+
+
+def test_a_download_failure_without_a_cancel_is_reported(monkeypatch, tmp_path):
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
+
+    def failing(*args):
+        raise updater.UpdateError("does not match its published SHA-256")
+    for function, args in worker_reports(monkeypatch, controller, failing):
+        function(*args)
+    assert alerts[0]["title"] == "Maramax 0.5.2 could not be installed"
+
+
+def test_download_progress_reaches_the_main_thread_once_per_percent(monkeypatch, tmp_path):
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
+    size = 200_000
+
+    def download(release, current, installed, staging, progress, cancelled):
+        for received in range(0, size, 1000):     # 200 blocks: two per percent.
+            progress(received, size)
+        progress(size, size)
+        return staging / "Maramax.app"
+    handed = worker_reports(monkeypatch, controller, download)
+    reports = [args for function, args in handed if function == controller._show_download_progress]
+    assert [received * 100 // expected for received, expected in reports] == list(range(101))
+    assert reports[-1] == (size, size)
+
+
+# -- Offering --
+
+def test_check_now_asks_again_even_with_a_release_already_known(monkeypatch, tmp_path):
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
+    started = []
+    monkeypatch.setattr(update_offer.threading, "Thread",
+                        lambda **kwargs: SimpleNamespace(start=lambda: started.append(kwargs["args"])))
+    controller._checked(a_release(), asked=False)
+    asked.clear()
+    controller.check_requested()
+    # A fresh check (asked=True), which offers what the release page says now.
+    assert started == [(True,)] and asked == [] and item.title == "Checking for Updates…"
+
+
+def test_an_automatic_prompt_waits_while_a_dialog_is_open(monkeypatch, tmp_path):
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path, modal=object())
+    controller._checked(a_release(), asked=False)
+    assert asked == [] and item.title == "Install Maramax 0.5.2…"
+    controller._checked(a_release(), asked=True)    # One the user asked for still answers.
+    assert asked == ["0.5.2"]
+
+
+def test_a_new_app_left_staged_by_an_earlier_run_is_removed_after_launch(monkeypatch, tmp_path):
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
+    later, tick = run_timers(monkeypatch)
+    discarded = []
+    monkeypatch.setattr(update_offer.UpdateOffer, "_discard", staticmethod(discarded.append))
+    installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
+    controller._installed_app = installed
+    fake_bundle(tmp_path / "earlier").rename(updater.staged_app(installed))
+    controller.start()
+    assert tick() == update_offer.LEFTOVER_REMOVAL_SECONDS and discarded == [updater.staged_app(installed)]
+    # One this run has staged and is waiting to install is not a leftover.
+    discarded.clear()
+    controller._set_step(update_offer.Step.INSTALLING)
+    controller._remove_leftover()
+    assert discarded == []
+
+
+def test_the_wait_for_idle_can_still_be_cancelled_after_the_restart_notice_gave_way():
+    """A real progress window, built off-screen in its own process."""
+    body = r'''
+from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
+NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+from parakeet_dictation.update_window import UpdateProgressWindow
+window = UpdateProgressWindow.alloc().initWithCancel_(lambda: None)
+window.show_restarting()
+assert not window.cancel.isEnabled()
+window.show_ready("0.5.2", True)       # A dictation began during "Restarting Maramax…".
+assert window.cancel.isEnabled()
+'''
+    result = subprocess.run([sys.executable, "-c", body], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr[-1500:]

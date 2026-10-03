@@ -27,12 +27,17 @@ CHECK_TITLE = "Check for Updates…"
 FIRST_CHECK_SECONDS = 60
 CHECK_INTERVAL_SECONDS = 24 * 60 * 60
 # An install quits the app, so it waits until nothing has been running for
-# this long: a finished dictation still pastes and shows its outcome.
+# this long: a finished dictation still pastes. (The outcome it shows counts
+# as busy for as long as it is on screen.)
 IDLE_BEFORE_INSTALL_SECONDS = 3.0
 # Long enough to read "Restarting Maramax…" before the window goes.
 RESTART_NOTICE_SECONDS = 0.8
 # A quit that has not happened by then is not going to.
 QUIT_WATCHDOG_SECONDS = 15.0
+# A new app left staged by a run that quit before installing it is removed
+# this long after launch: by then a swap still running from that quit (if
+# Maramax was reopened at once) has long finished with it.
+LEFTOVER_REMOVAL_SECONDS = 30
 MAX_NOTES_CHARS = 600
 
 
@@ -41,6 +46,7 @@ class Step(enum.Enum):
     CHECKING = "checking"
     PROMPTING = "prompting"      # the "is available" alert is open
     DOWNLOADING = "downloading"
+    CANCELLING = "cancelling"    # Cancel pressed; the download stops at its next block or timeout
     INSTALLING = "installing"    # downloaded and verified; waiting to quit
 
 
@@ -59,6 +65,8 @@ def menu_title(step: Step, version: str | None, percent: int | None = None) -> s
         return "Checking for Updates…"
     if step is Step.DOWNLOADING:
         return f"Downloading Maramax {version}… {percent or 0}%"
+    if step is Step.CANCELLING:
+        return "Cancelling the Update…"
     if step is Step.INSTALLING:
         return f"Installing Maramax {version}…"
     return f"Install Maramax {version}…" if version else CHECK_TITLE
@@ -72,6 +80,8 @@ def status_text(*, step: Step, version: str | None, percent: int | None, last_ch
         return "Checking for updates…"
     if step is Step.DOWNLOADING:
         return f"Downloading Maramax {version}… {percent or 0}%"
+    if step is Step.CANCELLING:
+        return f"Cancelling the download of Maramax {version}…"
     if step is Step.INSTALLING:
         return f"Maramax {version} is ready and installs as soon as Maramax is idle."
     if version:
@@ -138,6 +148,7 @@ class UpdateOffer:
         self._paths = updater.UpdatePaths.under(support_dir)
         self._config = config
         self._save_settings = save_settings
+        # True while quitting would interrupt something or cut it short.
         self._is_busy = is_busy
         self._quit_app = quit_app
         # Told whenever what status_text() says may have changed.
@@ -154,7 +165,18 @@ class UpdateOffer:
         """Report how the last update went, then begin the automatic checks
         (each is skipped while the setting is off)."""
         self._report_last_install()
+        call_later(LEFTOVER_REMOVAL_SECONDS, self._remove_leftover)
         call_later(FIRST_CHECK_SECONDS, self._scheduled_check)
+
+    def _remove_leftover(self) -> None:
+        """A new app staged by an earlier run that quit, logged out, or crashed
+        while it waited to install. While IDLE, nothing of this run is staged."""
+        if self._installed_app is None or self._step is not Step.IDLE:
+            return
+        leftover = updater.staged_app(self._installed_app)
+        if leftover.exists():
+            logger.info(f"Removing an update that was never installed: {leftover}")
+            self._discard(leftover)
 
     def _report_last_install(self) -> None:
         try:
@@ -181,16 +203,14 @@ class UpdateOffer:
         return self._step is Step.IDLE
 
     def check_requested(self) -> None:
-        """The menu item or Settings' Check Now: offer what is known, else ask GitHub."""
+        """The menu item or Settings' Check Now: ask GitHub (a release found
+        earlier may since have been replaced or withdrawn), then offer."""
         if self._step is not Step.IDLE:
             # The title already says what is happening; the window shows more.
             if self._window is not None:
                 self._window.bring_forward()
             return
-        if self._release is not None:
-            self._offer(self._release)
-        else:
-            self._check(asked=True)
+        self._check(asked=True)
 
     # -- Checking --
 
@@ -242,8 +262,9 @@ class UpdateOffer:
                 rumps.alert(title="Maramax is up to date", message=f"Version {self._current} is the newest release.")
             return
         logger.info(f"Maramax {release.version} is available (running {self._current})")
+        # An open dialog or file panel counts as busy: the prompt would open behind it.
         if should_prompt(asked=asked, version=release.version, skipped_version=self._config.skipped_update_version,
-                         busy=self._is_busy()):
+                         busy=not self._idle()):
             self._offer(release)
 
     # -- Offering --
@@ -301,6 +322,8 @@ class UpdateOffer:
         """The progress window's Cancel: stop the download, or the install
         that is waiting for the app to be idle."""
         self._cancel.set()
+        if self._step is Step.DOWNLOADING:
+            self._set_step(Step.CANCELLING)  # A stalled read can take a while to give up.
         if self._window is not None:
             self._window.close()
 
@@ -324,16 +347,19 @@ class UpdateOffer:
         try:
             staged_app = updater.download(release, self._current, installed_app, self._paths.download,
                                           progress, cancel.is_set)
-        except updater.UpdateCancelled:
-            AppHelper.callAfter(self._download_stopped, release)
-            return
-        except updater.UpdateError as exc:
-            AppHelper.callAfter(self._download_failed, release, str(exc))
-            return
         except Exception as exc:
-            # Never leave the menu stuck on "Downloading": report and carry on.
-            logger.exception("Update download failed unexpectedly")
-            AppHelper.callAfter(self._download_failed, release, f"Unexpected error: {exc}")
+            if isinstance(exc, updater.UpdateError):
+                problem = str(exc)
+            else:
+                # Never leave the menu stuck on "Downloading": report and carry on.
+                logger.exception("Update download failed unexpectedly")
+                problem = f"Unexpected error: {exc}"
+            # After Cancel, whatever ended the download (UpdateCancelled, or a
+            # stalled read timing out) is the stop the user asked for.
+            if cancel.is_set():
+                AppHelper.callAfter(self._download_stopped, release)
+            else:
+                AppHelper.callAfter(self._download_failed, release, problem)
             return
         AppHelper.callAfter(self._staged, release, installed_app, staged_app)
 

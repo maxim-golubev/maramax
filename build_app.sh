@@ -5,6 +5,15 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT_DIR="$(pwd)"
 
+# What this build is made from, recorded beside the bundle once it passes its
+# check: create_release.py takes the commit and dirty flag from here, not from
+# whatever the checkout holds when it runs.
+BUILD_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)"
+BUILD_DIRTY=false
+if [ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]; then
+  BUILD_DIRTY=true
+fi
+
 if [ -d ".venv" ]; then
   source .venv/bin/activate
 fi
@@ -205,3 +214,4 @@ if ! python "$ROOT_DIR/packaging/check_bundle.py" --bundle "$ROOT_DIR/dist/Maram
   echo "ERROR: bundle check failed; the bundle is at dist/Maramax.app.failed-check" >&2
   exit 1
 fi
+printf '{"commit": "%s", "dirty": %s}\n' "$BUILD_COMMIT" "$BUILD_DIRTY" > "$ROOT_DIR/dist/build-stamp.json"
