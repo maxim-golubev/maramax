@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import plistlib
 from pathlib import Path
 
 
@@ -29,6 +30,15 @@ def app_bundle() -> Path | None:
     return Path(resources).parents[1] if resources else None
 
 
+def bundle_identifier() -> str | None:
+    """The CFBundleIdentifier of the .app this process runs from, or None when it runs from source."""
+    bundle = app_bundle()
+    if bundle is None:
+        return None
+    with open(bundle / "Contents" / "Info.plist", "rb") as info:
+        return plistlib.load(info)["CFBundleIdentifier"]
+
+
 def ensure_ssl_certs() -> None:
     """Point OpenSSL at certifi's CA bundle when the default is unusable.
 
@@ -39,14 +49,14 @@ def ensure_ssl_certs() -> None:
     current = os.environ.get("SSL_CERT_FILE")
     if current and Path(current).exists():
         return
-    try:
-        import certifi
+    # Bundled and checked by the build: a missing certifi fails here, at
+    # launch, not later as a TLS error in an update check or model download.
+    import certifi
 
-        cert_path = certifi.where()
-    except Exception:
-        return
-    if Path(cert_path).exists():
-        os.environ["SSL_CERT_FILE"] = cert_path
+    cert_path = certifi.where()
+    if not Path(cert_path).exists():
+        raise RuntimeError(f"certifi's CA bundle is missing: {cert_path}")
+    os.environ["SSL_CERT_FILE"] = cert_path
 
 
 def resource_path(*parts: str) -> Path:

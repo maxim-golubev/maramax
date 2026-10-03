@@ -20,7 +20,7 @@ REPLACEMENT = "replacement"
 _TITLES = {HEARD: "When the transcript says", REPLACEMENT: "Replace with"}
 VISIBLE_ROWS = 7
 GAP = 8
-GUIDE = "Double-click a replacement to change it. Each one applies once per match; replacements never chain."
+GUIDE = "Double-click a replacement to change it. Replaced text is never replaced a second time."
 EMPTY_GUIDE = "No replacements yet. Type what the transcript says and how it should be written, then Add."
 # Shown in place of a line break in a replacement of several lines.
 _LINE_BREAK = " ⏎ "
@@ -46,7 +46,7 @@ def displayed_rules(rules: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 def editable_in_place(text: str) -> bool:
-    """A table cell edits one line; a replacement of several lines is changed by adding it again."""
+    """A table cell edits one line; a replacement of several lines is changed by removing it and adding it again."""
     return "\n" not in text
 
 
@@ -184,6 +184,7 @@ class ReplacementsEditor(NSObject):
             if not rules:
                 self._say(EMPTY_GUIDE)
         self.count.setStringValue_(count_text(len(self.rules)))
+        self.remove.setEnabled_(bool(self._selected_rows()))
         self.undo.setHidden_(self._before_removal is None)
         self._show_trial()
 

@@ -22,7 +22,6 @@ OPTIONS = {
         "pycparser",
         "rumps",
         "pyperclip",
-        "dotenv",
         # huggingface_hub 1.x networking stack (httpx); incomplete bundling
         # makes from_pretrained silently fall back to local-path resolution.
         "huggingface_hub",

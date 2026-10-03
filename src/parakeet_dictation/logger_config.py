@@ -7,8 +7,6 @@ import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from dotenv import load_dotenv
-
 
 _LOGGER_CONFIGURED = False
 _LOGGER_NAME = "maramax"
@@ -64,13 +62,13 @@ def setup_logging(log_path: Path | None = None) -> logging.Logger:
             file_handler = RotatingFileHandler(log_path, maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8")
             file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
             logger.addHandler(file_handler)
-        except OSError:
-            logger.warning("Could not open diagnostic log")
+        except OSError as exc:
+            # A log file that cannot be opened must not stop the app from
+            # starting: the console still gets every message, this one included.
+            logger.warning(f"Could not open diagnostic log {log_path}: {exc}; logging to the console only")
 
     if _LOGGER_CONFIGURED:
         return logger
-
-    load_dotenv()
 
     log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
     logger.setLevel(log_level)
@@ -80,4 +78,15 @@ def setup_logging(log_path: Path | None = None) -> logging.Logger:
 
     logger.addHandler(handler)
     _LOGGER_CONFIGURED = True
+    return logger
+
+
+def setup_helper_logging() -> logging.Logger:
+    """The audio helper's logging: warnings and errors as plain lines on
+    stderr, which the app copies into its own log. The helper opens no log
+    file of its own: two processes rotating one file would race."""
+    handler = logging.StreamHandler()  # stderr
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.WARNING)
     return logger

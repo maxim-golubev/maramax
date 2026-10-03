@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import enum
+
 from AppKit import (
-    NSColor, NSFont, NSLayoutAttributeFirstBaseline, NSLayoutAttributeLeading, NSLayoutPriorityDefaultLow,
-    NSMakeRect, NSStackView, NSTextField, NSUserInterfaceLayoutOrientationHorizontal,
-    NSUserInterfaceLayoutOrientationVertical, NSView,
+    NSAttributedString, NSColor, NSFont, NSFontAttributeName, NSFontWeightRegular, NSForegroundColorAttributeName,
+    NSImage, NSImageSymbolConfiguration, NSLayoutAttributeFirstBaseline, NSLayoutAttributeLeading,
+    NSLayoutPriorityDefaultLow, NSMakeRect, NSStackView, NSTextAttachment, NSTextField,
+    NSUserInterfaceLayoutOrientationHorizontal, NSUserInterfaceLayoutOrientationVertical, NSView,
 )
+
+SMALL_TEXT_SIZE = 11
+
+
+class Notice(enum.Enum):
+    """What a notice says about a state, as an SF Symbol and the colour's NSColor selector."""
+    ALLOWED = ("checkmark.circle.fill", "systemGreenColor")
+    WARNING = ("exclamationmark.triangle.fill", "systemOrangeColor")
 
 
 def stack(views, *, horizontal=False, spacing=8):
@@ -38,8 +49,24 @@ def aligned_width(control):
 def small_text(text, width):
     """Secondary 11 pt text that wraps at `width`: help, notes, and hints."""
     label = NSTextField.wrappingLabelWithString_(text)
-    label.setFont_(NSFont.systemFontOfSize_(11))
+    label.setFont_(NSFont.systemFontOfSize_(SMALL_TEXT_SIZE))
     label.setTextColor_(NSColor.secondaryLabelColor())
     label.setSelectable_(False)
     label.setPreferredMaxLayoutWidth_(width)
     return label
+
+
+def show_notice(label, notice: Notice, text):
+    """Give a small_text() label the notice's symbol before `text`: a state
+    the eye should catch, such as a warning. The symbol is part of the text,
+    so it sits on the text's baseline and wraps with it."""
+    symbol, tint = notice.value
+    size = NSImageSymbolConfiguration.configurationWithPointSize_weight_(SMALL_TEXT_SIZE, NSFontWeightRegular)
+    color = NSImageSymbolConfiguration.configurationWithPaletteColors_([getattr(NSColor, tint)()])
+    attachment = NSTextAttachment.alloc().init()
+    attachment.setImage_(NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, None)
+                         .imageWithSymbolConfiguration_(size.configurationByApplyingConfiguration_(color)))
+    rich = NSAttributedString.attributedStringWithAttachment_(attachment).mutableCopy()
+    rich.appendAttributedString_(NSAttributedString.alloc().initWithString_attributes_(
+        f" {text}", {NSFontAttributeName: label.font(), NSForegroundColorAttributeName: label.textColor()}))
+    label.setAttributedStringValue_(rich)

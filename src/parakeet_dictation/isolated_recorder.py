@@ -14,7 +14,7 @@ from typing import IO
 
 from . import recovery
 from .capture import CaptureMeter, CaptureSnapshot
-from .helper_protocol import Event, InputDevice, Operation, parse, request
+from .helper_protocol import Event, Operation, parse, request
 from .logger_config import logger
 
 
@@ -56,6 +56,10 @@ class IsolatedAudioRecorder:
         self._process: subprocess.Popen[str] | None = None
         self._reader: threading.Thread | None = None
         self._spill: IO[bytes] | None = None
+        # Whether the recovery file holds this capture's spill. When it holds
+        # an earlier capture that could not be set aside, that file is the
+        # earlier capture's only copy and must outlive this one.
+        self._spill_is_ours = False
         self._closed = False
         self._closed_because = "Maramax is shutting down"
         self._overflows = 0
@@ -78,8 +82,27 @@ class IsolatedAudioRecorder:
     # -- Helper process --
 
     def _popen(self):
-        return subprocess.Popen(self._command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        # Undecodable bytes are replaced rather than raised: an exception
+        # would stop the thread that drains the helper's log.
+        process = subprocess.Popen(self._command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, errors="replace", bufsize=1)
+        threading.Thread(target=self._relay_log, args=(process,), daemon=True).start()
+        return process
+
+    @staticmethod
+    def _relay_log(process):
+        """Copy the helper's log lines (its wedge and failover diagnostics)
+        into the app's log. Drained to EOF so that a full pipe can never
+        block a logging call inside the helper's audio paths; this thread
+        owns the pipe and closes it."""
+        assert process.stderr is not None
+        try:
+            with process.stderr:
+                for line in process.stderr:
+                    if line.strip():
+                        logger.warning(f"Audio helper {process.pid}: {line.rstrip()}")
+        except OSError as exc:
+            logger.error(f"Stopped reading the log of audio helper {process.pid}: {exc}")
 
     def _spawn(self):
         """Callers hold _operation_lock."""
@@ -190,7 +213,9 @@ class IsolatedAudioRecorder:
         finally:
             self._operation_lock.release()
 
-    def list_input_devices(self):
+    def list_input_devices(self) -> list[str] | None:
+        """The input devices' names in PortAudio's order, or None when they
+        cannot be listed now (the caller keeps the list it has)."""
         if self.recording or not self._listing_lock.acquire(blocking=False):
             return None
         process = None
@@ -218,12 +243,18 @@ class IsolatedAudioRecorder:
                     answered.set()
 
             threading.Thread(target=read, daemon=True).start()
-            answered.wait(timeout=4)
-            for message in result:
-                if message.get("event") == Event.DEVICES:
-                    self.automatic_device_name = message.get("automatic")
-                    return [InputDevice(*item) for item in message["devices"]]
-            return None
+            if not answered.wait(timeout=4):
+                logger.warning("Could not list microphones: the audio helper did not answer within 4 s")
+                return None
+            if not result:
+                logger.warning("Could not list microphones: the audio helper exited without answering")
+                return None
+            message = result[0]
+            if message["event"] == Event.ERROR:
+                logger.warning(f"Could not list microphones: {message.get('message')}")
+                return None
+            self.automatic_device_name = message.get("automatic")
+            return list(message["devices"])
         except OSError as exc:
             logger.warning(f"Could not list microphones: {exc}")
             return None
@@ -323,19 +354,20 @@ class IsolatedAudioRecorder:
             self._operation_lock.release()
 
     def _open_spill(self):
+        self._spill = None
+        self._spill_is_ours = False
         if recovery.unkept_in_progress(self._recovery_dir):
             # An earlier capture could not be set aside as an unsaved
             # recording; opening the spill would truncate the only copy.
             logger.error("An earlier capture is still in the recovery file; this one is kept in memory only")
-            self._spill = None
             return
         try:
             self._recovery_dir.mkdir(parents=True, exist_ok=True)
             self._spill = recovery.in_progress_path(self._recovery_dir).open("wb")
+            self._spill_is_ours = True
         except OSError as exc:
             # Memory capture and the final archive can still succeed.
             logger.warning(f"Recording will not be spilled to disk as it arrives: {exc}")
-            self._spill = None
 
     def _abandon_start(self):
         self._in_flight = False
@@ -376,7 +408,8 @@ class IsolatedAudioRecorder:
                     else:
                         # Nothing more will arrive; the app finishes with
                         # what was captured rather than showing a live meter.
-                        self.last_error = RuntimeError("The microphone disconnected and no other input could be opened")
+                        self.last_error = RuntimeError(
+                            f"The microphone disconnected and no other input could be opened: {message.get('error')}")
                     self.meter.set_reconnecting(False)
                 elif kind == Event.ERROR:
                     self.last_error = RuntimeError(message.get("message", "Microphone failed"))
@@ -390,8 +423,14 @@ class IsolatedAudioRecorder:
                 elif kind == Event.CLOSING:
                     self._accepting.clear()
         except Exception as exc:
-            if process is self._process and self._in_flight:
-                self.last_error = exc
+            # Nothing reads this helper's output any more, so it must not be
+            # handed another request: start() replaces a helper that is not
+            # accepting rather than waiting out its whole start timeout.
+            logger.error(f"Audio helper {process.pid} reader stopped: {exc!r}")
+            if process is self._process:
+                self._accepting.clear()
+                if self._in_flight:
+                    self.last_error = exc
         finally:
             if process is self._process:
                 if self._in_flight and not self._done.is_set() and self.last_error is None:
@@ -472,15 +511,30 @@ class IsolatedAudioRecorder:
             if locked:
                 self._data_lock.release()
 
+    @property
+    def spill_holds_capture(self) -> bool:
+        """Whether the recovery file holds this capture: False when it went
+        without one because an earlier capture still occupied the file."""
+        return self._spill_is_ours
+
     def preserve_recovery(self) -> bool:
         """Keep what was spilled as an unsaved recording of its own."""
         self._close_spill()
+        # Whatever the rename does, the file no longer holds a spill this
+        # recorder may delete: it is gone, or it is a capture not set aside.
+        self._spill_is_ours = False
         return recovery.promote_in_progress(self._recovery_dir)
 
     def discard_recovery(self) -> None:
-        """The capture is safe elsewhere (or unwanted): drop the spill."""
+        """The capture is safe elsewhere (or unwanted): drop its spill. An
+        earlier capture still in the recovery file is that capture's only
+        copy, so it is set aside once more instead of deleted."""
         self._close_spill()
-        recovery.discard_in_progress(self._recovery_dir)
+        if self._spill_is_ours:
+            self._spill_is_ours = False
+            recovery.discard_in_progress(self._recovery_dir)
+        else:
+            recovery.promote_in_progress(self._recovery_dir)
 
     def cleanup(self):
         if self._closed:

@@ -21,6 +21,7 @@ from parakeet_dictation.updater import UpdateError, checksum_name, signer_requir
 
 RELEASE_SIGNING = "Maramax release certificate"  # build-info.json's mark of a build installed copies accept
 BUILD_STAMP = "build-stamp.json"  # written beside the bundle by build_app.sh: the commit it was built from
+APP_SOURCES = Path("src") / "parakeet_dictation"  # compared with the bundle and hashed into build-info.json
 
 
 class ReleaseError(RuntimeError):
@@ -47,6 +48,14 @@ def published_path(root: Path, version: str) -> Path:
 
 def checksum_path(asset: Path) -> Path:
     return asset.with_name(checksum_name(asset.name))
+
+
+def steps_to_release_again(root: Path, version: str) -> str:
+    """How to make `version`'s release anew. Releases are never overwritten,
+    so what an earlier run made has to be removed first, by hand."""
+    destination, archive, _ = release_paths(root, version)
+    return (f"remove {destination} and, beside it, {archive.name}, {bundle_delta.delta_glob(version)}, "
+            f"{assets_path(root, version).name}, and their .sha256 files; then run create_release.py")
 
 
 def previous_release(root: Path, version: str) -> tuple[str, Path] | None:
@@ -119,10 +128,8 @@ def main() -> None:
     bundle = root / "dist" / "Maramax.app"
     destination, archive, _ = release_paths(root, version)
     if destination.exists():
-        # Previous releases are never overwritten; a half-made one from a
-        # failed run has to be removed by hand, deliberately.
-        raise ReleaseError(f"{destination} already exists; remove it (and its .zip, deltas, and .assets.json) "
-                           f"to release {version} again")
+        raise ReleaseError(f"{destination} already exists; to release {version} again, "
+                           f"{steps_to_release_again(root, version)}")
     for stale in (*destination.parent.glob(bundle_delta.delta_glob(version)), assets_path(root, version)):
         stale.unlink(missing_ok=True)  # From a run that stopped before its folder was made: not this build's.
         checksum_path(stale).unlink(missing_ok=True)
@@ -146,9 +153,9 @@ def main() -> None:
     commit = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
     dirty = built_dirty(bundle.parent / BUILD_STAMP, commit)
     resources = bundle / "Contents" / "Resources"
-    bundled_source = resources / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "parakeet_dictation"
+    bundled_source = resources / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / APP_SOURCES.name
     hashes = {}
-    for source in sorted((root / "src" / "parakeet_dictation").glob("*.py")):
+    for source in sorted((root / APP_SOURCES).glob("*.py")):
         content = source.read_bytes()
         if content != (bundled_source / source.name).read_bytes():
             raise ReleaseError(f"Stale bundle: {source.name} differs from the checkout; run build_app.sh")

@@ -99,7 +99,9 @@ def shortcut_problem(key_code: int, modifiers: int) -> str | None:
     if len(held) >= 2:
         return None
     if not held:
-        return "That would stop the key from typing. Hold two of Control, Option, and Cmd with it."
+        if modifiers & shiftKey:
+            return "That would stop the key from typing. Add Control or Cmd."
+        return "That would stop the key from typing. Add Control+Shift, Cmd+Shift, or two of Control, Option, and Cmd."
     if held == [optionKey]:
         return "Option with a single key types a character on many keyboards. Add Control or Cmd."
     if modifiers & shiftKey:
@@ -153,10 +155,29 @@ def key_typing(character: str, typed: Mapping[int, str]) -> int | None:
     return min(matches) if matches else None
 
 
+# AppKit's modifier flags (NSEventModifierFlag…) and Carbon's bits for the same keys.
+_APPKIT_MODIFIERS = ((1 << 18, controlKey), (1 << 19, optionKey), (1 << 17, shiftKey), (1 << 20, cmdKey))
+# What AppKit calls F1 in a key equivalent (NSF1FunctionKey); F2–F12 follow it.
+_APPKIT_F1 = 0xF704
+
+
 def carbon_modifiers(event_flags: int) -> int:
     """Carbon's modifier bits for an AppKit event's modifier flags."""
-    pairs = ((1 << 18, controlKey), (1 << 19, optionKey), (1 << 17, shiftKey), (1 << 20, cmdKey))
-    return sum(carbon for appkit, carbon in pairs if event_flags & appkit)
+    return sum(carbon for appkit, carbon in _APPKIT_MODIFIERS if event_flags & appkit)
+
+
+def menu_key_equivalent(key_code: int, modifiers: int, key_names: Mapping[int, str]) -> tuple[str, int]:
+    """How a menu item shows a shortcut on its right: AppKit's key equivalent
+    (the key's character, lower case) and its modifier flags. `key_names` is
+    layout_key_names(), so the key is the one this layout prints on it."""
+    name = key_names[key_code]
+    if key_code == kVK_Space:
+        key = " "
+    elif key_code in _FUNCTION_KEYS:
+        key = chr(_APPKIT_F1 + int(name[1:]) - 1)
+    else:
+        key = name.lower()
+    return key, sum(appkit for appkit, carbon in _APPKIT_MODIFIERS if modifiers & carbon)
 
 
 class EventTypeSpec(ctypes.Structure):
@@ -376,17 +397,17 @@ class GlobalHotKeyManager:
         if spec is None:
             return
         try:
-            self._dictation = (spec, self.register(spec))
+            self._dictation = (spec, self._register(spec))
         except HotKeyError:
             if previous is not None:
-                self._dictation = (previous[0], self.register(previous[0]))
+                self._dictation = (previous[0], self._register(previous[0]))
             raise
 
     def _unregister(self, hotkey_ref: EventHotKeyRef) -> None:
         self._carbon.UnregisterEventHotKey(hotkey_ref)
         self._hotkey_refs.remove(hotkey_ref)
 
-    def register(self, spec: HotKeySpec) -> EventHotKeyRef:
+    def _register(self, spec: HotKeySpec) -> EventHotKeyRef:
         hotkey_id = EventHotKeyID(self._signature, spec.identifier)
         hotkey_ref = EventHotKeyRef()
         status = self._carbon.RegisterEventHotKey(
@@ -411,7 +432,7 @@ class GlobalHotKeyManager:
             key_code = command_key_code(KEY_NAMES[STOP.key_code].lower())
             if key_code is None:
                 raise HotKeyError(f"No key gives {STOP.label} on the current keyboard layout")
-            self._recording_ref = self.register(replace(STOP, key_code=key_code))
+            self._recording_ref = self._register(replace(STOP, key_code=key_code))
         elif handler is None and self._recording_ref is not None:
             self._unregister(self._recording_ref)
             self._recording_ref = None

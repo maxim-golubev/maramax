@@ -676,7 +676,7 @@ tests pass.
 - Releases from here are batched and used locally before they are offered;
   0.7.0, 0.8.0, and 0.8.1 went out within four hours of each other.
 
-### 0.8.1 republished with the menu's width
+### The menu's width while the model loads
 
 Opened while the speech model loads, the menu was as wide as "Status:
 Preparing the speech model — the first launch downloads it" and stayed that
@@ -686,7 +686,96 @@ hiding and showing the item in the same instant brings it to 152 pt. `MenuLine`
 does that for the status, Start/Stop Dictation, and the update line (434 pt to
 152 pt through the app's own class). 477 tests pass.
 
-The first 0.8.1 had been downloaded by this Mac alone (the repository has no
-other users yet), so its release and tag were replaced rather than a fourth
-version published in one day; a version that others may have is never
-replaced.
+## 0.9.0 the menu, delivery, permissions, and a full audit — October 3, 2026
+
+Measured from source on this Mac (M3 Pro, macOS 15.7.9); the built app passed
+its bundle check.
+
+### How many transcripts and recordings are kept
+
+History kept the last 100 transcripts and Recordings the last 20, with no
+way to change either. **Keep the last** in Settings → Advanced now offers 50,
+100 (still the default), 250, 500, and 1,000 transcripts, and 10, 20 (still
+the default), 50, and 100 recordings, and shows a number set by hand in
+`settings.json`. Recordings stay under the 512 MB cap whatever the number. A
+lower number of transcripts shortens the list at once; either file loses its
+oldest only at the next save, so choosing a higher number again before then
+keeps them.
+
+### The update window's bar
+
+From the last byte downloaded, the bar switched to the indeterminate style,
+pale and animated, through "Checking the download…", "ready", and
+"Restarting Maramax…". It now stays full, in the accent colour, from the last
+byte to the restart.
+
+### Pasting asked for a permission that was already granted
+
+Turning on paste opened System Settings every time, with Maramax already
+switched on there. macOS's Accessibility entry for `com.maramax.dictation`
+held four code hashes (an ad hoc build's, from before 0.6.1) and none of the
+installed build's, so `AXIsProcessTrusted()` was false whatever the switch
+showed; toggling it does not rewrite the stored requirement. The microphone
+entry, granted after 0.6.1, holds the designated requirement (identifier and
+certificate leaf) and survives updates. `request_accessibility()` now clears
+Maramax's own entry (`tccutil reset Accessibility com.maramax.dictation`,
+checked to work without administrator rights) and asks macOS to prompt, which
+lists Maramax afresh. A dictation no longer opens any window.
+
+### The menu's width
+
+NSMenu sizes itself to its widest title plus its widest key-equivalent column.
+Measured over every title the items can show, with every preset shortcut and
+all four modifiers with a function key, the widest menu is 295 pt (the
+download line beside Control+Shift+Space), so the status line is fixed at
+300 pt. Space with three or four modifiers is wider (306–320 pt); with one of
+those, an open menu still widens a little while an update downloads. On screen, a menu held open while the
+status went from "Ready" to a two-line message and back, and the update line
+read "Downloading Update… 100%", stayed 300 pt wide throughout; only its
+height changed (296, 312, 334 pt).
+
+### Transcripts written as a person writes them
+
+All 20 archived recordings were recognized again with `written()` applied: 18
+are byte-identical to what was stored, and two changed only a clock time
+("9.45" and "8.45" to "9:45" and "8:45"). Over the last 100 transcripts, 11
+change: "um"/"uh" removed (6 transcripts, capitals handed on) and clock times
+written with a colon (5). Research behind it, all on this Mac's data:
+
+- Parakeet's formatting is otherwise clean: 0 of 98 transcripts start in lower
+  case or with punctuation, none has stray spacing, 97 % end with . or ?, and
+  no collapsed stretch has occurred since 0.6.0 (6 of 76 before).
+- Silence trimming before recognition changed words throughout (pickles →
+  tickles, slate → plate), as zero padding did in 0.5.0: not adopted.
+- Collapsing repeated words would break 14 grammatical "that that": not adopted.
+- Text-only fuzzy matching of replacement spellings rewrote "curious" →
+  "Cairos" and "in the cloud" → "Claude": not adopted.
+- Checking a candidate spelling against the audio with Parakeet's own joint
+  separated true corrections (−1.35 to −4.6 log-probability) from false ones
+  (−18 to −94) on six positives: promising, not shipped until "cloud" vs
+  "Claude" has been measured on purpose-made dictations.
+
+### Smart spacing
+
+`character_before_cursor()` read ".", "o", and "" from a native text view
+after "Hello world.", after "Hello", and at the start, through the same
+Accessibility calls it makes on the frontmost app. 36 of 97 consecutive
+dictations in the history were made within five minutes of each other; pasted
+one after another they would have read "end.Start".
+
+### Audit
+
+A 131-agent review of the whole code base, each finding checked by an
+independent skeptic, confirmed 89 findings (none severe); all were fixed, in
+the controller and windows here and in five batches (audio, transcription,
+storage, updates, packaging), each in its own worktree with its own tests.
+The largest: the audio helper's log lines were discarded; archiving one
+capture could delete an earlier capture's only spill; a stale "draft stream
+stuck" flag could fail a healthy dictation; mlx was shipped twice (147 MB);
+a dropped download was reported as a checksum mismatch. The test suite grew
+from 477 to 616. A second audit of the changes (82 agents, each finding
+checked by three skeptics) confirmed 15 findings, a third, of those fixes alone, 11, and a
+convergence round of ten lenses 22; the real ones were fixed, among them a stale bundle check that
+would have failed the next build and a filler rule that could backtrack exponentially. Not
+changed, as not worth their complexity: messages after a full disk defeats every way of keeping
+a spill, beyond saying where the audio is.

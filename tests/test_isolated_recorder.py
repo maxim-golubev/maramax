@@ -1,11 +1,13 @@
 """Real subprocess tests with synthetic PCM; never open an audio device."""
+import logging
 import subprocess
 import sys
 import json
 import threading
 import time
 
-from parakeet_dictation import recovery
+from parakeet_dictation import audio_worker, recovery
+from parakeet_dictation.capture import CaptureMeter
 from parakeet_dictation.isolated_recorder import IsolatedAudioRecorder, worker_command
 from parakeet_dictation.recovery import in_progress_path
 
@@ -216,6 +218,23 @@ time.sleep(60)
     assert recorder.start()
     assert recorder.stop() == b'\x01\x00' * 1600    # This capture is kept in memory instead.
     assert in_progress_path(tmp_path).read_bytes() == b'\x05\x00' * 16000
+    recorder.discard_recovery()                       # This capture was archived...
+    assert in_progress_path(tmp_path).read_bytes() == b'\x05\x00' * 16000  # ...the earlier one stays.
+    monkeypatch.undo()                                # The rename works again.
+    recorder.discard_recovery()
+    assert not in_progress_path(tmp_path).exists()
+    assert [recovery.load_unsaved(path) for path in recovery.unsaved_recordings(tmp_path)] == [b'\x05\x00' * 16000]
+    recorder.cleanup()
+
+
+def test_an_archived_capture_drops_its_own_spill(tmp_path):
+    recorder = recorder_for(tmp_path, helper())
+    assert recorder.start()
+    assert wait_for(lambda: in_progress_path(tmp_path).stat().st_size > recovery.MIN_RECOVERABLE_BYTES)
+    recorder.stop()
+    recorder.discard_recovery()
+    assert not in_progress_path(tmp_path).exists()
+    assert recovery.unsaved_recordings(tmp_path) == []
     recorder.cleanup()
 
 
@@ -411,6 +430,7 @@ def test_locked_microphone_that_vanishes_ends_the_recording_without_switching(tm
     assert wait_for(lambda: recorder.last_error is not None, timeout=6)
     assert time.monotonic() - before < 4  # Reported once the reopen fails, not after a dead wait.
     assert "no other input" in str(recorder.last_error)
+    assert "Selected microphone disconnected: AirPods" in str(recorder.last_error)  # The helper's reason.
     pcm = recorder.stop()
     assert pcm and set(pcm[::2]) == {2}
     recorder.cleanup()
@@ -432,8 +452,7 @@ def test_helper_whose_audio_session_leaked_is_not_used_again(tmp_path):
 
 def test_device_listing_reports_what_automatic_would_use(tmp_path):
     recorder = recorder_for(tmp_path, helper(), prefer_builtin=False)
-    devices = recorder.list_input_devices()
-    assert [device.name for device in devices] == ["MacBook Pro Microphone", "AirPods"]
+    assert recorder.list_input_devices() == ["MacBook Pro Microphone", "AirPods"]
     assert recorder.automatic_device_name == "AirPods"
     recorder.prefer_builtin = True
     recorder.list_input_devices()
@@ -551,3 +570,80 @@ print(json.dumps({{"event":"done"}}),flush=True)
     assert time.monotonic() - before < 3
     assert "unexpectedly" in str(recorder.last_error)
     recorder.cleanup()
+
+
+def test_the_helpers_own_diagnostics_reach_the_app_log(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="maramax")
+    recorder = recorder_for(tmp_path, helper(vanish_after=40), device="AirPods")
+    assert recorder.start()
+    pid = recorder._process.pid
+    # Logged only inside the helper, by the reopen that failed.
+    assert wait_for(lambda: f"Audio helper {pid}: ERROR Microphone could not be reopened" in caplog.text)
+    recorder.stop()
+    recorder.cleanup()
+
+
+def test_a_listing_the_helper_refused_says_why(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="maramax")
+    recorder = recorder_for(tmp_path, command(
+        'print(json.dumps({"event":"error","message":"PortAudio enumeration failed"}),flush=True)'))
+    assert recorder.list_input_devices() is None
+    assert "Could not list microphones: PortAudio enumeration failed" in caplog.text
+    recorder._command = command('sys.exit(0)')
+    assert recorder.list_input_devices() is None
+    assert "exited without answering" in caplog.text
+    recorder.cleanup()
+
+
+def test_a_helper_whose_output_cannot_be_read_is_not_used_again(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="maramax")
+    body = '''
+print(json.dumps({"event":"ready","device":"Fake"}),flush=True)
+sys.stdin.readline()
+print(json.dumps({"event":"done"}),flush=True)
+print(json.dumps({"event":"idle"}),flush=True)
+print("not a message",flush=True)
+time.sleep(60)
+'''
+    recorder = recorder_for(tmp_path, command(body))
+    assert recorder.start()
+    unreadable = recorder._process
+    recorder.stop()
+    assert wait_for(lambda: f"Audio helper {unreadable.pid} reader stopped" in caplog.text)
+    assert not recorder._accepting.is_set()
+    before = time.monotonic()
+    assert recorder.start()  # A fresh helper, not a wait for an answer nobody reads.
+    assert time.monotonic() - before < 3
+    assert recorder._process is not unreadable and recorder.reset_count == 1
+    recorder.stop()
+    recorder.cleanup()
+
+
+def test_the_helper_keeps_no_copy_of_audio_it_has_sent(monkeypatch):
+    sent = []
+    monkeypatch.setattr(audio_worker, "send", lambda kind, **fields: sent.append(fields["pcm"]))
+
+    class Recorder:
+        frames = [b"\x01\x00", b"\x02\x00"]
+
+        def capture_snapshot(self):
+            return CaptureMeter().snapshot()
+
+    recorder = Recorder()
+    audio_worker.AudioHelper._forward(recorder)
+    assert recorder.frames == []
+    recorder.frames.append(b"\x03\x00")
+    audio_worker.AudioHelper._forward(recorder)
+    audio_worker.AudioHelper._forward(recorder)  # Nothing new: nothing sent.
+    assert sent == ["AQACAA==", "AwA="]
+
+
+def test_a_busy_listing_is_an_error_not_an_empty_list(monkeypatch):
+    sent = []
+    monkeypatch.setattr(audio_worker, "send", lambda kind, **fields: sent.append((kind, fields)))
+    monkeypatch.setattr(audio_worker.AudioRecorder, "list_input_devices", lambda self: None)
+    lister = object.__new__(audio_worker.AudioHelper)  # No request reader: stdin is pytest's.
+    lister.recorder = None
+    lister._warm_key = None
+    lister._list({"prefer_builtin": True})
+    assert sent == [(audio_worker.Event.ERROR, {"message": "the audio session was busy"})]

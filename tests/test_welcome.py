@@ -5,10 +5,12 @@ from types import SimpleNamespace
 
 from parakeet_dictation import app as module
 from parakeet_dictation.app import DictationApp, Phase
-from parakeet_dictation.config import AppConfig
+from parakeet_dictation.config import AppConfig, Delivery
 from parakeet_dictation.hotkeys import (
     DEFAULT_DICTATE, KEY_NAMES, HotKeyError, cmdKey, controlKey, dictation_shortcut, optionKey,
 )
+from parakeet_dictation.indicator import split_status
+from parakeet_dictation.preferences import DELIVERY_LABELS
 from parakeet_dictation.welcome import recording_note, shortcut_page_text, try_it_text
 
 D, E, SPACE = 0x02, 0x0E, 0x31
@@ -23,7 +25,10 @@ def controller(monkeypatch, tmp_path, refuse=False):
     app._preferences_window = None
     app._welcome_window = None
     app._phase = Phase.IDLE
-    app.transcriber = SimpleNamespace(is_ready=lambda: True, status_message=lambda: "Speech model ready")
+    app.transcriber = SimpleNamespace(is_ready=lambda: True, status_message=lambda: "Speech model ready",
+                                      load_error=None)
+    app.qwen = SimpleNamespace(failed=False)
+    app.retry_model_item = SimpleNamespace(hidden=True)
     shortcuts, statuses = [], []
     app._show_status = lambda message, revert_after=0: statuses.append(message)
     app._push_status = lambda message, revert_after=0: statuses.append(message)
@@ -34,6 +39,10 @@ def controller(monkeypatch, tmp_path, refuse=False):
         shortcuts.append(spec.label if spec else None)
 
     app.hotkey_manager = SimpleNamespace(set_dictation_shortcut=set_dictation_shortcut)
+    app.menu_shortcut = {}
+    app.record_menu = SimpleNamespace(_menuitem=SimpleNamespace(
+        setKeyEquivalent_=lambda key: app.menu_shortcut.update(key=key),
+        setKeyEquivalentModifierMask_=lambda mask: app.menu_shortcut.update(mask=mask)))
     intro = []
     app.overlay_controller = SimpleNamespace(set_intro_text=intro.append)
     app.history_store = SimpleNamespace(render=lambda: None)
@@ -51,6 +60,7 @@ def test_choosing_a_shortcut_registers_saves_and_renames_it_everywhere(monkeypat
     assert shortcuts == ["Control+Option+D"] and app.current_shortcut().label == "Control+Option+D"
     assert AppConfig.load(app._settings_path).dictation_shortcut == [D, controlKey | optionKey]
     assert intro == [module.intro_text("Control+Option+D", app.config), module.empty_history_text("Control+Option+D")]
+    assert app.menu_shortcut["key"] == "d"                     # Shown beside Start Dictation too.
 
 
 def test_a_shortcut_is_named_for_the_keyboard_layout_in_use(monkeypatch, tmp_path):
@@ -106,23 +116,28 @@ def test_the_welcome_is_seen_once(monkeypatch, tmp_path):
     assert AppConfig.load(app._settings_path).onboarded is True
 
 
-def test_either_welcome_choice_copies_the_transcript(monkeypatch, tmp_path):
+def test_a_delivery_choice_is_saved_as_the_settings_older_versions_read(monkeypatch, tmp_path):
     app, _, intro, _ = controller(monkeypatch, tmp_path)
+    monkeypatch.setattr(module, "accessibility_trusted", lambda: True)
     app.config = AppConfig(auto_copy_to_clipboard=False, paste_to_active_app=True)
-    app.choose_delivery(False)                                     # "Copy the transcript"
+    app.choose_delivery(Delivery.COPIED)
     saved = AppConfig.load(app._settings_path)
     assert (saved.auto_copy_to_clipboard, saved.paste_to_active_app) == (True, False)
     shown = [module.intro_text("Option+Space", app.config), module.empty_history_text("Option+Space")]
-    assert intro[-2:] == shown and "copied automatically" in intro[-2]
-    app.choose_delivery(True)
+    assert intro[-2:] == shown and "copied, ready to paste" in intro[-2]
+    app.choose_delivery(Delivery.PASTED)
     assert app.config.paste_to_active_app and "pasted into the app" in intro[-2]
+    app.choose_delivery(Delivery.KEPT)
+    saved = AppConfig.load(app._settings_path)
+    assert (saved.auto_copy_to_clipboard, saved.paste_to_active_app) == (False, False)
+    assert saved.delivery() is Delivery.KEPT
 
 
 def test_changing_a_setting_rewrites_what_the_window_and_the_welcome_say(monkeypatch, tmp_path):
     app, _, intro, _ = controller(monkeypatch, tmp_path)
     refreshed = []
     app._welcome_window = SimpleNamespace(refresh=lambda: refreshed.append("welcome"))
-    app.toggle_setting("auto_copy_to_clipboard")                   # Turned off.
+    app.choose_delivery(Delivery.KEPT)
     assert intro == [module.intro_text("Option+Space", app.config), module.empty_history_text("Option+Space")]
     assert "stays here" in intro[0]
     assert refreshed == ["welcome"]
@@ -130,11 +145,11 @@ def test_changing_a_setting_rewrites_what_the_window_and_the_welcome_say(monkeyp
 
 def test_the_window_intro_follows_the_settings():
     assert "Press Option+Space to dictate" in module.intro_text("Option+Space", AppConfig())
-    assert "copied automatically" in module.intro_text("Option+Space", AppConfig())
+    assert "copied, ready to paste" in module.intro_text("Option+Space", AppConfig())
     manual = module.intro_text("Option+Space", AppConfig(auto_start_recording=False))
     assert manual.startswith("Press Cmd+R or Dictate to start") and "Option+Space brings this window back" in manual
     kept = module.intro_text("Option+Space", AppConfig(auto_copy_to_clipboard=False))
-    assert "copied" not in kept.split("Turn on")[0] and "Copy the transcript to the clipboard" in kept
+    assert "is not copied" in kept and f"“{DELIVERY_LABELS[Delivery.COPIED]}”" in kept
 
 
 def test_try_it_describes_what_these_settings_do():
@@ -150,6 +165,8 @@ def test_try_it_describes_what_these_settings_do():
     assert "small bar" in recording_note(AppConfig())
     for config in (AppConfig(compact_dictation=False), AppConfig(auto_start_recording=False)):
         assert "small bar" not in recording_note(config) and "Maramax window" in recording_note(config)
+    # The welcome names the warning the bar shows while the microphone connects.
+    assert f"“{split_status(module.WAIT_TO_SPEAK_STATUS)[0]}”" in recording_note(AppConfig())
 
 
 def test_a_shortcut_edited_by_hand_into_something_unusable_falls_back(tmp_path):
@@ -186,13 +203,12 @@ owner = SimpleNamespace(
     problem_with_shortcut=problem,
     pause_shortcut=lambda: calls.append("pause"), resume_shortcut=lambda: calls.append("resume"),
     transcriber=SimpleNamespace(status_message=lambda: "Speech model ready"),
-    paste_permitted=lambda: False, open_accessibility_settings=lambda: calls.append("accessibility"),
+    paste_permitted=lambda: False, request_paste_permission=lambda: calls.append("ask permission"),
     finish_welcome=lambda: calls.append("finished"),
 )
-def choose_delivery(paste):
-    owner.config.auto_copy_to_clipboard = True
-    owner.config.paste_to_active_app = paste
-    calls.append(("paste", paste))
+def choose_delivery(delivery):
+    owner.config.set_delivery(delivery)
+    calls.append(("delivery", delivery.value))
 owner.choose_delivery = choose_delivery
 def hidden_window():
     return NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -282,17 +298,20 @@ assert not welcome.pages[1].isHidden() and welcome.pages[0].isHidden()
 welcome.picker.start_recording()
 welcome.goForward_(None)                                     # Leaving the step ends the recording.
 assert not welcome.picker.is_recording() and calls[-1] == "resume"
-assert welcome.copy_choice.state() == 1 and welcome.permission_row.isHidden()
-welcome.choosePaste_(welcome.paste_choice)
-assert calls[-1] == ("paste", True) and not welcome.permission_row.isHidden() and not welcome.permission.isHidden()
-welcome.choosePaste_(welcome.copy_choice)
-assert calls[-1] == ("paste", False) and welcome.permission_row.isHidden() and welcome.copy_choice.state() == 1
-owner.config.auto_copy_to_clipboard = False                  # Turned off in Settings: neither choice is true now.
+from parakeet_dictation.config import Delivery
+copy_choice, paste_choice = welcome.choices[Delivery.COPIED], welcome.choices[Delivery.PASTED]
+assert copy_choice.state() == 1 and welcome.permission_row.isHidden()
+welcome.chooseDelivery_(paste_choice)
+assert calls[-1] == ("delivery", "pasted") and not welcome.permission_row.isHidden() and not welcome.permission.isHidden()
+assert "Not allowed yet" in str(welcome.permission_note.stringValue())
+welcome.chooseDelivery_(copy_choice)
+assert calls[-1] == ("delivery", "copied") and welcome.permission_row.isHidden() and copy_choice.state() == 1
+owner.config.auto_copy_to_clipboard = False                  # Kept in Maramax (Settings): neither choice is true now.
 welcome.refresh()
-assert welcome.copy_choice.state() == 0 and welcome.paste_choice.state() == 0
-welcome.choosePaste_(welcome.paste_choice)
-welcome.openAccessibility_(None)
-assert calls[-1] == "accessibility"
+assert copy_choice.state() == 0 and paste_choice.state() == 0
+welcome.chooseDelivery_(paste_choice)
+welcome.requestPermission_(None)
+assert calls[-1] == "ask permission"
 welcome.goForward_(None)
 assert str(welcome.forward.title()) == "Done" and STEPS == 4
 assert str(welcome.try_text.stringValue()) == try_it_text("Option+Space", owner.config)

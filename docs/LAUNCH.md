@@ -15,10 +15,11 @@
 
 macOS asks for microphone access the first time you dictate; allow it. If you
 denied it earlier, switch Maramax on under **System Settings → Privacy &
-Security → Microphone**. For the transcript to be pasted for you, turn on
-**Settings → Paste into the active app**; Maramax opens **System Settings →
-Privacy & Security → Accessibility**, where you switch Maramax on. Opening the
-app does not open the microphone; only dictating does.
+Security → Microphone**. For the transcript to be pasted for you, choose **Paste
+into the app you’re using** (in the welcome, or **Settings → General**): macOS
+asks once, and its button opens **Privacy & Security → Accessibility**, where
+you switch Maramax on. Opening the app does not open the microphone; only
+dictating does.
 
 If an older Maramax is running, quit it from its menu bar icon first: one copy
 runs at a time. Settings, history, and recordings are shared between versions.
@@ -30,7 +31,7 @@ version has been published and offers it in a **Software Update** window with
 the release notes: **Install Update**, **Remind Me Later**, or **Skip This
 Version**. A daily offer appears without taking the keyboard, so typing meant
 for another app never reaches it. **Check for Updates…** in the menu, or **Check
-Now** in **Settings → General**, asks right away; the top of Settings shows the
+Now** in **Settings → Advanced**, asks right away; the top of Settings shows the
 version you have.
 
 **Install Update** shows the download in a small window (only the files
@@ -41,9 +42,11 @@ are untouched; if anything goes wrong, the next launch says so. The version it
 replaced is kept at
 `~/Library/Application Support/Maramax/updates/previous/Maramax.app`: to roll
 back, quit Maramax and move that copy into Applications. Because every release
-carries the same signature, macOS keeps the microphone and Accessibility
-permissions across updates. The daily check can be turned off in **Settings →
-General → Check for updates automatically**.
+carries the same signature, macOS keeps the microphone permission across
+updates, and the Accessibility permission once it was granted to a release; one
+left from a build before 0.6.1 is not kept, and choosing **Allow…** in Settings
+replaces it. The daily check can be turned off in **Settings → Advanced → Check
+for updates automatically**.
 
 ## Everyday use
 
@@ -52,17 +55,19 @@ General → Check for updates automatically**.
   The red button finishes; the arrow opens the full window.
 - **Open Transcript** shows the transcript, history, and a queue for
   transcribing audio and video files.
-- **Settings…** has copy and paste, live preview, the microphone, the optional
-  larger recognizer, and word replacements: a phrase it keeps mishearing and
-  the spelling you want. The original wording stays in history and recordings.
+- **Settings…** has where the transcript goes (paste, copy, or keep), live
+  preview, the microphone, word replacements (a phrase it keeps mishearing and
+  the spelling you want; the original wording stays in history and
+  recordings), the optional high-accuracy model, and updates.
 - **Recordings…** plays, exports, or transcribes again any saved capture,
   including ones that returned no transcript.
 
 Automatic input prefers the Mac's own microphone (except with the lid closed),
 so AirPods stay in high-quality playback; choose a microphone in **Settings →
 Microphone** to always use it. AirPods need two to three seconds to connect
-before they deliver sound: start speaking when the bar says **Recording**.
-**Keep the microphone connected for** keeps that connection open between
+before they deliver sound: while the bar says **Don’t speak yet** in orange,
+wait; start speaking when it says **Recording**. **Keep the microphone
+connected** keeps that connection open between
 dictations so the next one starts at once; while it is open, macOS shows the
 microphone indicator and AirPods play in call quality.
 
@@ -74,8 +79,15 @@ nothing is pasted and the transcript stays in history.
 
 ## When something goes wrong
 
-- **The speech model does not load:** check the connection, then **More →
-  Retry Speech Model**.
+- **The speech model does not load:** check the connection, then press your
+  shortcut again or choose **Retry Speech Model** at the top of the menu.
+- **Pasting stopped working:** choose **Allow…** under **Settings → General →
+  Paste into the app you’re using**; in the dialog macOS shows, choose **Open
+  System Settings** and switch Maramax on under **Privacy & Security →
+  Accessibility**.
+- **The bar says the microphone sent only silence, every time:** switch
+  Maramax on under **System Settings → Privacy & Security → Microphone**, then
+  check the input under **Settings → Microphone**.
 - **A dictation returned nothing:** the audio is still in **Recordings…**; play
   it first. A silent recording needs a working microphone, not another try.
 - **Maramax quit or crashed while recording:** the audio appears in
@@ -84,9 +96,10 @@ nothing is pasted and the transcript stays in history.
 ## Local data
 
 Everything lives in `~/Library/Application Support/Maramax/`: settings,
-transcripts, recordings (ordinary WAV files with JSON details, up to 20
-recordings or 512 MB, always keeping the newest), and logs (2 MB, two
-backups; transcript text is not logged). **More → Clear History &
-Recordings…** deletes transcripts and audio. Speech models stay in the Hugging
+transcripts (the last 100 by default), recordings (ordinary WAV files with
+JSON details; the last 20 by default, under 512 MB in all, always keeping the
+newest; both numbers are chosen in **Settings → Advanced**), and logs (2 MB, two
+backups; transcript text is not logged). **Settings → Advanced → Clear History
+& Recordings…** deletes transcripts and audio. Speech models stay in the Hugging
 Face cache. Importing media files needs FFmpeg (`brew install ffmpeg`);
 dictation does not.

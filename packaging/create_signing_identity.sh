@@ -42,9 +42,14 @@ keyUsage = critical, digitalSignature
 extendedKeyUsage = critical, codeSigning
 EOF
 # Signatures carry no timestamp, so they are checked against the certificate's
-# dates every time: it is made to outlast the app.
-openssl req -x509 -newkey rsa:3072 -nodes -days 10950 -config "$WORK/certificate.cnf" \
-  -keyout "$WORK/key.pem" -out "$WORK/certificate.pem" 2>/dev/null
+# dates every time: it is made to outlast the app. Its progress output is kept
+# off the screen, and shown only if it fails (the exit trap deletes $WORK).
+if ! openssl req -x509 -newkey rsa:3072 -nodes -days 10950 -config "$WORK/certificate.cnf" \
+    -keyout "$WORK/key.pem" -out "$WORK/certificate.pem" 2>"$WORK/certificate.log"; then
+  cat "$WORK/certificate.log" >&2
+  echo "ERROR: openssl could not create the release certificate (see above); nothing was kept." >&2
+  exit 1
+fi
 P12_PASSWORD="$(openssl rand -hex 16)"
 openssl pkcs12 -export -legacy -inkey "$WORK/key.pem" -in "$WORK/certificate.pem" \
   -out "$WORK/identity.p12" -passout "pass:$P12_PASSWORD" 2>/dev/null \

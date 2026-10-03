@@ -1,3 +1,6 @@
+import os
+from datetime import datetime, timezone
+
 from parakeet_dictation import recovery
 
 
@@ -100,3 +103,11 @@ def test_load_unsaved_missing_or_too_short_returns_none(tmp_path):
     assert recovery.load_unsaved(_legacy_path(tmp_path)) is None
     _legacy_path(tmp_path).write_bytes(b"x" * 10)
     assert recovery.load_unsaved(_legacy_path(tmp_path)) is None
+
+
+def test_an_unsaved_recording_is_dated_when_its_capture_ended(tmp_path):
+    _write_in_progress(tmp_path, recovery.MIN_RECOVERABLE_BYTES)
+    ended = datetime(2026, 3, 9, 8, 30, tzinfo=timezone.utc)
+    os.utime(recovery.in_progress_path(tmp_path), (ended.timestamp(), ended.timestamp()))
+    recovery.promote_in_progress(tmp_path)  # Keeping it is a rename: the date survives.
+    assert recovery.captured_at(recovery.unsaved_recordings(tmp_path)[0]) == ended

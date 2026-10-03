@@ -117,14 +117,23 @@ long_status = "Speech model unavailable — check your connection, then retry th
 window.set_status(long_status)
 assert window.status_label.cell().usesSingleLineMode() and str(window.status_label.toolTip()) == long_status
 window.set_transcribing(False); window.set_queue_processing(False)
-window.set_drop_state(True)
-assert "queue" in str(window.status_label.stringValue())  # Drop feedback is visible in Queue mode.
-window.set_drop_state(False)
+from parakeet_dictation.overlay import DROP_HINT, DropTarget, drop_target
+window.set_drop_state(window.drop_target(1))
+assert str(window.status_label.stringValue()) == "Drop to add to the queue"   # In Queue mode, even one file.
+window.set_drop_state(None)
 assert str(window.status_label.stringValue()) == long_status
 window._set_mode(Mode.HISTORY)
-window.set_drop_state(True)                                # Also where the hint label is not on screen.
+window.set_drop_state(window.drop_target(1))               # Also where the hint label is not on screen.
 assert str(window.status_label.stringValue()) == "Drop to transcribe"
-window.set_drop_state(False)
+window.set_drop_state(window.drop_target(3))               # Several files are queued, wherever they land.
+assert str(window.status_label.stringValue()) == "Drop to add to the queue"
+window.set_drop_state(None)
+# What a drop does: one rule for the feedback and for the drop itself.
+assert drop_target(Mode.RESULT, 1, transcribing=False) is DropTarget.TRANSCRIBE
+assert drop_target(Mode.RESULT, 2, transcribing=False) is DropTarget.QUEUE
+assert drop_target(Mode.RESULT, 1, transcribing=True) is DropTarget.QUEUE      # Busy: it waits in the queue.
+assert drop_target(Mode.QUEUE, 1, transcribing=False) is DropTarget.QUEUE
+assert "several to add them to the queue" in DROP_HINT
 window.hide()
 assert str(window.status_label.stringValue()) == long_status  # Reopening shows the status, not a blank.
 assert not window.panel.isVisible()
@@ -138,8 +147,13 @@ bar = DictationIndicator.alloc().initWithDelegate_(delegate)
 stop, expand = bar.stop_button.frame(), bar.expand_button.frame()
 assert stop.size.width == stop.size.height == expand.size.width == expand.size.height
 assert stop.origin.y == expand.origin.y == (HEIGHT - stop.size.height) / 2
+from parakeet_dictation.app import _HEALTH_STATUS
+bar._layout_text(True)
+for status in _HEALTH_STATUS.values():     # Said beside the meter while recording: never cut short.
+    bar.title.setStringValue_(status)
+    assert bar.title.fittingSize().width <= bar.title.frame().size.width, status
 assert split_status("Copied transcript to clipboard") == ("Copied transcript to clipboard", FINISHED_HINT)
-assert split_status("No transcript returned — audio kept for retry") == ("No transcript returned", "Audio kept for retry")
+assert split_status("No speech detected — audio saved in Recordings") == ("No speech detected", "Audio saved in Recordings")
 assert split_status("Microphone unavailable: Selected microphone disconnected: AirPods") == (
     "Microphone unavailable", "Selected microphone disconnected: AirPods")
 # Whichever separator comes first ends the outcome line.
@@ -151,8 +165,8 @@ from parakeet_dictation import indicator
 timers = []
 indicator.call_later = lambda delay, fn, *args: timers.append((delay, args))
 bar.finish("Copied transcript to clipboard", duration=2)
-bar.finish("Copied — auto-paste skipped (focus changed)", duration=8)   # A later outcome restarts the countdown.
-assert str(bar.title.stringValue()) == "Copied" and "skipped" in str(bar.detail.stringValue())
+bar.finish("Copied, not pasted — you switched apps", duration=8)   # A later outcome restarts the countdown.
+assert str(bar.title.stringValue()) == "Copied, not pasted" and "switched apps" in str(bar.detail.stringValue())
 assert timers[0][1] != timers[1][1]            # The first timer's token is stale.
 bar._hide_if_current(*timers[0][1])
 assert bar._finished and timers[1][0] == 8
@@ -162,7 +176,7 @@ assert not bar.panel.isVisible() and not bar.panel.canBecomeKeyWindow()
 
 def test_recordings_window_stays_put_and_names_its_limits(tmp_path):
     run(r'''
-from parakeet_dictation.recordings import MAX_RECORDINGS, RecordingStore
+from parakeet_dictation.recordings import DEFAULT_RECORDINGS, RecordingStore
 from parakeet_dictation.recordings_window import MARGIN, WIDTH, RecordingsController
 store = RecordingStore(Path(sys.argv[1]))
 record = store.save(b"\x01\x00" * 16000)
@@ -170,7 +184,10 @@ window = RecordingsController.alloc().initWithDelegate_store_(delegate, store)
 window.refresh()
 assert not window.panel.hidesOnDeactivate()
 assert str(window.panel.title()) == "Recordings"
-assert str(MAX_RECORDINGS) in str(window.note.stringValue())
+assert f"Up to {DEFAULT_RECORDINGS} recordings" in str(window.note.stringValue())
+store.limit = 50                                     # Chosen in Settings while the window is open.
+window.refresh()
+assert "Up to 50 recordings" in str(window.note.stringValue())
 assert "not transcribed yet" in str(window.picker.titleOfSelectedItem())
 for control in (window.picker, window.play):
     assert abs(visible_rect(control).origin.x - MARGIN) < 0.6
@@ -183,6 +200,23 @@ assert not window.play.isEnabled() and not window.retry.isEnabled() and window.s
 delegate.is_busy = False
 window.show_busy_state()                             # Told when the app becomes idle, not only on a refresh.
 assert window.play.isEnabled() and window.retry.isEnabled()
+window.sound = SimpleNamespace(isPlaying=lambda: True, stop=lambda: None)
+delegate.is_busy = True                              # A dictation starts while a recording plays:
+window.show_busy_state()
+assert window.play.isEnabled() and not window.retry.isEnabled()   # Stop still works.
+window.stop_playback()
+assert not window.play.isEnabled()
+delegate.is_busy = False
+import threading
+done = threading.Event()
+window._saving = [threading.Thread(target=done.wait), threading.Thread(target=lambda: None)]
+for thread in window._saving:
+    thread.start()
+window._saving[1].join()
+assert window.is_saving()                            # The first copy still runs: quitting would cut it short.
+done.set()
+window._saving[0].join()
+assert not window.is_saving()
 ''', str(tmp_path))
 
 
@@ -375,4 +409,53 @@ from parakeet_dictation.update_window import UpdateProgressWindow
 window = UpdateProgressWindow.alloc().initWithCancel_(lambda: None)
 cancel, bar = visible_rect(window.cancel), visible_rect(window.bar)
 assert abs((cancel.origin.x + cancel.size.width) - (bar.origin.x + bar.size.width)) < 0.5, (cancel, bar)
+''')
+
+
+def test_the_bar_and_the_window_say_dont_speak_until_the_microphone_delivers_sound():
+    run(r'''
+from AppKit import NSColor
+from parakeet_dictation.capture import CaptureMeter
+from parakeet_dictation.indicator import DictationIndicator, METER_BARS, wave_levels
+from parakeet_dictation.overlay import OverlayController
+clock = [0.0]
+meter = CaptureMeter(clock=lambda: clock[0])
+meter.device_name = "AirPods"
+meter.mark_open()
+bar = DictationIndicator.alloc().initWithDelegate_(delegate)
+window = OverlayController.alloc().initWithDelegate_(delegate)
+orange = NSColor.systemOrangeColor()
+bar.show("Option+Space")                                   # The microphone is not open yet.
+window.prepare_for_recording()
+assert bar.title.textColor() == orange and window.status_label.textColor() == orange
+assert bar.meter.wave is not None                          # The meter is the waiting wave, not levels.
+from parakeet_dictation.app import WAIT_TO_SPEAK_STATUS
+bar.set_status(WAIT_TO_SPEAK_STATUS)                       # Read in full, never cut short.
+assert bar.title.cell().cellSize().width <= bar.title.frame().size.width, bar.title.cell().cellSize()
+for _ in range(3):                                         # AirPods send exact zeros while they connect.
+    clock[0] += 0.15
+    meter.feed(bytes(1024))
+    snapshot = meter.snapshot()
+    assert snapshot.health == "waiting"
+    phase = bar.meter.wave
+    bar.set_capture(snapshot)
+    window.set_capture(snapshot)
+    assert bar.meter.wave > phase                          # The wave moves on: alive, not stuck.
+    assert bar.title.textColor() == orange and window.status_label.textColor() == orange
+assert str(bar.detail.stringValue()) == "AirPods · 0:00" == str(window.detail_label.stringValue())
+clock[0] += 0.15
+meter.feed(b"\x10\x20" * 512)                              # Sound: speak now.
+bar.set_capture(meter.snapshot())
+window.set_capture(meter.snapshot())
+assert bar.meter.wave is None and bar.title.textColor() == NSColor.labelColor()
+assert window.status_label.textColor() == NSColor.labelColor()
+bar.show("Option+Space")
+bar.set_transcribing()
+assert bar.title.textColor() == NSColor.labelColor()       # The colour never carries over.
+bar.show("Option+Space")
+bar.finish("Done", 2)
+assert bar.title.textColor() == NSColor.labelColor()
+levels = wave_levels(0.0)
+assert len(levels) == METER_BARS and all(0.25 <= level <= 0.55 for level in levels)
+assert levels != wave_levels(0.9)
 ''')

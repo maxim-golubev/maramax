@@ -1,5 +1,6 @@
 """Finding, verifying, and swapping in a new release, with file URLs and a fake bundle. No network, no app is opened."""
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -205,6 +206,42 @@ def test_a_download_that_is_not_this_app_is_refused_and_cleared(tmp_path, codesi
     assert not (installed.parent / updater.STAGED_NAME).exists()
 
 
+def test_a_download_cut_short_says_so_rather_than_blaming_the_checksum(tmp_path, codesign):
+    """A connection closed cleanly mid-body ends the reads with no error."""
+    installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
+    release = published(tmp_path)
+    longer = updater.Asset(**{**release.archive.__dict__, "size": release.archive.size + 4096})
+    cut_short = updater.Release(**{**release.__dict__, "archive": longer})
+    with pytest.raises(updater.UpdateError, match=f"stopped after {release.archive.size:,} of {longer.size:,} bytes"):
+        updater.download(cut_short, "0.5.1", installed, tmp_path / "staging", lambda *a: None, lambda: False)
+    assert not (tmp_path / "staging").exists() and codesign == []
+
+
+@pytest.mark.parametrize("failure", [
+    http.client.IncompleteRead(b"partial", 2048),      # a chunked body cut off: not an OSError
+    ConnectionResetError(54, "Connection reset by peer"),
+])
+def test_a_connection_that_breaks_mid_download_is_a_download_error_and_is_cleared(tmp_path, monkeypatch, failure):
+    installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
+    release = published(tmp_path)
+    real_open = updater._open
+
+    class Breaking:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, amount):
+            raise failure
+    monkeypatch.setattr(updater, "_open", lambda url, version: Breaking() if url == release.archive.url
+                        else real_open(url, version))
+    with pytest.raises(updater.UpdateError, match="Could not download Maramax-0.5.2.zip"):
+        updater.download(release, "0.5.1", installed, tmp_path / "staging", lambda *a: None, lambda: False)
+    assert not (tmp_path / "staging").exists()
+
+
 def test_a_download_whose_app_reports_another_version_is_refused(tmp_path, codesign):
     installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
     release = published(tmp_path, version="0.5.2")
@@ -404,11 +441,15 @@ def test_an_install_needs_two_idle_looks(idle_now, idle_before, expected):
     assert update_offer.ready_to_install(idle_now=idle_now, idle_before=idle_before) is expected
 
 
-def test_the_menu_item_says_what_is_happening():
-    title = update_offer.menu_title
-    assert title(update_offer.Step.IDLE, None) == update_offer.CHECK_TITLE
-    assert title(update_offer.Step.IDLE, "0.5.2") == "Install Maramax 0.5.2…"
-    assert title(update_offer.Step.DOWNLOADING, "0.5.2", 40) == "Downloading Maramax 0.5.2… 40%"
+def test_the_menu_item_says_what_is_happening_in_a_few_words():
+    """The menu is a fixed width: a long title would be cut off."""
+    title, step = update_offer.menu_title, update_offer.Step
+    assert title(step.IDLE, None) == update_offer.CHECK_TITLE
+    assert title(step.IDLE, "0.5.2") == "Install Maramax 0.5.2…"
+    assert title(step.CHECKING, "0.5.2") == "Checking for Updates…"
+    assert title(step.DOWNLOADING, "0.5.2", 40) == "Downloading Update… 40%"
+    assert title(step.CANCELLING, "0.5.2") == "Cancelling the Update…"
+    assert title(step.INSTALLING, "0.5.2") == "Installing Maramax 0.5.2…"
 
 
 FAILED = update_offer.CheckFailed("Could not reach GitHub")
@@ -421,6 +462,7 @@ FAILED = update_offer.CheckFailed("Could not reach GitHub")
     (update_offer.Step.IDLE, "0.6.1", "succeeded", None, "Maramax 0.6.1 is available."),
     (update_offer.Step.IDLE, None, "succeeded", "0.6.1", "Updated to Maramax 0.6.1."),
     (update_offer.Step.CHECKING, None, "succeeded", None, "Checking for updates…"),
+    (update_offer.Step.CANCELLING, "0.6.1", "succeeded", None, "Cancelling the update to Maramax 0.6.1…"),
     (update_offer.Step.INSTALLING, "0.6.1", "succeeded", None,
      "Maramax 0.6.1 is ready and installs as soon as Maramax is idle."),
 ])
@@ -437,7 +479,7 @@ def test_download_sizes_read_naturally(size, expected):
     assert update_window.download_size(size) == expected
     assert update_window.progress_state(size // 2, size) == (
         f"{update_window.download_size(size // 2)} of {expected}", (size // 2) / size)
-    assert update_window.progress_state(size, size) == ("Checking the download…", None)
+    assert update_window.progress_state(size, size) == ("Checking the download…", 1.0)
 
 
 def test_every_failed_install_has_something_to_say():
@@ -447,21 +489,35 @@ def test_every_failed_install_has_something_to_say():
 
 
 def test_release_notes_are_read_as_headings_bullets_and_paragraphs():
-    from parakeet_dictation.update_prompt import Block, BlockKind, Emphasis, Link, Run, note_blocks
+    from parakeet_dictation.update_prompt import Bullet, Emphasis, Heading, Link, Paragraph, Run, note_blocks
 
     notes = ("## New\r\n\n- **Updates itself.** See [the guide](https://x.test)\n  and `START HERE.md`.\n"
              "* _quietly_ fixed\n\nUpdating from 0.6.3 downloads\nabout 4 MB.\n\n[odd](javascript:alert(1)) snake_case")
     assert note_blocks(notes) == [
-        Block(BlockKind.HEADING, (Run("New", Emphasis.PLAIN),)),
-        Block(BlockKind.BULLET, (Run("Updates itself.", Emphasis.STRONG), Run(" See ", Emphasis.PLAIN),
-                                 Link("the guide", "https://x.test"), Run(" and ", Emphasis.PLAIN),
-                                 Run("START HERE.md", Emphasis.CODE), Run(".", Emphasis.PLAIN))),
-        Block(BlockKind.BULLET, (Run("quietly", Emphasis.ITALIC), Run(" fixed", Emphasis.PLAIN))),
-        Block(BlockKind.PARAGRAPH, (Run("Updating from 0.6.3 downloads about 4 MB.", Emphasis.PLAIN),)),
+        Heading((Run("New", Emphasis.PLAIN),)),
+        Bullet((Run("Updates itself.", Emphasis.STRONG), Run(" See ", Emphasis.PLAIN),
+                Link("the guide", "https://x.test"), Run(" and ", Emphasis.PLAIN),
+                Run("START HERE.md", Emphasis.CODE), Run(".", Emphasis.PLAIN))),
+        Bullet((Run("quietly", Emphasis.ITALIC), Run(" fixed", Emphasis.PLAIN))),
+        Paragraph((Run("Updating from 0.6.3 downloads about 4 MB.", Emphasis.PLAIN),)),
         # Only web links are links: the notes are not covered by the release's signature.
-        Block(BlockKind.PARAGRAPH, (Run("[odd](javascript:alert(1)) snake_case", Emphasis.PLAIN),)),
+        Paragraph((Run("[odd](javascript:alert(1)) snake_case", Emphasis.PLAIN),)),
     ]
     assert note_blocks("") == [] and note_blocks("\n  \n") == []
+
+
+def test_a_numbered_list_keeps_its_items_and_their_numbers():
+    from parakeet_dictation.update_prompt import Emphasis, Heading, NumberedItem, Paragraph, Run, note_blocks
+
+    def plain(text):
+        return (Run(text, Emphasis.PLAIN),)
+    assert note_blocks("## Fixes\n1. First fix\n2. Second fix\n   that wraps\n10) Tenth\n\nAbout 1.5 MB.") == [
+        Heading(plain("Fixes")),
+        NumberedItem("1.", plain("First fix")),
+        NumberedItem("2.", plain("Second fix that wraps")),
+        NumberedItem("10)", plain("Tenth")),
+        Paragraph(plain("About 1.5 MB.")),     # A number in a sentence starts no list.
+    ]
 
 
 def test_the_offer_says_what_installing_does():
@@ -635,7 +691,7 @@ def test_install_and_relaunch_shows_progress_waits_for_idle_then_restarts(monkey
     release = a_release()
     controller._download(release)
     controller._show_download_progress(1024, 2048)
-    assert item.title == "Downloading Maramax 0.5.2… 50%"
+    assert item.title == "Downloading Update… 50%"
     controller._staged(release, controller._installed_app, tmp_path / updater.STAGED_NAME)
     assert item.title == "Installing Maramax 0.5.2…"
     tick()                      # Still dictating.
@@ -684,8 +740,16 @@ def test_a_quit_that_does_not_happen_is_reported_and_reset(monkeypatch, tmp_path
     controller._release = release
     controller._set_step(update_offer.Step.INSTALLING)
     controller._restart(release, tmp_path / "Maramax.app", tmp_path / updater.STAGED_NAME)
+    result = tmp_path / "updates" / "last-install"
+    result.parent.mkdir()
+    result.write_text(f"{updater.InstallResult.NOT_QUIT}\n")   # The swap script gave up first.
     assert tick() == update_offer.QUIT_WATCHDOG_SECONDS
     assert alerts[0]["title"] == "The update was not installed" and controller.can_check()
+    # Already said: the next launch does not report the same attempt again.
+    assert not result.exists()
+    later.clear()
+    controller.start()
+    assert not [delay for delay, function, args in later if delay == 5] and len(alerts) == 1
 
 
 def test_a_failed_download_is_reported_and_the_offer_stays(monkeypatch, tmp_path):
@@ -844,6 +908,44 @@ def test_a_cancel_reaching_the_restart_installs_nothing(monkeypatch, tmp_path):
     controller._cancel.set()
     controller._restart(release, tmp_path / "Maramax.app", tmp_path / updater.STAGED_NAME)
     assert not installs and discarded and controller.can_check()
+
+
+def test_an_installer_that_cannot_start_discards_the_new_app(monkeypatch, tmp_path):
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
+    discarded, quits = [], []
+    monkeypatch.setattr(update_offer.UpdateOffer, "_discard", staticmethod(discarded.append))
+
+    def cannot_start(**kwargs):
+        raise updater.UpdateError("Could not start the installer: [Errno 28] No space left on device")
+    monkeypatch.setattr(update_offer.updater, "install_after_exit", cannot_start)
+    controller._quit_app = lambda: quits.append(True)
+    release = a_release()
+    controller._release = release
+    controller._set_step(update_offer.Step.INSTALLING)
+    controller._restart(release, tmp_path / "Maramax.app", tmp_path / updater.STAGED_NAME)
+    assert discarded == [tmp_path / updater.STAGED_NAME] and not quits
+    assert alerts[0]["title"] == "The update could not be installed" and controller.can_check()
+
+
+def test_cancelling_the_wait_to_install_shows_at_once(monkeypatch, tmp_path):
+    """The menu and Settings stop saying "Installing" the moment Cancel is
+    pressed, though the staged app is discarded only at the next look."""
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path, busy=True)
+    later, tick = run_timers(monkeypatch)
+    installs, discarded = [], []
+    monkeypatch.setattr(update_offer.updater, "install_after_exit", lambda **kwargs: installs.append(kwargs))
+    monkeypatch.setattr(update_offer.UpdateOffer, "_discard", staticmethod(discarded.append))
+    controller._window = FakeWindow()
+    release = a_release()
+    controller._release = release
+    controller._staged(release, tmp_path / "Maramax.app", tmp_path / updater.STAGED_NAME)
+    assert item.title == "Installing Maramax 0.5.2…"
+    controller.cancel_requested()
+    assert item.title == "Cancelling the Update…" and not controller.can_check()
+    assert controller.status_text() == "Cancelling the update to Maramax 0.5.2…"
+    tick()
+    assert discarded == [tmp_path / updater.STAGED_NAME] and not installs
+    assert item.title == "Install Maramax 0.5.2…" and controller.can_check()
 
 
 def test_the_strict_signature_check_catches_a_wrong_rebuild(tmp_path):
@@ -1130,6 +1232,21 @@ def test_check_now_asks_again_even_with_a_release_already_known(monkeypatch, tmp
     assert started == [(True,)] and asked == [] and item.title == "Checking for Updates…"
 
 
+def test_a_prompt_window_that_cannot_be_made_does_not_stop_the_checks(monkeypatch, tmp_path):
+    controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path)
+    started = []
+    monkeypatch.setattr(update_offer.threading, "Thread",
+                        lambda **kwargs: SimpleNamespace(start=lambda: started.append(kwargs["args"])))
+
+    def broken():
+        raise RuntimeError("no window today")
+    monkeypatch.setattr(update_offer, "UpdatePromptWindow", SimpleNamespace(alloc=broken))
+    with pytest.raises(RuntimeError, match="no window today"):
+        controller._checked(a_release(), asked=False)
+    controller.check_requested()          # Not stuck in PROMPTING with no window to withdraw.
+    assert started == [(True,)] and item.title == "Checking for Updates…"
+
+
 def test_an_automatic_prompt_waits_while_a_dialog_is_open(monkeypatch, tmp_path):
     controller, item, config, alerts, saved, asked = offer(monkeypatch, tmp_path, modal=object())
     controller._checked(a_release(), asked=False)
@@ -1155,6 +1272,22 @@ def test_a_new_app_left_staged_by_an_earlier_run_is_removed_after_launch(monkeyp
     assert discarded == []
 
 
+def test_numbered_items_line_up_on_their_dots_and_their_text():
+    """The release notes as styled text, built in their own process."""
+    body = r'''
+from AppKit import NSTextAlignmentLeft, NSTextAlignmentRight
+from parakeet_dictation.update_prompt import NUMBER_END, NUMBER_INDENT, note_blocks, rendered_notes
+text = rendered_notes(note_blocks("9. Ninth\n10. Tenth\n\nDone."))
+assert str(text.string()) == "\t9.\tNinth\n\t10.\tTenth\nDone.", repr(str(text.string()))
+style = text.attribute_atIndex_effectiveRange_("NSParagraphStyle", 0, None)[0]
+stops = [(stop.alignment(), stop.location()) for stop in style.tabStops()]
+assert stops == [(NSTextAlignmentRight, NUMBER_END), (NSTextAlignmentLeft, NUMBER_INDENT)], stops
+assert style.headIndent() == NUMBER_INDENT     # A wrapped line starts under the item's text.
+'''
+    result = subprocess.run([sys.executable, "-c", body], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr[-1500:]
+
+
 def test_the_wait_for_idle_can_still_be_cancelled_after_the_restart_notice_gave_way():
     """A real progress window, built off-screen in its own process."""
     body = r'''
@@ -1162,10 +1295,16 @@ from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
 NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyProhibited)
 from parakeet_dictation.update_window import UpdateProgressWindow
 window = UpdateProgressWindow.alloc().initWithCancel_(lambda: None)
+window.show_progress(5, 10)
+assert window.bar.doubleValue() == 0.5
+window.show_progress(10, 10)           # Downloaded: the bar is full from here to the restart.
+assert window.bar.doubleValue() == 1.0 and not window.bar.isIndeterminate()
 window.show_restarting()
 assert not window.cancel.isEnabled()
+assert window.bar.doubleValue() == 1.0 and not window.bar.isIndeterminate()
 window.show_ready("0.5.2", True)       # A dictation began during "Restarting Maramax…".
 assert window.cancel.isEnabled()
+assert window.bar.doubleValue() == 1.0 and not window.bar.isIndeterminate()
 '''
     result = subprocess.run([sys.executable, "-c", body], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr[-1500:]

@@ -16,6 +16,8 @@ Files (raw 16-bit mono 16kHz PCM, no header):
 
 from __future__ import annotations
 
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .audio_format import BYTES_PER_SECOND
@@ -91,6 +93,28 @@ def promote_in_progress(base_dir: Path) -> bool:
         return False
 
 
+def keep_unsaved(base_dir: Path, pcm: bytes) -> bool:
+    """Keep a capture that has no spill of its own (an earlier capture still
+    held the recovery file) as the next unsaved recording. True when it is
+    kept; False when it is too short to recover or cannot be written."""
+    if len(pcm) < MIN_RECOVERABLE_BYTES:
+        return False
+    kept = _kept_files(base_dir)
+    path = base_dir / f"{UNSAVED_PREFIX}{kept[-1][0] + 1 if kept else 1}{UNSAVED_SUFFIX}"
+    temp = path.with_name(path.name + ".tmp")
+    try:
+        with temp.open("wb") as handle:
+            handle.write(pcm)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp.replace(path)  # A crash leaves no partial recording under the name the next launch reads.
+        return True
+    except OSError as exc:
+        temp.unlink(missing_ok=True)
+        logger.error(f"Could not keep a capture of {len(pcm)} bytes as {path.name}: {exc}")
+        return False
+
+
 def unkept_in_progress(base_dir: Path) -> bool:
     """Whether the recovery file still holds a capture worth keeping, which
     promote_in_progress() could not set aside: a new spill must not truncate it."""
@@ -111,6 +135,13 @@ def discard_in_progress(base_dir: Path) -> None:
 def unsaved_recordings(base_dir: Path) -> list[Path]:
     """The unsaved recordings worth recovering, oldest first."""
     return [path for _, path in _kept_files(base_dir) if _size_of(path) >= MIN_RECOVERABLE_BYTES]
+
+
+def captured_at(path: Path) -> datetime:
+    """When an unsaved recording's capture ended: the spill's last write,
+    which keeping it (a rename) does not change. Raises OSError when the
+    file is gone."""
+    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
 
 
 def load_unsaved(path: Path) -> bytes | None:

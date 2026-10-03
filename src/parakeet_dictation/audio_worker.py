@@ -16,6 +16,7 @@ import time
 
 from .capture import CaptureSnapshot
 from .helper_protocol import Event, Operation, event, parse
+from .logger_config import setup_helper_logging
 from .recorder import AudioRecorder, default_input_device, lid_closed
 
 # Speech that is still in the driver (or in a Bluetooth link) when the user
@@ -108,7 +109,7 @@ class AudioHelper:
                     self._list(request)
                 elif operation == Operation.RELEASE:
                     if self._warm_key is not None:
-                        self._close_unasked()
+                        self._close_warm_stream()
                 elif operation == Operation.RECORD:
                     if self._record(request) is _EOF:
                         return
@@ -132,9 +133,9 @@ class AudioHelper:
             # list. The app starts a fresh helper when this one is gone.
             self._exit()
 
-    def _close_unasked(self) -> None:
-        """Close the device without the app having asked for it just now, so
-        tell it first: a close can take a while, or wedge."""
+    def _close_warm_stream(self) -> None:
+        """Close the kept-warm device, telling the app first (CLOSING): a
+        close can take a while, or wedge."""
         send(Event.CLOSING)
         self._release()
         send(Event.IDLE)
@@ -154,15 +155,17 @@ class AudioHelper:
             # where PortAudio wedges; leaving is quicker and always works.
             self._exit()
         if time.monotonic() >= self._warm_until:
-            self._close_unasked()
+            self._close_warm_stream()
 
     def _list(self, request: dict) -> None:
         self._release()
         recorder = AudioRecorder(prefer_builtin=bool(request.get("prefer_builtin", True)))
         try:
-            devices = recorder.list_input_devices()
-            send(Event.DEVICES, devices=[list(device) for device in devices or []],
-                 automatic=recorder.automatic_device_name())
+            names = recorder.list_input_devices()
+            if names is None:
+                send(Event.ERROR, message="the audio session was busy")
+            else:
+                send(Event.DEVICES, devices=names, automatic=recorder.automatic_device_name())
         except Exception as exc:
             send(Event.ERROR, message=str(exc))
         finally:
@@ -203,7 +206,6 @@ class AudioHelper:
         assert recorder is not None
         send(Event.READY, device=recorder.capture_snapshot().device_name, warm=bool(warm))
 
-        sent = 0
         reopens = 0
         opened = time.monotonic()
         callbacks_at_open = nonzero_at_open = 0
@@ -218,14 +220,18 @@ class AudioHelper:
                     seconds = stop.get("keep_warm", 0)
                     keep_warm = float(seconds) if isinstance(seconds, (int, float)) else 0.0
                     break
-                sent = self._forward(recorder, sent)
+                self._forward(recorder)
                 snapshot = recorder.capture_snapshot()
                 if reopens < MAX_REOPENS and route_failed(
                         snapshot, time.monotonic() - opened, callbacks_at_open, nonzero_at_open):
                     send(Event.RECONNECTING)
                     reopened = recorder.reopen()
                     snapshot = recorder.capture_snapshot()
-                    send(Event.DEVICE, device=snapshot.device_name, reopened=bool(reopened))
+                    if reopened:
+                        send(Event.DEVICE, device=snapshot.device_name, reopened=True)
+                    else:
+                        send(Event.DEVICE, device=snapshot.device_name, reopened=False,
+                             error=str(recorder.last_error))
                     # One honest failure is enough: the app ends the recording
                     # with what was captured instead of showing a dead one.
                     reopens = reopens + 1 if reopened else MAX_REOPENS
@@ -234,8 +240,8 @@ class AudioHelper:
             deadline = time.monotonic() + TAIL_SECONDS
             while time.monotonic() < deadline:
                 time.sleep(POLL_SECONDS)
-                sent = self._forward(recorder, sent)
-            self._forward(recorder, sent)
+                self._forward(recorder)
+            self._forward(recorder)
             healthy = recorder.last_error is None and self._stream_is_delivering(recorder)
             # Everything captured is delivered before the device is closed:
             # the app can start recognition while the driver winds down.
@@ -254,14 +260,19 @@ class AudioHelper:
         return None
 
     @staticmethod
-    def _forward(recorder: AudioRecorder, sent: int) -> int:
-        frames = recorder.frames[sent:]
-        if not frames:
-            return sent
-        send(Event.AUDIO, pcm=base64.b64encode(b"".join(frames)).decode("ascii"),
+    def _forward(recorder: AudioRecorder) -> None:
+        """Send what has been captured since the last call and drop it here:
+        the app holds the recording, so the helper keeps no second copy. The
+        stream callback only appends, so removing the sent head is safe."""
+        frames = recorder.frames
+        count = len(frames)
+        if not count:
+            return
+        send(Event.AUDIO, pcm=base64.b64encode(b"".join(frames[:count])).decode("ascii"),
              overflows=recorder.capture_snapshot().overflow_count)
-        return sent + len(frames)
+        del frames[:count]
 
 
 def main() -> None:
+    setup_helper_logging()
     AudioHelper().run()

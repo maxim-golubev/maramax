@@ -1,6 +1,12 @@
 import json
 
+import pytest
+
+from parakeet_dictation.config import AppConfig
 from parakeet_dictation.history import HistoryStore, adopt_legacy_history
+
+# What the app keeps, for the tests that are not about the limit.
+LIMIT = AppConfig().history_limit
 
 
 def test_history_store_limits_and_persists_entries(tmp_path):
@@ -17,8 +23,22 @@ def test_history_store_limits_and_persists_entries(tmp_path):
     assert [item["source_label"] for item in payload] == ["Third", "Second"]
 
 
+def test_a_lower_limit_shows_at_once_and_deletes_with_the_next_save(tmp_path):
+    store = HistoryStore(history_limit=3, base_dir=tmp_path)
+    for label in ("First", "Second", "Third"):
+        store.add_entry("microphone", label, "words")
+    store.history_limit = 1
+    assert [entry.source_label for entry in store.list_entries()] == ["Third"]
+    store.history_limit = 3                       # Changed back before anything was saved: nothing lost.
+    assert len(store.list_entries()) == 3
+    store.history_limit = 2
+    store.add_entry("microphone", "Fourth", "words")
+    assert [entry.source_label for entry in HistoryStore(history_limit=3, base_dir=tmp_path).list_entries()] == [
+        "Fourth", "Third"]
+
+
 def test_empty_history_has_nothing_to_render(tmp_path):
-    assert HistoryStore(base_dir=tmp_path).render() is None
+    assert HistoryStore(base_dir=tmp_path, history_limit=LIMIT).render() is None
 
 
 def test_history_store_migrates_legacy_history(tmp_path):
@@ -42,27 +62,27 @@ def test_history_store_migrates_legacy_history(tmp_path):
     )
     current = support_dir / "Maramax"
     adopt_legacy_history(current)
-    store = HistoryStore(base_dir=current)
+    store = HistoryStore(base_dir=current, history_limit=LIMIT)
 
     assert (current / "history.json").exists()
     assert store.list_entries()[0].source_label == "Legacy"
     store.add_entry("microphone", "New", "words")
     adopt_legacy_history(current)  # Never again: it must not overwrite what exists.
-    assert len(HistoryStore(base_dir=current).list_entries()) == 2
+    assert len(HistoryStore(base_dir=current, history_limit=LIMIT).list_entries()) == 2
 
 
 def test_malformed_fields_do_not_prevent_loading_valid_history(tmp_path):
-    store = HistoryStore(base_dir=tmp_path)
+    store = HistoryStore(base_dir=tmp_path, history_limit=LIMIT)
     store.add_entry("microphone", "Valid", "hello")
     payload = json.loads(store.path.read_text())
     payload.insert(0, dict(payload[0], text=42))
     store.path.write_text(json.dumps(payload))
-    assert "hello" in HistoryStore(base_dir=tmp_path).render()
-    assert len(HistoryStore(base_dir=tmp_path).list_entries()) == 1
+    assert "hello" in HistoryStore(base_dir=tmp_path, history_limit=LIMIT).render()
+    assert len(HistoryStore(base_dir=tmp_path, history_limit=LIMIT).list_entries()) == 1
 
 
 def test_failed_history_deletion_is_reported(tmp_path, monkeypatch):
-    store = HistoryStore(base_dir=tmp_path)
+    store = HistoryStore(base_dir=tmp_path, history_limit=LIMIT)
 
     def fail():
         raise OSError("disk unavailable")
@@ -76,7 +96,7 @@ def test_originals_are_retained_without_breaking_older_history_readers(tmp_path)
     first = store.add_entry("microphone", "Dictation", "Maramax", raw_text="mara max")
     payload = json.loads(store.path.read_text())
     assert set(payload[0]) == {"id", "created_at", "source_kind", "source_label", "text"}
-    assert HistoryStore(base_dir=tmp_path).list_entries()[0].raw_text == "mara max"
+    assert HistoryStore(base_dir=tmp_path, history_limit=LIMIT).list_entries()[0].raw_text == "mara max"
     store.add_entry("microphone", "Next", "next")
     assert first.id not in json.loads(store.originals_path.read_text())
     assert store.clear()
@@ -85,10 +105,10 @@ def test_originals_are_retained_without_breaking_older_history_readers(tmp_path)
 
 
 def test_unreadable_originals_are_set_aside_not_overwritten(tmp_path):
-    store = HistoryStore(base_dir=tmp_path)
+    store = HistoryStore(base_dir=tmp_path, history_limit=LIMIT)
     store.add_entry("microphone", "Dictation", "Maramax", raw_text="mara max")
     store.originals_path.write_text("{truncated")
-    reopened = HistoryStore(base_dir=tmp_path)
+    reopened = HistoryStore(base_dir=tmp_path, history_limit=LIMIT)
     reopened.add_entry("microphone", "Next", "words")
     assert (tmp_path / "history-originals.json.corrupt").read_text() == "{truncated"
     assert json.loads(store.originals_path.read_text()) == {}
@@ -97,10 +117,10 @@ def test_unreadable_originals_are_set_aside_not_overwritten(tmp_path):
 def test_history_folder_removed_while_running_is_made_again(tmp_path):
     import shutil
 
-    store = HistoryStore(base_dir=tmp_path / "Maramax")
+    store = HistoryStore(base_dir=tmp_path / "Maramax", history_limit=LIMIT)
     shutil.rmtree(tmp_path / "Maramax")
     store.add_entry("microphone", "Next", "words")
-    assert len(HistoryStore(base_dir=tmp_path / "Maramax").list_entries()) == 1
+    assert len(HistoryStore(base_dir=tmp_path / "Maramax", history_limit=LIMIT).list_entries()) == 1
 
 
 def test_clear_leaves_no_transcript_anywhere(tmp_path):
@@ -115,7 +135,7 @@ def test_clear_leaves_no_transcript_anywhere(tmp_path):
     (support / "history.json.corrupt-2").write_text(secret)      # and again,
     (support / "history-originals.json.corrupt").write_text(secret)
     (support / "history.json.tmp").write_text(secret)            # and a write a crash interrupted.
-    store = HistoryStore(base_dir=support)
+    store = HistoryStore(base_dir=support, history_limit=LIMIT)
     store.add_entry("microphone", "Dictation", secret, raw_text=secret + " raw")
     unrelated = support / "settings.json"
     unrelated.write_text("{}")
@@ -126,7 +146,7 @@ def test_clear_leaves_no_transcript_anywhere(tmp_path):
 
 def test_unreadable_history_is_set_aside_not_overwritten(tmp_path):
     (tmp_path / "history.json").write_text("")  # What a power loss can leave behind.
-    store = HistoryStore(base_dir=tmp_path)
+    store = HistoryStore(base_dir=tmp_path, history_limit=LIMIT)
     assert store.list_entries() == []
     store.add_entry("microphone", "Next", "words")
     assert (tmp_path / "history.json.corrupt").exists()
@@ -134,12 +154,12 @@ def test_unreadable_history_is_set_aside_not_overwritten(tmp_path):
 
 
 def test_fields_from_a_newer_version_survive_a_save(tmp_path):
-    store = HistoryStore(base_dir=tmp_path)
+    store = HistoryStore(base_dir=tmp_path, history_limit=LIMIT)
     store.add_entry("microphone", "First", "one")
     payload = json.loads(store.path.read_text())
     payload[0]["language"] = "en"
     store.path.write_text(json.dumps(payload))
-    reopened = HistoryStore(base_dir=tmp_path)
+    reopened = HistoryStore(base_dir=tmp_path, history_limit=LIMIT)
     assert reopened.list_entries()[0].text == "one"
     reopened.add_entry("microphone", "Second", "two")
     assert json.loads(store.path.read_text())[1]["language"] == "en"
@@ -148,7 +168,7 @@ def test_fields_from_a_newer_version_survive_a_save(tmp_path):
 def test_a_second_unreadable_file_does_not_replace_the_first_one_set_aside(tmp_path):
     for attempt, damage in enumerate(("first", "second"), start=1):
         (tmp_path / "history.json").write_text(damage)
-        HistoryStore(base_dir=tmp_path).add_entry("microphone", "Next", "words")
+        HistoryStore(base_dir=tmp_path, history_limit=LIMIT).add_entry("microphone", "Next", "words")
     assert (tmp_path / "history.json.corrupt").read_text() == "first"
     assert (tmp_path / "history.json.corrupt-2").read_text() == "second"
 
@@ -161,10 +181,8 @@ def test_failed_write_leaves_no_temporary_file(tmp_path, monkeypatch):
 
     monkeypatch.setattr(atomic_file.os, "fsync", fail)
     (tmp_path / "settings.json").write_text("old")
-    try:
+    with pytest.raises(OSError):
         atomic_file.write_text_atomically(tmp_path / "settings.json", "new")
-    except OSError:
-        pass
     assert sorted(path.name for path in tmp_path.iterdir()) == ["settings.json"]
     assert (tmp_path / "settings.json").read_text() == "old"
 
@@ -174,6 +192,6 @@ def test_unreadable_history_takes_its_original_texts_aside_with_it(tmp_path):
     alone, losing the pre-replacement texts of everything set aside."""
     (tmp_path / "history.json").write_text("{not a list")
     (tmp_path / "history-originals.json").write_text('{"a": "mara max"}')
-    store = HistoryStore(base_dir=tmp_path)
+    store = HistoryStore(base_dir=tmp_path, history_limit=LIMIT)
     store.add_entry("microphone", "Next", "Maramax", raw_text="mara max")
     assert (tmp_path / "history-originals.json.corrupt").read_text() == '{"a": "mara max"}'

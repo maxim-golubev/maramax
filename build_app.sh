@@ -7,10 +7,20 @@ ROOT_DIR="$(pwd)"
 
 # What this build is made from, recorded beside the bundle once it passes its
 # check: create_release.py takes the commit and dirty flag from here, not from
-# whatever the checkout holds when it runs.
+# whatever the checkout holds when it runs. The checkout is looked at again
+# once the bundle is finished, because py2app reads it for minutes.
+checkout_is_dirty() {
+  local changes
+  # Called as a condition, where set -e is off: a failing git must not read as clean.
+  if ! changes="$(git -C "$ROOT_DIR" status --porcelain)"; then
+    echo "ERROR: git status failed in $ROOT_DIR, so whether the build is dirty is unknown" >&2
+    exit 1
+  fi
+  [ -n "$changes" ]
+}
 BUILD_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)"
 BUILD_DIRTY=false
-if [ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]; then
+if checkout_is_dirty; then
   BUILD_DIRTY=true
 fi
 
@@ -44,7 +54,6 @@ python setup.py py2app \
 
 BUNDLE_RESOURCES="$ROOT_DIR/dist/Maramax.app/Contents/Resources"
 BUNDLE_SITE_PACKAGES="$BUNDLE_RESOURCES/lib/python$PYTHON_SHORT_VERSION"
-BUNDLE_DYNLOAD="$BUNDLE_SITE_PACKAGES/lib-dynload"
 VENV_SITE_PACKAGES="$ROOT_DIR/.venv/lib/python$PYTHON_SHORT_VERSION/site-packages"
 BUNDLE_ZIP="$BUNDLE_RESOURCES/lib/python${PYTHON_SHORT_VERSION//./}.zip"
 
@@ -99,19 +108,13 @@ if data[4:8] == b"\0\0\0\0" and not path.with_suffix(".py").exists():
 PY
 
 # ── Copy full mlx package from venv ──
-# Place in site-packages so it's found on sys.path.
+# Into site-packages, once, as installed: the C extension finds libmlx.dylib
+# and mlx.metallib in the lib/ beside it (@loader_path/lib).
 MLX_PACKAGE_DEST="$BUNDLE_SITE_PACKAGES/mlx"
 if [ -d "$MLX_PACKAGE_DEST" ]; then
   rm -rf "$MLX_PACKAGE_DEST"
 fi
 ditto "$VENV_SITE_PACKAGES/mlx" "$MLX_PACKAGE_DEST"
-
-# Also place in lib-dynload for the C extension lookup.
-if [ -d "$BUNDLE_DYNLOAD/mlx" ]; then
-  rm -rf "$BUNDLE_DYNLOAD/mlx"
-fi
-mkdir -p "$BUNDLE_DYNLOAD/mlx"
-ditto "$VENV_SITE_PACKAGES/mlx" "$BUNDLE_DYNLOAD/mlx"
 
 # Copy scipy
 SCIPY_PACKAGE_SOURCE="$VENV_SITE_PACKAGES/scipy"
@@ -213,5 +216,15 @@ if ! python "$ROOT_DIR/packaging/check_bundle.py" --bundle "$ROOT_DIR/dist/Maram
   mv "$ROOT_DIR/dist/Maramax.app" "$ROOT_DIR/dist/Maramax.app.failed-check"
   echo "ERROR: bundle check failed; the bundle is at dist/Maramax.app.failed-check" >&2
   exit 1
+fi
+# An edit made while py2app ran may be in the bundle, so changes found by either
+# look make the build dirty. A commit made meanwhile leaves no stamp: the bundle
+# then matches neither commit, and create_release.py refuses it.
+if [ "$(git -C "$ROOT_DIR" rev-parse HEAD)" != "$BUILD_COMMIT" ]; then
+  echo "ERROR: HEAD moved from $BUILD_COMMIT while the bundle was built; run build_app.sh again" >&2
+  exit 1
+fi
+if checkout_is_dirty; then
+  BUILD_DIRTY=true
 fi
 printf '{"commit": "%s", "dirty": %s}\n' "$BUILD_COMMIT" "$BUILD_DIRTY" > "$ROOT_DIR/dist/build-stamp.json"

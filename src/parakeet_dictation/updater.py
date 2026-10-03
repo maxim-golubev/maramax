@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -199,7 +200,7 @@ def latest_release(current_version: str, url: str = LATEST_RELEASE_URL) -> Relea
         if exc.code == 404:
             raise UpdateError(f"GitHub has no published release at {url}") from exc
         raise UpdateError(f"GitHub answered the update check with HTTP {exc.code}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (OSError, http.client.HTTPException) as exc:  # A dropped connection, as in _fetch.
         raise UpdateError(f"Could not reach GitHub to check for updates: {exc}") from exc
     except ValueError as exc:
         raise UpdateError(f"GitHub's answer to the update check was not JSON: {exc}") from exc
@@ -306,8 +307,16 @@ def _fetch(asset: Asset, current_version: str, destination: Path, progress: Prog
                 digest.update(block)
                 received += len(block)
                 progress(received, asset.size)
-    except (urllib.error.URLError, TimeoutError) as exc:
+    except (OSError, http.client.HTTPException) as exc:
+        # OSError covers URLError, timeouts, and a reset connection;
+        # http.client's own errors (a cut-off chunked body, a garbled
+        # status line) are not OSErrors, and urllib passes them through.
         raise UpdateError(f"Could not download {asset.name}: {exc}") from exc
+    if received < asset.size:
+        # A connection closed cleanly mid-body ends the reads without an
+        # error: a dropped network, not a damaged or altered file.
+        raise UpdateError(f"The download of {asset.name} stopped after {received:,} of {asset.size:,} bytes; "
+                          "the connection was closed early")
     if digest.hexdigest() != expected:
         raise UpdateError(f"The download of {asset.name} does not match its published SHA-256")
 

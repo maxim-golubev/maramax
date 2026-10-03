@@ -1,7 +1,10 @@
 """The recognizers with fake models: routing, cleanup, and the in-memory path. No weights are loaded."""
+import re
+import sys
 from types import SimpleNamespace
 import threading
 import time
+import wave
 import weakref
 import zlib
 
@@ -40,6 +43,12 @@ def test_model_cache_is_released_when_inference_fails(monkeypatch):
     with pytest.raises(transcription.TranscriptionError, match="inference failed"):
         transcriber.transcribe_pcm(b"\x01\x00" * 1600)
     assert calls == ["collect", "clear"]
+
+
+def test_a_dictation_comes_out_written_as_a_person_writes(monkeypatch):
+    transcriber = recognizer([], generate=lambda mel: [recognized("Um,", "meet", "at", "8.45", "p.m.")])
+    monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: audio)
+    assert transcriber.transcribe_pcm(b"\x01\x00" * 1600) == "Meet at 8:45 p.m."
 
 
 def test_the_capture_is_out_of_memory_before_the_cache_is_cleared(monkeypatch):
@@ -94,7 +103,7 @@ def test_stuck_draft_stream_is_rescued_by_the_other_engine_or_reported():
     assert rescued._final_transcribe_pcm(b"\x01\x02") == "Rescued words"
     stranded = routing(qwen_ready=False, encoder_free=False)
     stranded.transcriber.transcribe_pcm = lambda *_a, **_k: pytest.fail("the stuck encoder must not be used")
-    with pytest.raises(transcription.TranscriptionError, match="stalled"):
+    with pytest.raises(transcription.TranscriptionError, match=f"^{re.escape(transcription.ENGINE_STALLED)}$"):
         stranded._final_transcribe_pcm(b"\x01\x02")
 
 
@@ -176,17 +185,129 @@ def test_high_accuracy_failure_releases_inference_and_cache(monkeypatch):
     assert calls == ["clear"]
 
 
-def test_media_converter_start_failure_removes_temporary_audio(tmp_path, monkeypatch):
+def fake_qwen_library(monkeypatch, load):
+    """The high-accuracy model library, its from_pretrained replaced by `load`."""
+    monkeypatch.setitem(sys.modules, "qwen3_asr_mlx", SimpleNamespace(
+        Qwen3ASR=SimpleNamespace(from_pretrained=load)))
+    monkeypatch.setattr(transcription, "cached_model_source", lambda model_id: model_id)
+
+
+def wait_for(condition):
+    deadline = time.monotonic() + 2
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return condition()
+
+
+def test_high_accuracy_turned_back_on_while_a_discarded_model_closes_is_loaded(monkeypatch):
+    loading, closing, closed = threading.Event(), threading.Event(), threading.Event()
+    loads = []
+
+    class Model:
+        def warm_up(self):
+            pass
+
+        def close(self):
+            if len(loads) == 1:
+                closing.set()
+                assert closed.wait(timeout=2)  # Releasing the weights takes a moment.
+
+    def load(_source):
+        loads.append(Model())
+        if len(loads) == 1:
+            assert loading.wait(timeout=2)
+        return loads[-1]
+
+    fake_qwen_library(monkeypatch, load)
+    qwen = transcription.QwenTranscriber()
+    qwen.start_loading()            # On,
+    qwen.unload()                   # off while it loads,
+    loading.set()
+    assert closing.wait(timeout=2)  # so the loaded model is closed,
+    qwen.start_loading()            # and on again during that close.
+    closed.set()
+    assert wait_for(qwen.is_ready)
+    assert qwen.model is loads[1] and qwen.status_message() == "High-accuracy model ready"
+
+
+def test_a_discarded_model_that_fails_to_close_is_not_a_failed_load(monkeypatch):
+    failures = []
+    loaded = threading.Event()
+
+    class Model:
+        def warm_up(self):
+            pass
+
+        def close(self):
+            loaded.set()
+            raise RuntimeError("close failed")
+
+    gate = threading.Event()
+
+    def load(_source):
+        assert gate.wait(timeout=2)
+        return Model()
+
+    fake_qwen_library(monkeypatch, load)
+    monkeypatch.setattr(transcription.logger, "warning", lambda _message: None)
+    qwen = transcription.QwenTranscriber(on_load_failed=failures.append)
+    qwen.start_loading()
+    qwen.unload()
+    gate.set()
+    assert loaded.wait(timeout=2)
+    assert wait_for(lambda: not any(thread.name.endswith("(_load)") for thread in threading.enumerate()))
+    assert qwen.load_error is None and failures == [] and not qwen.is_ready()
+
+
+def test_a_failed_high_accuracy_load_is_logged_with_its_traceback(monkeypatch):
+    def load(_source):
+        raise KeyError("encoder")
+
+    logged, failures = [], []
+    fake_qwen_library(monkeypatch, load)
+    monkeypatch.setattr(transcription.logger, "exception", logged.append)
+    qwen = transcription.QwenTranscriber(on_load_failed=failures.append)
+    qwen.start_loading()
+    assert wait_for(lambda: failures)
+    assert logged == [f"Could not load the high-accuracy model {qwen.MODEL_ID}"]
+    assert isinstance(qwen.load_error, KeyError) and not qwen._loading
+    assert qwen.status_message().startswith("High-accuracy model could not be loaded")
+
+
+def test_a_failed_warm_up_is_logged_with_its_traceback_and_frees_the_cache(monkeypatch):
+    calls = []
+
+    def warm_up_fails(self):
+        raise AttributeError("no attribute 'encoder'")
+
+    monkeypatch.setattr(transcription, "from_pretrained", lambda _source: SimpleNamespace())
+    monkeypatch.setattr(transcription.ParakeetTranscriber, "_warm_model", warm_up_fails)
+    monkeypatch.setattr(transcription.logger, "exception", lambda message: calls.append(message))
+    monkeypatch.setattr(transcription.gc, "collect", lambda: calls.append("collect"))
+    monkeypatch.setattr(transcription.mx, "clear_cache", lambda: calls.append("clear"))
+    transcriber = transcription.ParakeetTranscriber("test/parakeet")
+    assert transcriber.ready_event.wait(timeout=2)
+    assert transcriber.model is None and isinstance(transcriber.load_error, AttributeError)
+    assert calls == ["Could not load the Parakeet model test/parakeet", "collect", "clear"]
+
+
+def media(tmp_path, monkeypatch, run):
+    """An imported file, converted by `run` in place of FFmpeg, with its
+    temporary WAV created in `tmp_path`."""
     (tmp_path / "example.mp3").write_bytes(b"synthetic input")
     monkeypatch.setattr(transcription.tempfile, "tempdir", str(tmp_path))
-    monkeypatch.setattr(transcription, "resolve_ffmpeg", lambda: "/missing/ffmpeg")
+    monkeypatch.setattr(transcription, "resolve_ffmpeg", lambda: "/usr/local/bin/ffmpeg")
+    monkeypatch.setattr(transcription.subprocess, "run", run)
+    return tmp_path / "example.mp3"
 
+
+def test_media_converter_start_failure_removes_temporary_audio(tmp_path, monkeypatch):
     def fail(*_args, **_kwargs):
         raise FileNotFoundError("converter missing")
 
-    monkeypatch.setattr(transcription.subprocess, "run", fail)
-    with pytest.raises(transcription.TranscriptionError, match="Could not start media conversion"):
-        transcription.normalize_media(tmp_path / "example.mp3")
+    with pytest.raises(transcription.TranscriptionError, match="^FFmpeg did not start$"):
+        with transcription.converted_media(media(tmp_path, monkeypatch, fail)):
+            pytest.fail("nothing was converted")
     assert not list(tmp_path.glob("*.wav"))
 
 
@@ -195,9 +316,62 @@ def test_missing_ffmpeg_leaves_no_temporary_file(tmp_path, monkeypatch):
     monkeypatch.setattr(transcription.tempfile, "tempdir", str(tmp_path))
     monkeypatch.setenv("PATH", str(tmp_path))
     monkeypatch.setattr(transcription, "RUNTIME_BIN_CANDIDATES", ("bin",))
-    with pytest.raises(transcription.TranscriptionError, match="ffmpeg is required"):
-        transcription.normalize_media(tmp_path / "example.mp3")
+    with pytest.raises(transcription.TranscriptionError,
+                       match="^Importing media needs FFmpeg — install it with brew install ffmpeg$"):
+        with transcription.converted_media(tmp_path / "example.mp3"):
+            pytest.fail("nothing was converted")
     assert not list(tmp_path.glob("*.wav"))
+
+
+def test_converted_media_exists_only_inside_the_with(tmp_path, monkeypatch):
+    def convert(command, **_kwargs):
+        with wave.open(command[-1], "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            audio.writeframes(b"\x01\x00" * 160)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    with transcription.converted_media(media(tmp_path, monkeypatch, convert)) as converted:
+        with wave.open(converted, "rb") as audio:
+            assert audio.getnframes() == 160
+    assert not list(tmp_path.glob("*.wav"))
+
+
+def unreadable(*_args, **_kwargs):
+    return SimpleNamespace(returncode=1, stderr="example.mp3: Invalid data found when processing input")
+
+
+def too_slow(*_args, **_kwargs):
+    raise transcription.subprocess.TimeoutExpired("ffmpeg", transcription.FFMPEG_TIMEOUT_SECONDS)
+
+
+@pytest.mark.parametrize("run, message", [
+    (unreadable, "FFmpeg could not read the file"),
+    (too_slow, "FFmpeg took over 120 s to convert the file"),
+])
+def test_a_failed_conversion_says_why_whatever_number_of_files_failed(tmp_path, monkeypatch, run, message):
+    """Read beside the file's name in the queue, and in a run's summary of several files."""
+    monkeypatch.setattr(transcription.logger, "error", lambda _message: None)
+    with pytest.raises(transcription.TranscriptionError) as failure:
+        with transcription.converted_media(media(tmp_path, monkeypatch, run)):
+            pytest.fail("nothing was converted")
+    assert str(failure.value) == message
+    assert not list(tmp_path.glob("*.wav"))
+
+
+def test_a_converted_copy_that_cannot_be_deleted_is_reported_not_raised(tmp_path, monkeypatch):
+    warned = []
+
+    def refuse(self, missing_ok=False):
+        raise PermissionError(f"cannot delete {self}")
+
+    path = media(tmp_path, monkeypatch, lambda *_a, **_k: SimpleNamespace(returncode=0, stderr=""))
+    monkeypatch.setattr(transcription.logger, "warning", warned.append)
+    monkeypatch.setattr(transcription.Path, "unlink", refuse)
+    with transcription.converted_media(path) as converted:
+        pass
+    assert len(warned) == 1 and converted in warned[0] and "example.mp3" in warned[0]
 
 
 def test_complete_cached_model_is_loaded_as_a_local_directory(tmp_path, monkeypatch):
@@ -322,7 +496,7 @@ def test_offline_pass_waits_for_the_draft_stream_and_refuses_if_it_is_stuck(monk
     assert drafts and drafts[0] == "draft"
     assert not transcriber.start_drafts(lambda: [], drafts.append)  # Never two streams on one encoder.
     assert not transcriber.finish_drafts()
-    with pytest.raises(transcription.TranscriptionError, match="stalled"):
+    with pytest.raises(transcription.TranscriptionError, match=f"^{re.escape(transcription.ENGINE_STALLED)}$"):
         transcriber.transcribe_pcm(b"\x01\x00" * 1600)
     assert calls == []
     before = time.monotonic()
@@ -332,6 +506,37 @@ def test_offline_pass_waits_for_the_draft_stream_and_refuses_if_it_is_stuck(monk
     transcriber._drafts.join(timeout=2)
     assert transcriber.finish_drafts()
     assert transcriber.transcribe_pcm(b"\x01\x00" * 1600) == "spoken words."
+
+
+def test_a_stream_that_recovers_on_its_own_does_not_make_the_next_one_look_stuck(monkeypatch):
+    monkeypatch.setattr(transcription, "DRAFT_RELEASE_SECONDS", 0.2)
+    transcriber = recognizer([])
+    release = threading.Event()
+    streams = []
+
+    class Stream:
+        result = SimpleNamespace(text="")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            if len(streams) == 1:
+                release.wait(timeout=5)  # The first stream holds the encoder for a while.
+
+        def add_audio(self, _audio):
+            pass
+
+    transcriber.model.transcribe_stream = lambda context_size: streams.append(Stream()) or streams[-1]
+    assert transcriber.start_drafts(lambda: [], lambda _text: None)
+    assert not transcriber.finish_drafts()       # Found wedged.
+    release.set()
+    transcriber._drafts.join(timeout=2)          # It lets go by itself; nothing asks in between.
+    assert transcriber.start_drafts(lambda: [], lambda _text: None)
+    deadline = time.monotonic() + 2
+    while len(streams) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert transcriber.finish_drafts()           # The healthy stream is waited for, not judged stuck.
 
 
 def words(text, start=0.0, gap=0.5):
@@ -622,3 +827,10 @@ def test_the_high_accuracy_model_loads_only_once_the_standard_one_is_ready(monke
     controller.transcriber.wait_until_ready = lambda: None
     controller._wait_for_model_readiness()           # Ready (or ready after Retry Speech Model).
     assert loads == ["qwen"]
+
+
+
+def test_the_high_accuracy_model_says_it_waits_until_it_is_asked_to_load():
+    """It loads only once the standard model is ready; until then it is not "loading"."""
+    qwen = transcription.QwenTranscriber()
+    assert qwen.status_message() == "The high-accuracy model loads once the standard model is ready"

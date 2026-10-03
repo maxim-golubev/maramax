@@ -20,8 +20,9 @@ FAINT_PEAK = 0.002
 # tries to repair a route sooner than each of these (see audio_worker.py);
 # tests/test_capture.py holds the two sets of numbers in that order.
 NO_FRAME_SECONDS = 5.0    # device open, but no buffer has ever arrived
+NO_SIGNAL_SECONDS = 7.0   # buffers arrive, but none has held a sample above zero since the open
 STALLED_SECONDS = 3.0     # buffers were arriving and stopped
-QUIET_SECONDS = 10.0      # buffers arrive but hold only zeros
+QUIET_SECONDS = 10.0      # signal had arrived, then nothing above zero for this long
 RECONNECT_LIMIT_SECONDS = 8.0  # a replacement input is taking this long to open
 
 
@@ -68,10 +69,15 @@ class CaptureSnapshot:
         if self.last_frame_age > STALLED_SECONDS:
             return CaptureHealth.DISCONNECTED
         if self.nonzero_samples == 0:
-            return CaptureHealth.WAITING if listening < NO_FRAME_SECONDS else CaptureHealth.SILENT
+            return CaptureHealth.WAITING if listening < NO_SIGNAL_SECONDS else CaptureHealth.SILENT
         if self.last_signal_age is not None and self.last_signal_age > QUIET_SECONDS:
             return CaptureHealth.QUIET
         return CaptureHealth.RECEIVING
+
+    def summary(self) -> str:
+        """The microphone and how long it has recorded, as the bar and the window show it."""
+        seconds = int(self.audio_seconds)
+        return f"{self.device_name} · {seconds // 60}:{seconds % 60:02d}"
 
     @property
     def faint(self) -> bool:

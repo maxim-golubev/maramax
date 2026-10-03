@@ -10,6 +10,7 @@ from pathlib import Path
 from .atomic_file import set_aside, write_text_atomically
 from .corrections import normalize_rules
 from .hotkeys import DEFAULT_DICTATE, shortcut_problem
+from .recordings import DEFAULT_RECORDINGS
 
 # How long the microphone may stay connected after a dictation.
 MAX_KEEP_MIC_READY_SECONDS = 600
@@ -30,6 +31,7 @@ class AppConfig:
     live_preview: bool = True
     high_accuracy: bool = False
     history_limit: int = 100
+    recordings_limit: int = DEFAULT_RECORDINGS
     compact_dictation: bool = True
     prefer_builtin_mic: bool = True
     input_device: str | None = None
@@ -41,7 +43,7 @@ class AppConfig:
     # [virtual key code, Carbon modifier bits]; see hotkeys.shortcut_problem().
     dictation_shortcut: list[int] = field(
         default_factory=lambda: [DEFAULT_DICTATE.key_code, DEFAULT_DICTATE.modifiers])
-    # The welcome window has been through once (it can be reopened from the menu).
+    # The welcome window has been through once (Settings → General → Welcome Guide… reopens it).
     onboarded: bool = False
     # A release the user chose "Skip This Version" for; automatic checks do not offer it again.
     skipped_update_version: str | None = None
@@ -106,6 +108,11 @@ class AppConfig:
         if self.paste_to_active_app:
             return Delivery.PASTED
         return Delivery.COPIED if self.auto_copy_to_clipboard else Delivery.KEPT
+
+    def set_delivery(self, delivery: Delivery) -> None:
+        """Stored as the two settings 0.8 and earlier read, so rolling back keeps the choice."""
+        self.paste_to_active_app = delivery is Delivery.PASTED
+        self.auto_copy_to_clipboard = delivery is not Delivery.KEPT
 
     def save(self, path: Path) -> None:
         payload = dict(self.unrecognized) | {name: getattr(self, name) for name in _PERSISTED_FIELDS}

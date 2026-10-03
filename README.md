@@ -19,7 +19,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/dictation-dark.gif">
-    <img alt="The Maramax dictation bar through one dictation: connecting, recording with a live level meter and timer, transcribing, then 'Copied transcript to clipboard'" src="docs/images/dictation-light.gif" width="460">
+    <img alt="The Maramax dictation bar through one dictation: 'Don’t speak yet' in orange while the microphone connects, recording with a live level meter and timer, transcribing, then 'Copied transcript to clipboard'" src="docs/images/dictation-light.gif" width="460">
   </picture>
 </p>
 
@@ -28,25 +28,27 @@ NVIDIA's Parakeet model transcribes on the GPU through MLX, and the text is
 copied, or pasted into the app you were using. No audio or text leaves the Mac.
 
 - **Fast:** on an M3 Pro, a dictation under 30 seconds is transcribed in about
-  0.3 s, and one over two minutes in about 3 s (medians over 20 real
+  0.25 s, and one over two minutes in about 2.3 s (medians over 20 real
   dictations).
 - **Private:** recognition, history, and recordings stay on the Mac. The only
   network requests it makes by itself are the one-time speech model download
   and a daily update check, which can be turned off.
 - **Built with:** Python 3.12, PyObjC/AppKit for the native interface, MLX for
   inference, PortAudio in a separate helper process, Carbon hotkeys through
-  ctypes, py2app. About 9,400 lines of app code and 5,800 of tests.
+  ctypes, py2app.
 
 ## Engineering
 
-The speech model was the easy part. Most of the work went into three problems:
+The speech model was the easy part. Most of the work went into four problems:
 
 - **Bluetooth audio drivers hang.** A call into the macOS audio stack can block
   forever while AirPods switch modes, so the app never makes one itself. A
   helper process owns the microphone, every start and stop has a deadline, and
   a helper that stops answering is replaced without losing the audio it already
   sent. In Automatic mode, a microphone that drops out mid-sentence is replaced
-  by the next available one and the recording continues.
+  by the next available one and the recording continues. AirPods also send one
+  and a half to two and a half seconds of pure silence while they connect, so
+  the bar says "Don't speak yet" until real sound arrives.
 - **No dictation is lost.** Audio is written to disk as it arrives and archived
   before recognition starts, so neither a crash nor a failed transcription can
   cost a recording.
@@ -56,8 +58,14 @@ The speech model was the easy part. Most of the work went into three problems:
   decoder. Maramax detects those stretches, transcribes them again in shorter
   windows, and replaces only the affected text, and only if at least 90% of
   the words still match.
+- **Every change to the text is measured first.** Candidate fixes are replayed
+  against archived dictations, and a change ships only if everything it was not
+  meant to touch comes out byte for byte the same. That is how clock times
+  ("8.45 p.m." becomes "8:45 p.m.") and filler removal got in, and how silence
+  trimming, beam search, and collapsing repeated words were kept out: each made
+  real transcripts worse.
 
-Over 450 tests run without a microphone, a screen, or model weights: a fake
+About 600 tests run without a microphone, a screen, or model weights: a fake
 audio device drives the real helper process, and the native windows are built
 and measured off-screen.
 
@@ -80,8 +88,8 @@ Requires an Apple Silicon Mac; tested on macOS 15.
    starts in a few seconds and works offline.
 
 Also in the app: a replacement list for names and jargon it mishears, an
-optional larger recognizer (Qwen3-ASR 1.7B) that takes that list as vocabulary,
-and batch transcription of audio and video files.
+optional high-accuracy model (Qwen3-ASR 1.7B) that takes that list as
+vocabulary, and batch transcription of audio and video files.
 
 ## Build from source
 

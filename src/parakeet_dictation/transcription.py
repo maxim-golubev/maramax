@@ -11,7 +11,8 @@ import tempfile
 import threading
 import time
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
@@ -33,12 +34,18 @@ from huggingface_hub import try_to_load_from_cache
 from .audio_format import FULL_SCALE, SAMPLE_RATE, SAMPLE_WIDTH, whole_samples
 from .logger_config import logger
 from .paths import RUNTIME_BIN_CANDIDATES
+from .written_form import written
 
 FFMPEG_TIMEOUT_SECONDS = 120
 CHUNK_SECONDS = 120.0
 OVERLAP_SECONDS = 15.0
 # How long a draft stream may take to let go of the encoder once told to stop.
 DRAFT_RELEASE_SECONDS = 30.0
+# What the user is told when a draft stream never let go of the encoder, so
+# the standard engine cannot run an offline pass.
+ENGINE_STALLED = "Transcription engine stalled — restart the app"
+# What the high-accuracy model says before it has been asked to load: only once the standard one is ready.
+QWEN_WAITING = "The high-accuracy model loads once the standard model is ready"
 
 # Parakeet sometimes stops formatting partway through a dictation: lower-case
 # "i", no capitals, no punctuation, until the window ends. Which stretch it
@@ -239,7 +246,10 @@ class ParakeetTranscriber:
         except Exception as exc:
             self.model = None
             self.load_error = exc
-            logger.error(f"Error loading Parakeet model: {exc}")
+            # The error comes from the model library: its traceback is the diagnosis.
+            logger.exception(f"Could not load the Parakeet model {self.model_id}")
+            gc.collect()
+            mx.clear_cache()
         finally:
             self.ready_event.set()
 
@@ -260,7 +270,7 @@ class ParakeetTranscriber:
         if self.is_ready():
             return "Speech model ready"
         if self.load_error is not None:
-            return "Speech model unavailable — check your connection, then retry"
+            return "Speech model unavailable — check your connection, then try again"
         return "Preparing the speech model — the first launch downloads it"
 
     # -- Offline pass --
@@ -280,17 +290,13 @@ class ParakeetTranscriber:
     ) -> str:
         self.wait_until_ready()
         self._require_encoder()
-        normalized_path = normalize_media(file_path)
-        try:
-            with wave.open(normalized_path, "rb") as audio:
-                pcm_bytes = audio.readframes(audio.getnframes())
-        finally:
-            Path(normalized_path).unlink(missing_ok=True)
+        with converted_media(file_path) as converted, wave.open(converted, "rb") as audio:
+            pcm_bytes = audio.readframes(audio.getnframes())
         return self._transcribe_samples(_samples(pcm_bytes), progress_callback)
 
     def _require_encoder(self) -> None:
         if not self.finish_drafts():
-            raise TranscriptionError("Transcription engine stalled — restart the app")
+            raise TranscriptionError(ENGINE_STALLED)
 
     def _transcribe_samples(self, samples: np.ndarray, progress_callback: Callable | None = None) -> str:
         assert self.model is not None
@@ -304,7 +310,7 @@ class ParakeetTranscriber:
             audio = mx.array(samples).astype(mx.float32) / FULL_SCALE
             tokens = self._tokens_in_chunks(audio, 0, len(audio), CHUNK_SECONDS, OVERLAP_SECONDS, progress_callback)
             tokens = self._repair_collapses(audio, tokens, progress_callback)
-            return sentences_to_result(tokens_to_sentences(tokens, DecodingConfig().sentence)).text.strip()
+            return written(sentences_to_result(tokens_to_sentences(tokens, DecodingConfig().sentence)).text.strip())
         finally:
             # Cancellation and inference errors need cleanup too, otherwise
             # repeated failed sessions can retain Metal's cached allocations.
@@ -410,6 +416,9 @@ class ParakeetTranscriber:
         if self._drafts is not None and self._drafts.is_alive():
             logger.warning("Previous draft stream still running; no drafts for this recording")
             return False
+        # A stream found wedged has since let go: the new one has not been
+        # waited for yet, so finish_drafts() must give it the full wait.
+        self._drafts_wedged = False
         stop = self._drafts_stop = threading.Event()
         self._drafts = threading.Thread(target=self._stream_drafts, args=(frames_provider, stop, on_draft), daemon=True)
         self._drafts.start()
@@ -454,9 +463,9 @@ class ParakeetTranscriber:
                     text = (stream.result.text or "").strip()
                     if text:
                         on_draft(text)
-        except Exception as exc:
+        except Exception:
             # Drafts are a convenience; the offline pass still runs.
-            logger.warning(f"Live preview unavailable: {exc}")
+            logger.warning("Live preview unavailable: the draft stream failed", exc_info=True)
         finally:
             gc.collect()
             mx.clear_cache()
@@ -520,6 +529,10 @@ class QwenTranscriber:
         threading.Thread(target=self._load, daemon=True).start()
 
     def _load(self) -> None:
+        # The load ends (_loading cleared) in the same locked step that
+        # decides what becomes of the model, before any slow cleanup: a
+        # start_loading() during that cleanup then starts a load of its own
+        # instead of being taken for this one and lost.
         model = None
         try:
             from qwen3_asr_mlx import Qwen3ASR
@@ -528,34 +541,36 @@ class QwenTranscriber:
             model.warm_up()
             gc.collect()
             mx.clear_cache()
-
-            with self._load_lock:
-                discard = self._discard_when_loaded
-                self._discard_when_loaded = False
-                if not discard:
-                    self.model = model
-            if discard:
-                # The setting was switched off while we were loading.
-                model.close()
-                gc.collect()
-                mx.clear_cache()
-            else:
-                self.load_error = None
-                logger.info("Qwen3-ASR high-accuracy model loaded")
-                if self._on_loaded is not None:
-                    self._on_loaded()
         except Exception as exc:
+            with self._load_lock:
+                self._loading = False
+                self.load_error = exc
+            # The error comes from the model library: its traceback is the diagnosis.
+            logger.exception(f"Could not load the high-accuracy model {self.MODEL_ID}")
             if model is not None:
                 self._close(model)
             gc.collect()
             mx.clear_cache()
-            self.load_error = exc
-            logger.error(f"High-accuracy model failed to load: {exc}")
             if self._on_load_failed is not None:
                 self._on_load_failed(str(exc))
-        finally:
-            with self._load_lock:
-                self._loading = False
+            return
+
+        with self._load_lock:
+            self._loading = False
+            keep = not self._discard_when_loaded
+            self._discard_when_loaded = False
+            if keep:
+                self.model = model
+                self.load_error = None
+        if not keep:
+            # The setting was switched off while the model was loading.
+            self._close(model)
+            gc.collect()
+            mx.clear_cache()
+            return
+        logger.info("Qwen3-ASR high-accuracy model loaded")
+        if self._on_loaded is not None:
+            self._on_loaded()
 
     @staticmethod
     def _close(model) -> None:
@@ -572,9 +587,16 @@ class QwenTranscriber:
     def status_message(self) -> str:
         if self.is_ready():
             return "High-accuracy model ready"
-        if self.load_error is not None and not self._loading:
+        if self.failed:
             return "High-accuracy model could not be loaded — using the standard model"
+        if not self._loading:
+            return QWEN_WAITING
         return "Loading the high-accuracy model…"
+
+    @property
+    def failed(self) -> bool:
+        """The last load failed and no other is under way: it can be tried again."""
+        return self.load_error is not None and not self._loading
 
     def _acquire_model(self):
         """Take an in-use reference so unload() can't close the model out
@@ -652,27 +674,24 @@ class QwenTranscriber:
     def transcribe_file(self, file_path: str | Path, context: str | None = None) -> str:
         model = self._acquire_model()
         try:
-            normalized_path = normalize_media(file_path)
-            try:
+            with converted_media(file_path) as converted:
                 try:
-                    with wave.open(normalized_path, "rb") as wav_file:
+                    with wave.open(converted, "rb") as wav_file:
                         if wav_file.getnframes() == 0:
                             return ""
                 except (wave.Error, OSError):
                     pass  # Not inspectable as WAV: let the model report what it finds.
-                return self._transcript(model, normalized_path, context)
-            finally:
-                try:
-                    os.unlink(normalized_path)
-                except OSError:
-                    pass
+                return self._transcript(model, converted, context)
         finally:
             self._release_model()
             gc.collect()
             mx.clear_cache()
 
 
-def normalize_media(file_path: str | Path) -> str:
+@contextmanager
+def converted_media(file_path: str | Path) -> Iterator[str]:
+    """`file_path` converted by FFmpeg to the app's PCM format, as a
+    temporary WAV file that exists only inside the `with`."""
     file_path = Path(file_path)
     if not file_path.exists():
         raise TranscriptionError(f"Media file not found: {file_path}")
@@ -680,50 +699,29 @@ def normalize_media(file_path: str | Path) -> str:
     ffmpeg_path = resolve_ffmpeg()  # Before the temporary file: it raises when FFmpeg is absent.
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
         temp_path = temp_file.name
-
-    command = [
-        ffmpeg_path,
-        "-v",
-        "error",
-        "-y",
-        "-i",
-        str(file_path),
-        "-ac",
-        "1",
-        "-ar",
-        str(SAMPLE_RATE),
-        "-sample_fmt",
-        "s16",
-        temp_path,
-    ]
-
+    command = [ffmpeg_path, "-v", "error", "-y", "-i", str(file_path),
+               "-ac", "1", "-ar", str(SAMPLE_RATE), "-sample_fmt", "s16", temp_path]
     try:
-        result = subprocess.run(
-            command, capture_output=True, text=True, check=False,
-            timeout=FFMPEG_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired:
         try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-        raise TranscriptionError(
-            f"ffmpeg timed out processing {file_path.name} "
-            f"(limit: {FFMPEG_TIMEOUT_SECONDS}s)"
-        )
-    except OSError as exc:
-        Path(temp_path).unlink(missing_ok=True)
-        raise TranscriptionError(f"Could not start media conversion: {exc}") from exc
-
-    if result.returncode != 0:
+            result = subprocess.run(command, capture_output=True, text=True, check=False,
+                                    timeout=FFMPEG_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise TranscriptionError(
+                f"FFmpeg took over {FFMPEG_TIMEOUT_SECONDS} s to convert the file") from exc
+        except OSError as exc:
+            logger.error(f"FFmpeg at {ffmpeg_path} did not start for {file_path}: {exc}")
+            raise TranscriptionError("FFmpeg did not start") from exc
+        if result.returncode != 0:
+            logger.error(f"FFmpeg could not convert {file_path} (exit {result.returncode}): {result.stderr.strip()}")
+            raise TranscriptionError("FFmpeg could not read the file")
+        yield temp_path
+    finally:
         try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-        stderr = result.stderr.strip() or "ffmpeg failed"
-        raise TranscriptionError(f"Could not process {file_path.name}: {stderr}")
-
-    return temp_path
+            Path(temp_path).unlink(missing_ok=True)
+        except OSError as exc:
+            # The transcript, or the error that brought us here, matters more
+            # than a stray copy in the temporary folder: say where it is.
+            logger.warning(f"Could not delete the converted copy of {file_path.name} at {temp_path}: {exc}")
 
 
 def resolve_ffmpeg() -> str:
@@ -732,7 +730,5 @@ def resolve_ffmpeg() -> str:
     search = os.pathsep.join([os.environ.get("PATH", ""), *(c for c in RUNTIME_BIN_CANDIDATES if os.path.isabs(c))])
     found = shutil.which("ffmpeg", path=search)
     if found is None:
-        raise TranscriptionError(
-            "ffmpeg is required for media file transcription. Install it with `brew install ffmpeg`."
-        )
+        raise TranscriptionError("Importing media needs FFmpeg — install it with brew install ffmpeg")
     return found

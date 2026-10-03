@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import enum
+import functools
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,8 +14,8 @@ from AppKit import (
     NSFontAttributeName, NSFontItalicTrait, NSFontManager, NSFontWeightSemibold, NSForegroundColorAttributeName,
     NSImageView, NSLayoutConstraint, NSLayoutPriorityDefaultLow, NSLinkAttributeName, NSMakeRect, NSMakeSize,
     NSMutableAttributedString, NSMutableParagraphStyle, NSPanel, NSParagraphStyleAttributeName, NSScrollView,
-    NSTextField, NSTextTab, NSTextView, NSViewWidthSizable, NSWindowStyleMaskClosable, NSWindowStyleMaskResizable,
-    NSWindowStyleMaskTitled,
+    NSTextAlignmentLeft, NSTextAlignmentRight, NSTextField, NSTextTab, NSTextView, NSViewWidthSizable,
+    NSWindowStyleMaskClosable, NSWindowStyleMaskResizable, NSWindowStyleMaskTitled,
 )
 from Foundation import NSURL, NSObject
 
@@ -27,6 +28,10 @@ HEIGHT = 440
 MIN_WIDTH = 480
 MIN_HEIGHT = 340
 BULLET_INDENT = 16
+# A numbered item's number ends at NUMBER_END, so the dots of 9. and 10. line
+# up, and its text starts at NUMBER_INDENT ("99." is 18.5 pt wide at 12 pt).
+NUMBER_END = 20
+NUMBER_INDENT = 26
 HEADLINE = "A new version of Maramax is available!"
 NO_NOTES = "This version was published without release notes."
 
@@ -56,16 +61,31 @@ class Link:
     url: str
 
 
-class BlockKind(enum.Enum):
-    HEADING = "heading"
-    BULLET = "bullet"
-    PARAGRAPH = "paragraph"
+Parts = tuple[Run | Link, ...]
 
 
 @dataclass(frozen=True)
-class Block:
-    kind: BlockKind
-    parts: tuple[Run | Link, ...]
+class Heading:
+    parts: Parts
+
+
+@dataclass(frozen=True)
+class Bullet:
+    parts: Parts
+
+
+@dataclass(frozen=True)
+class NumberedItem:
+    number: str     # as written: "2." or "2)"
+    parts: Parts
+
+
+@dataclass(frozen=True)
+class Paragraph:
+    parts: Parts
+
+
+Block = Heading | Bullet | NumberedItem | Paragraph
 
 
 _INLINE = re.compile(
@@ -77,9 +97,10 @@ _INLINE = re.compile(
 )
 _HEADING = re.compile(r"#{1,6}\s+(.*?)\s*#*\s*")
 _BULLET = re.compile(r"\s*[-*+]\s+(.*)")
+_NUMBERED = re.compile(r"\s*(\d{1,9}[.)])\s+(.*)")
 
 
-def inline_parts(text: str) -> tuple[Run | Link, ...]:
+def inline_parts(text: str) -> Parts:
     """One line of Markdown as runs of text and links, without the markup."""
     parts: list[Run | Link] = []
     position = 0
@@ -101,27 +122,33 @@ def inline_parts(text: str) -> tuple[Run | Link, ...]:
 
 
 def note_blocks(markdown: str) -> list[Block]:
-    """Release notes (GitHub Markdown) as headings, bullets, and paragraphs.
-    A line that continues a bullet or paragraph joins it, as Markdown does."""
-    blocks: list[tuple[BlockKind, str]] = []
+    """Release notes (GitHub Markdown) as headings, bullets, numbered items,
+    and paragraphs. A line that continues an item or paragraph joins it, as
+    Markdown does."""
+    # Each block's text is gathered first (a later line may continue it),
+    # with what makes the block once its text is complete.
+    blocks: list[tuple[Callable[[Parts], Block], str]] = []
     open_block = False  # Whether the next plain line continues the last block.
     for line in markdown.replace("\r\n", "\n").split("\n"):
-        heading, bullet = _HEADING.fullmatch(line), _BULLET.fullmatch(line)
+        heading, bullet, numbered = _HEADING.fullmatch(line), _BULLET.fullmatch(line), _NUMBERED.fullmatch(line)
         if not line.strip():
             open_block = False
         elif heading:
-            blocks.append((BlockKind.HEADING, heading.group(1)))
+            blocks.append((Heading, heading.group(1)))
             open_block = False
         elif bullet:
-            blocks.append((BlockKind.BULLET, bullet.group(1).strip()))
+            blocks.append((Bullet, bullet.group(1).strip()))
+            open_block = True
+        elif numbered:
+            blocks.append((functools.partial(NumberedItem, numbered.group(1)), numbered.group(2).strip()))
             open_block = True
         elif open_block:
-            kind, text = blocks[-1]
-            blocks[-1] = (kind, f"{text} {line.strip()}")
+            make, text = blocks[-1]
+            blocks[-1] = (make, f"{text} {line.strip()}")
         else:
-            blocks.append((BlockKind.PARAGRAPH, line.strip()))
+            blocks.append((Paragraph, line.strip()))
             open_block = True
-    return [Block(kind, inline_parts(text)) for kind, text in blocks]
+    return [make(inline_parts(text)) for make, text in blocks]
 
 
 def offer_text(version: str, current_version: str) -> str:
@@ -285,19 +312,24 @@ def rendered_notes(blocks: list[Block]):
         style = NSMutableParagraphStyle.alloc().init()
         style.setParagraphSpacing_(5)
         size = 12
-        if block.kind is BlockKind.HEADING:
+        if isinstance(block, Heading):
             size = 13
             style.setParagraphSpacingBefore_(0 if index == 0 else 8)
-        elif block.kind is BlockKind.PARAGRAPH and index > 0 and blocks[index - 1].kind is BlockKind.BULLET:
+        elif isinstance(block, Paragraph) and index > 0 and isinstance(blocks[index - 1], Bullet | NumberedItem):
             style.setParagraphSpacingBefore_(6)  # Text after a list stands apart from its last item.
-        elif block.kind is BlockKind.BULLET:
+        elif isinstance(block, Bullet):
             style.setHeadIndent_(BULLET_INDENT)
-            style.setTabStops_([NSTextTab.alloc().initWithTextAlignment_location_options_(0, BULLET_INDENT, {})])
+            style.setTabStops_([_tab(NSTextAlignmentLeft, BULLET_INDENT)])
+        elif isinstance(block, NumberedItem):
+            style.setHeadIndent_(NUMBER_INDENT)
+            style.setTabStops_([_tab(NSTextAlignmentRight, NUMBER_END), _tab(NSTextAlignmentLeft, NUMBER_INDENT)])
         base = {NSParagraphStyleAttributeName: style, NSForegroundColorAttributeName: NSColor.labelColor(),
                 NSFontAttributeName: (NSFont.systemFontOfSize_weight_(size, NSFontWeightSemibold)
-                                      if block.kind is BlockKind.HEADING else NSFont.systemFontOfSize_(size))}
-        if block.kind is BlockKind.BULLET:
+                                      if isinstance(block, Heading) else NSFont.systemFontOfSize_(size))}
+        if isinstance(block, Bullet):
             _append(text, "•\t", base)
+        elif isinstance(block, NumberedItem):
+            _append(text, f"\t{block.number}\t", base)
         for part in block.parts:
             url = NSURL.URLWithString_(part.url) if isinstance(part, Link) else None
             if url is not None:
@@ -309,6 +341,10 @@ def rendered_notes(blocks: list[Block]):
         if index < len(blocks) - 1:
             _append(text, "\n", base)
     return text
+
+
+def _tab(alignment, location):
+    return NSTextTab.alloc().initWithTextAlignment_location_options_(alignment, location, {})
 
 
 def _append(text, string, attributes):

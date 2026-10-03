@@ -46,7 +46,7 @@ class Step(enum.Enum):
     CHECKING = "checking"
     PROMPTING = "prompting"      # the Software Update window waits for an answer
     DOWNLOADING = "downloading"
-    CANCELLING = "cancelling"    # Cancel pressed; the download stops at its next block or timeout
+    CANCELLING = "cancelling"    # Cancel pressed; the download stops, or the staged app is discarded
     INSTALLING = "installing"    # downloaded and verified; waiting to quit
 
 
@@ -60,11 +60,12 @@ LastCheck = Literal["not checked", "succeeded"] | CheckFailed
 
 
 def menu_title(step: Step, version: str | None, percent: int | None = None) -> str:
-    """What the menu item says. `version` is the newer release, once known."""
+    """What the menu item says. `version` is the newer release, once known.
+    The menu is a fixed width, so every title stays short."""
     if step is Step.CHECKING:
         return "Checking for Updates…"
     if step is Step.DOWNLOADING:
-        return f"Downloading Maramax {version}… {percent or 0}%"
+        return f"Downloading Update… {percent or 0}%"
     if step is Step.CANCELLING:
         return "Cancelling the Update…"
     if step is Step.INSTALLING:
@@ -74,14 +75,14 @@ def menu_title(step: Step, version: str | None, percent: int | None = None) -> s
 
 def status_text(*, step: Step, version: str | None, percent: int | None, last_check: LastCheck,
                 updated_to: str | None = None) -> str:
-    """The sentence under Settings → Updates. `updated_to` is set on the
+    """The sentence under Settings → Advanced → Updates. `updated_to` is set on the
     first launch after an update installed."""
     if step is Step.CHECKING:
         return "Checking for updates…"
     if step is Step.DOWNLOADING:
         return f"Downloading Maramax {version}… {percent or 0}%"
     if step is Step.CANCELLING:
-        return f"Cancelling the download of Maramax {version}…"
+        return f"Cancelling the update to Maramax {version}…"
     if step is Step.INSTALLING:
         return f"Maramax {version} is ready and installs as soon as Maramax is idle."
     if version:
@@ -268,9 +269,9 @@ class UpdateOffer:
     def _offer(self, release: updater.Release, asked: bool) -> None:
         """Open the Software Update window. While it waits, PROMPTING keeps
         the daily check from offering again; the answer comes to _answered."""
-        self._set_step(Step.PROMPTING)
         if self._prompt is None:
             self._prompt = UpdatePromptWindow.alloc().initWithChoice_(self._answered)
+        self._set_step(Step.PROMPTING)
         # A check that ran by itself leaves the keyboard where the user is typing.
         self._prompt.show(version=release.version, current_version=self._current, notes=release.notes,
                           size=download_size((release.delta or release.archive).size), activate=asked)
@@ -313,8 +314,12 @@ class UpdateOffer:
         """The progress window's Cancel: stop the download, or the install
         that is waiting for the app to be idle."""
         self._cancel.set()
-        if self._step is Step.DOWNLOADING:
-            self._set_step(Step.CANCELLING)  # A stalled read can take a while to give up.
+        if self._step in (Step.DOWNLOADING, Step.INSTALLING):
+            # Said at once, though a stalled read can take a while to give up
+            # and the wait for idle looks again only every few seconds. Never
+            # IDLE here: a new download would replace self._cancel, and the
+            # look still to come would then install the app it should discard.
+            self._set_step(Step.CANCELLING)
         if self._window is not None:
             self._window.close()
 
@@ -418,6 +423,7 @@ class UpdateOffer:
         except updater.UpdateError as exc:
             logger.error(str(exc))
             self._set_step(Step.IDLE)
+            self._discard(staged_app)  # A retry downloads it again.
             if self._window is not None:
                 self._window.close()
             rumps.alert(title="The update could not be installed", message=str(exc))
@@ -427,8 +433,16 @@ class UpdateOffer:
         self._quit_app()
 
     def _quit_did_not_happen(self) -> None:
-        # Still here: the swap script will give up and change nothing.
+        # Still here: the swap script has given up and changed nothing.
         logger.error("Maramax did not quit to install the update")
+        try:
+            # Taken now, so the next launch does not report this attempt again.
+            outcome = updater.take_install_result(self._paths.result)
+        except updater.UpdateError as exc:
+            logger.warning(str(exc))
+        else:
+            if outcome is not None:
+                logger.info(f"The installer gave up waiting for Maramax to quit ({outcome})")
         self._set_step(Step.IDLE)
         if self._window is not None:
             self._window.close()

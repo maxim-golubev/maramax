@@ -27,11 +27,12 @@ def download_size(size: int) -> str:
     return f"{max(1, round(size / 1024))} KB"
 
 
-def progress_state(received: int, expected: int) -> tuple[str, float | None]:
-    """What the window says and how full the bar is (None: still working,
-    with no measure of how far along)."""
+def progress_state(received: int, expected: int) -> tuple[str, float]:
+    """What the window says and how full the bar is. Full once every byte
+    has arrived, and it stays full while the download is checked and
+    Maramax restarts."""
     if received >= expected:
-        return "Checking the download…", None
+        return "Checking the download…", 1.0
     return f"{download_size(received)} of {download_size(expected)}", received / expected
 
 
@@ -55,6 +56,7 @@ class UpdateProgressWindow(NSObject):
         self.title.setFrame_(NSMakeRect(TEXT_LEFT, HEIGHT - 40, inner, 18))
         self.bar = NSProgressIndicator.alloc().initWithFrame_(NSMakeRect(TEXT_LEFT, HEIGHT - 68, inner, 20))
         self.bar.setStyle_(NSProgressIndicatorStyleBar)
+        self.bar.setIndeterminate_(False)
         self.bar.setMinValue_(0.0)
         self.bar.setMaxValue_(1.0)
         self.detail = NSTextField.labelWithString_("")
@@ -76,7 +78,7 @@ class UpdateProgressWindow(NSObject):
     def show(self, version):
         self.title.setStringValue_(f"Downloading Maramax {version}…")
         self.detail.setStringValue_("Starting the download…")
-        self._determinate(0.0)
+        self.bar.setDoubleValue_(0.0)
         self.cancel.setEnabled_(True)
         if not self.panel.isVisible():
             self.panel.center()
@@ -87,10 +89,7 @@ class UpdateProgressWindow(NSObject):
     def show_progress(self, received, expected):
         text, fraction = progress_state(received, expected)
         self.detail.setStringValue_(text)
-        if fraction is None:
-            self._indeterminate()
-        else:
-            self._determinate(fraction)
+        self.bar.setDoubleValue_(fraction)
 
     @objc.python_method
     def show_ready(self, version, busy):
@@ -99,7 +98,7 @@ class UpdateProgressWindow(NSObject):
                                     else "Maramax restarts in a moment.")
         # Also after "Restarting…" gave way to waiting again: the wait can still be cancelled.
         self.cancel.setEnabled_(True)
-        self._indeterminate()
+        self.bar.setDoubleValue_(1.0)
 
     @objc.python_method
     def bring_forward(self):
@@ -112,23 +111,11 @@ class UpdateProgressWindow(NSObject):
         self.title.setStringValue_("Restarting Maramax…")
         self.detail.setStringValue_("It opens again in a moment.")
         self.cancel.setEnabled_(False)
-        self._indeterminate()
+        self.bar.setDoubleValue_(1.0)
 
     @objc.python_method
     def close(self):
-        self.bar.stopAnimation_(None)
         self.panel.orderOut_(None)
-
-    @objc.python_method
-    def _determinate(self, fraction):
-        self.bar.stopAnimation_(None)
-        self.bar.setIndeterminate_(False)
-        self.bar.setDoubleValue_(fraction)
-
-    @objc.python_method
-    def _indeterminate(self):
-        self.bar.setIndeterminate_(True)
-        self.bar.startAnimation_(None)
 
     def cancel_(self, sender):
         del sender

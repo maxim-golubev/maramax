@@ -16,7 +16,7 @@ from Foundation import NSObject
 from PyObjCTools import AppHelper
 
 from .main_thread import call_later
-from .recordings import MAX_ARCHIVE_BYTES, MAX_RECORDINGS, RecordingStatus
+from .recordings import MAX_ARCHIVE_BYTES, RecordingStatus
 
 _STATUS_LABELS = {
     RecordingStatus.DONE: "transcribed",
@@ -24,12 +24,22 @@ _STATUS_LABELS = {
     RecordingStatus.FAILED: "no transcript",
     RecordingStatus.CANCELLED: "cancelled",
 }
+# What the window says in place of a transcript, by why there is none.
+_NO_TRANSCRIPT = {
+    RecordingStatus.DONE: "The transcript was empty.",
+    RecordingStatus.SAVED: "Not transcribed yet. Use Transcribe Again.",
+    RecordingStatus.FAILED: "No transcript was made. Play it to hear what was recorded, or Transcribe Again.",
+    RecordingStatus.CANCELLED: "Cancelled before a transcript was made. Use Transcribe Again.",
+}
 WIDTH = 640
 HEIGHT = 390
 MARGIN = 20
 ROW = 32
-RETENTION_NOTE = (f"Stored on this Mac · Up to {MAX_RECORDINGS} recordings / "
-                  f"{MAX_ARCHIVE_BYTES // (1024 * 1024)} MB; the newest is always kept")
+
+
+def retention_note(limit: int) -> str:
+    return (f"Stored on this Mac · Up to {limit} recordings / {MAX_ARCHIVE_BYTES // (1024 * 1024)} MB; "
+            "the newest is always kept")
 
 
 class RecordingsController(NSObject):
@@ -41,7 +51,7 @@ class RecordingsController(NSObject):
         self.store = store
         self.records = []
         self.sound = None
-        self._saving = None  # the thread copying a WAV out, once Save Audio has been used
+        self._saving: list[threading.Thread] = []  # Save Audio copies, each in a thread of its own
         self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(0, 0, WIDTH, HEIGHT), NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
             NSBackingStoreBuffered, False,
@@ -69,7 +79,7 @@ class RecordingsController(NSObject):
         self.play = self._button("Play", "playAudio:")
         self.save = self._button("Save Audio…", "saveAudio:")
         self.retry = self._button("Transcribe Again", "retry:")
-        self.note = NSTextField.labelWithString_(RETENTION_NOTE)
+        self.note = NSTextField.labelWithString_(retention_note(store.limit))
         self.note.setFrame_(NSMakeRect(MARGIN, 13, inner, 18))
         self.note.setFont_(NSFont.systemFontOfSize_(11))
         self.note.setTextColor_(NSColor.secondaryLabelColor())
@@ -104,6 +114,7 @@ class RecordingsController(NSObject):
     @objc.python_method
     def refresh(self):
         selected = self.selected()
+        self.note.setStringValue_(retention_note(self.store.limit))  # The limit is chosen in Settings.
         self.records = self.store.list_recordings()
         self.picker.removeAllItems()
         for record in self.records:
@@ -131,10 +142,12 @@ class RecordingsController(NSObject):
 
     @objc.python_method
     def show_busy_state(self):
-        """Playing and transcribing again wait for a dictation or transcription to end."""
+        """Playing and transcribing again wait for a dictation or transcription
+        to end; a recording already playing can still be stopped."""
         record = self.selected()
-        for button in (self.play, self.retry):
-            button.setEnabled_(record is not None and not self.delegate.is_busy)
+        free = record is not None and not self.delegate.is_busy
+        self.retry.setEnabled_(free)
+        self.play.setEnabled_(free or self.sound is not None)
 
     @objc.python_method
     def _show_selected(self):
@@ -152,7 +165,8 @@ class RecordingsController(NSObject):
         details = f"Microphone: {device}\nRecorded audio: {record.duration:.1f} seconds"
         if record.message:
             details += f"\n{record.message}"
-        transcript = record.text or "No transcript yet. Use Play or Save Audio to inspect the capture."
+        # A status written by a newer version has no sentence here.
+        transcript = record.text or _NO_TRANSCRIPT.get(record.status, "No transcript.")
         if record.raw_text and record.raw_text != record.text:
             transcript += f"\n\nBefore word replacements:\n{record.raw_text}"
         self.text.setString_(details + "\n\n" + transcript)
@@ -171,11 +185,12 @@ class RecordingsController(NSObject):
             self.sound.stop()
             self.sound = None
         self.play.setTitle_("Play")
+        self.show_busy_state()
 
     def selectionChanged_(self, sender):
         del sender
         self.stop_playback()
-        self.note.setStringValue_(RETENTION_NOTE)
+        self.note.setStringValue_(retention_note(self.store.limit))
         self._show_selected()
 
     def playAudio_(self, sender):
@@ -198,8 +213,7 @@ class RecordingsController(NSObject):
         if sound is not self.sound:
             return
         if not sound.isPlaying():
-            self.sound = None
-            self.play.setTitle_("Play")
+            self.stop_playback()
         else:
             call_later(0.25, self._check_playback, sound)
 
@@ -223,13 +237,14 @@ class RecordingsController(NSObject):
                 message = f"Could not save audio: {exc}"
             AppHelper.callAfter(self.note.setStringValue_, message)
 
-        self._saving = threading.Thread(target=save, daemon=True)
-        self._saving.start()
+        thread = threading.Thread(target=save, daemon=True)
+        self._saving = [running for running in self._saving if running.is_alive()] + [thread]
+        thread.start()
 
     @objc.python_method
     def is_saving(self):
         """A WAV is still being copied out: quitting now would cut it short."""
-        return self._saving is not None and self._saving.is_alive()
+        return any(thread.is_alive() for thread in self._saving)
 
     def retry_(self, sender):
         del sender

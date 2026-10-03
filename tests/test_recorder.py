@@ -99,11 +99,8 @@ def test_zombie_callback_cannot_write_into_a_new_recording(recorder):
     assert recorder.capture_snapshot().callbacks == 0
 
 
-def test_repeated_driver_failures_require_restart_instead_of_leaking_forever(recorder):
-    recorder.abandoned_sessions = 2
-    assert recorder.start() is False
-    assert "restart" in str(recorder.last_error)
-    assert FakeAudio.opens == []
+def test_listing_names_every_input_in_portaudio_order(recorder):
+    assert recorder.list_input_devices() == ["MacBook Pro Microphone", "AirPods"]
 
 
 def test_constructing_and_closing_recorder_does_not_initialize_audio(monkeypatch):
@@ -131,7 +128,7 @@ def test_repeated_sessions_release_workers_and_streams(recorder):
         assert recorder._stream is None
         assert recorder.frames == []
         assert recorder.capture_snapshot().callbacks == 1
-        assert recorder.abandoned_sessions == 0
+        assert not recorder.session_abandoned
         previous_callback = stream.callback
 
 
@@ -183,9 +180,16 @@ def test_rearm_starts_a_fresh_recording_on_the_open_stream(recorder):
 def test_wedged_close_reports_that_the_process_must_not_record_again(recorder):
     assert recorder.start()
     recorder._stream.callback(b"\x01\x00" * 512, 512, {}, 0)
-    recorder.abandoned_sessions = 1  # What a wedged Pa_StopStream leaves behind.
+    recorder.session_abandoned = True  # What a wedged Pa_StopStream leaves behind.
     assert recorder.cleanup() is False
     assert recorder.cleanup() is False
+
+
+def test_reopen_after_an_abandoned_session_fails_with_the_reason(recorder):
+    assert recorder.start()
+    recorder.session_abandoned = True  # PortAudio's device list is frozen in this process.
+    assert recorder.reopen() is False
+    assert "could not be rebuilt" in str(recorder.last_error)
 
 
 def test_clean_shutdown_reports_portaudio_released(recorder):

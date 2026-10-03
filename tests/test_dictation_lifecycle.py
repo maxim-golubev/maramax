@@ -17,12 +17,15 @@ def controller(monkeypatch):
     app = object.__new__(module.DictationApp)
     calls = []
     app.config = AppConfig()
-    app.transcriber = SimpleNamespace(is_ready=lambda: True, status_message=lambda: "Speech model ready",
+    app.transcriber = SimpleNamespace(is_ready=lambda: True, status_message=lambda: "Speech model ready", load_error=None,
                                       start_drafts=lambda **_kw: calls.append("drafts") or True,
                                       finish_drafts=lambda: True)
+    app.qwen = SimpleNamespace(failed=False, unload=lambda: calls.append("qwen unloaded"))
+    app.retry_model_item = SimpleNamespace(hidden=True)
     app.recorder = SimpleNamespace(start=lambda cancel: True, last_error=None, frames=[],
                                   capture_snapshot=CaptureMeter().snapshot, prepare=lambda: calls.append("helper"))
     app._shutting_down = False
+    app._hotkey_error_message = None
     app._session = 0
     app._phase = Phase.IDLE
     app.overlay_visible = False
@@ -39,6 +42,7 @@ def controller(monkeypatch):
     app._welcome_window = None
     app.history_store = SimpleNamespace(render=lambda: None)
     app._previous_app = None
+    app.current_transcript = ""
     app._capture_health = None
     app._capture_device = ""
     app._capture_warning = ""
@@ -52,6 +56,7 @@ def controller(monkeypatch):
         show_mode=lambda _mode: calls.append("activated window"),
         focus=lambda: calls.append("focused"),
         set_history_text=lambda _text: None,
+        set_intro_text=lambda _text: None,
         show_active_microphone=lambda _name: None,
         set_capture=lambda _snapshot: None,
         set_transcribing=lambda _on: None,
@@ -180,18 +185,17 @@ def test_expanding_during_transcription_preserves_original_paste_target(monkeypa
     assert not app._hide_window_when_done  # The user asked to see it: it stays open.
 
 
-def test_opening_the_window_while_idle_targets_the_app_now_in_front(monkeypatch):
+def test_opening_the_window_while_idle_takes_over_the_display(monkeypatch):
+    """The paste target is chosen when a dictation starts, not here."""
     app, _ = controller(monkeypatch)
-    app._previous_app = "an app left long ago"
     app.current_transcript = ""
     app.open_transcript_window()
-    assert app._previous_app == "the app in front"
     assert app._session == 1
 
 
 def test_failed_microphone_start_does_not_leave_connecting_as_the_resting_status(monkeypatch):
     app, calls = controller(monkeypatch)
-    app._resting_status = "Connecting microphone…"
+    app._resting_status = module.WAIT_TO_SPEAK_STATUS
     app._phase = Phase.CONNECTING
     app._hide_window_when_done = True
     app.recorder.last_error = RuntimeError("Selected microphone disconnected: AirPods")
@@ -285,11 +289,15 @@ def test_bar_stays_longer_for_a_problem_than_for_a_clean_result(monkeypatch):
     app, calls = controller(monkeypatch)
     app._compact_session = True
     app._phase = Phase.TRANSCRIBING
-    app._complete_operation_on_main(0, module.BAR_SECONDS_AFTER_SUCCESS)
-    assert calls[-1] == ("bar finished", module.BAR_SECONDS_AFTER_SUCCESS)
-    app._phase = Phase.TRANSCRIBING
+    app._last_status = module.COPIED_STATUS
     app._complete_operation_on_main(0)
-    assert calls[-1] == ("bar finished", module.BAR_SECONDS_AFTER_PROBLEM)
+    assert calls[-1] == ("bar finished", module.BAR_SECONDS_AFTER_SUCCESS)
+    # A paste that could not happen, a transcript kept in Maramax, a warning: each gets time to be read.
+    for shown in (module.NOT_PERMITTED_STATUS, module.NOT_COPIED_STATUS, module.INCOMPLETE_STATUS):
+        app._phase = Phase.TRANSCRIBING
+        app._last_status = shown
+        app._complete_operation_on_main(0)
+        assert calls[-1] == ("bar finished", module.BAR_SECONDS_AFTER_PROBLEM)
 
 
 def test_dictation_started_behind_the_queue_dialog_is_not_overrun(monkeypatch):
@@ -389,7 +397,7 @@ def test_recover_transcribes_an_unsaved_recording_into_the_archive(monkeypatch, 
     app.recover_last_recording()
     assert chosen == recovery.unsaved_recordings(tmp_path)
     app._final_transcribe_pcm = lambda _pcm: "Words"
-    app._publish_transcript = lambda text, *_args: (text, True)
+    app._publish_transcript = lambda text, *_args: text
     app._recover_worker(0, chosen[0])
     records = app.recordings.list_recordings()
     assert [(record.status, record.text) for record in records] == [("done", "Words")]
@@ -423,6 +431,13 @@ def test_microphone_settings_reach_the_recorder_through_one_place(monkeypatch):
     monkeypatch.setattr(module.threading, "Thread", lambda **kwargs: threads.append(kwargs["target"]) or SimpleNamespace(start=kwargs["target"]))
     app.select_input_device("AirPods")
     app.set_keep_microphone_ready(120)
+    app.history_store = SimpleNamespace(history_limit=100, render=lambda: None)
+    app.set_history_limit(500)
+    assert app.config.history_limit == app.history_store.history_limit == 500
+    app.recordings = SimpleNamespace(limit=20)
+    app._recordings_window = None
+    app.set_recordings_limit(50)
+    assert app.config.recordings_limit == app.recordings.limit == 50
     assert (app.recorder.device_name, app.recorder.prefer_builtin, app.recorder.keep_warm_seconds) == ("AirPods", True, 120)
     assert released == [True, True]  # A device kept open under the old settings is let go.
     app._phase = Phase.RECORDING
@@ -430,26 +445,45 @@ def test_microphone_settings_reach_the_recorder_through_one_place(monkeypatch):
     assert app.config.input_device == "AirPods"  # Refused mid-recording.
 
 
-def test_queue_summary_covers_every_outcome():
+def test_queue_summary_covers_every_outcome_and_says_why_files_failed():
     summary = module.queue_run_summary
-    assert summary(cancelled=False, exported="Copied 2 transcripts to clipboard", export_error=None, any_failed=False) == "Copied 2 transcripts to clipboard"
-    assert summary(cancelled=True, exported="Saved 1 file to /x", export_error=None, any_failed=False) == "Queue cancelled. Saved 1 file to /x"
-    assert summary(cancelled=True, exported=None, export_error="disk full", any_failed=False) == "Queue cancelled"
-    assert summary(cancelled=False, exported=None, export_error="disk full", any_failed=False) == "Export failed: disk full"
-    assert summary(cancelled=False, exported=None, export_error=None, any_failed=True) == "All items failed"
-    assert summary(cancelled=False, exported=None, export_error=None, any_failed=False) == "No transcription output"
+    ffmpeg = "Importing media needs FFmpeg — install it with brew install ffmpeg"
+    assert summary(cancelled=False, exported="Copied 2 transcripts to clipboard", export_error=None,
+                   failures=[]) == "Copied 2 transcripts to clipboard"
+    assert summary(cancelled=True, exported="Saved 1 transcript to Transcripts", export_error=None,
+                   failures=[]) == "Queue cancelled. Saved 1 transcript to Transcripts"
+    assert summary(cancelled=True, exported=None, export_error="disk full", failures=[]) == "Queue cancelled"
+    assert summary(cancelled=False, exported=None, export_error="disk full", failures=[]) == "Export failed: disk full"
+    assert summary(cancelled=False, exported="Copied 1 transcript to clipboard", export_error=None,
+                   failures=[ffmpeg]) == "Copied 1 transcript to clipboard — 1 file failed, see the Queue tab"
+    # One reason for every failure is the one worth reading: FFmpeg is missing.
+    assert summary(cancelled=False, exported=None, export_error=None,
+                   failures=[ffmpeg, ffmpeg, ffmpeg]) == f"Nothing transcribed — 3 files failed ({ffmpeg})"
+    assert summary(cancelled=False, exported=None, export_error=None,
+                   failures=[ffmpeg, "No speech detected"]) == "Nothing transcribed — 2 files failed (see the Queue tab)"
+    assert summary(cancelled=False, exported=None, export_error=None, failures=[]) == "No files were transcribed"
 
 
 def test_empty_capture_outcomes():
     outcome = module.empty_capture_outcome
-    base = dict(has_audio=True, has_signal=True, faint=False, cancelled=False, audio_kept=True)
-    assert outcome(**base) == ("failed", "No transcript returned — audio kept for retry")
-    assert outcome(**base | {"faint": True})[1] == "No speech heard — signal too faint; audio kept for retry"
-    assert outcome(**base | {"has_signal": False})[1] == "Microphone delivered silence — check your input"
-    assert outcome(**base | {"has_audio": False, "has_signal": False})[1].startswith("No audio received")
-    assert outcome(**base | {"cancelled": True}) == ("cancelled", "Cancelled — audio kept for retry")
-    assert outcome(**base | {"cancelled": True, "audio_kept": False})[1] == "Cancelled — could not save audio"
-    assert outcome(**base | {"audio_kept": False})[1] == "No transcript returned — could not save audio"
+    base = dict(has_audio=True, has_signal=True, faint=False, cancelled=False, place=module.AudioPlace.ARCHIVED,
+                ready=True)
+    assert outcome(**base) == ("failed", "No speech detected — audio saved in Recordings")
+    assert outcome(**base | {"faint": True})[1] == "No speech heard — the microphone was too quiet; audio saved in Recordings"
+    assert outcome(**base | {"has_signal": False})[1] == "The microphone sent only silence — check your input and Privacy & Security → Microphone"
+    assert outcome(**base | {"has_audio": False, "has_signal": False})[1].startswith("No audio from the microphone")
+    assert outcome(**base | {"cancelled": True}) == ("cancelled", "Cancelled — audio saved in Recordings")
+    assert outcome(**base | {"cancelled": True, "place": module.AudioPlace.LOST})[1] == "Cancelled — the audio could not be saved"
+    assert outcome(**base | {"place": module.AudioPlace.LOST})[1] == "No speech detected — the audio could not be saved"
+    assert outcome(**base | {"place": module.AudioPlace.UNSAVED})[1] == (
+        "No speech detected — audio kept; it moves to Recordings at the next launch")
+
+
+def test_a_failure_reads_as_outcome_then_explanation_on_the_bar():
+    from parakeet_dictation.indicator import split_status
+    assert split_status(module.failure_text("Engine failed", module.AudioPlace.ARCHIVED)) == ("Engine failed", "Audio saved in Recordings")
+    stalled = module.failure_text(module.ENGINE_STALLED, module.AudioPlace.ARCHIVED)       # Keeps its own explanation first.
+    assert split_status(stalled) == ("Transcription engine stalled", "Restart the app; audio saved in Recordings")
 
 
 def test_recovery_marks_a_recording_it_tried_so_the_next_press_moves_on(monkeypatch, tmp_path):
@@ -498,7 +532,7 @@ def test_cancelling_while_the_microphone_connects_closes_the_window(monkeypatch)
     app, calls = controller(monkeypatch)
     app.overlay_visible = True
     app._phase = Phase.CONNECTING
-    app.dismiss_requested()                  # Esc or Close while "Connecting microphone…".
+    app.dismiss_requested()                  # Esc or Close while it says "Don’t speak yet".
     monkeypatch.setattr(module.threading, "Thread", lambda **kwargs: SimpleNamespace(start=lambda: None))
     app._recording_started(False, 0)
     assert "window hidden" in calls and not app.overlay_visible
@@ -550,26 +584,145 @@ def test_an_update_waits_for_an_outcome_on_the_bar_and_for_audio_being_saved(mon
     assert app._is_in_use()
 
 
-def test_a_menu_line_leaves_the_menu_for_the_instant_its_text_changes():
-    """An open menu narrows only when an item leaves it: without this, a long
-    status left the menu wide after it changed to "Ready"."""
-    line = module.MenuLine("Status: Preparing the speech model — the first launch downloads it")
-    real, calls = line._menuitem, []
 
-    class Watched:
-        def title(self):
-            return real.title()
 
-        def setTitle_(self, text):
-            calls.append(("title", str(text)))
-            real.setTitle_(text)
+def test_recovered_audio_is_dated_when_it_was_spoken(monkeypatch, tmp_path):
+    """A capture whose archive write failed is moved in at the next launch,
+    after later dictations: it must not be listed, or pruned, as the newest."""
+    import os
+    import time
 
-        def setHidden_(self, hidden):
-            calls.append(("hidden", bool(hidden)))
-            real.setHidden_(hidden)
-    line._menuitem = Watched()
-    line.title = "Status: Ready"
-    assert calls == [("hidden", True), ("title", "Status: Ready"), ("hidden", False)]
-    assert str(real.title()) == "Status: Ready" and not real.isHidden()
-    line.title = "Status: Ready"                 # Nothing changed: the menu is left alone.
-    assert len(calls) == 3
+    from parakeet_dictation import recovery
+
+    app, _ = controller(monkeypatch)
+    app.recordings = RecordingStore(tmp_path / "recordings")
+    app._support_dir = tmp_path
+    recovery.in_progress_path(tmp_path).write_bytes(b"\x01\x00" * 16000)
+    spoken = time.time() - 2 * 24 * 3600
+    os.utime(recovery.in_progress_path(tmp_path), (spoken, spoken))
+    recovery.promote_in_progress(tmp_path)  # Its archive write failed.
+    later = app.recordings.save(b"\x02\x00" * 16000)
+    app._adopt_recovered_audio()
+    newest_first = app.recordings.list_recordings()
+    assert [record.id for record in newest_first][0] == later.id
+    assert app.recordings.load_pcm(newest_first[1].id) == b"\x01\x00" * 16000
+
+
+def test_copy_last_transcript_falls_back_to_history_after_a_relaunch(monkeypatch):
+    app, calls = controller(monkeypatch)
+    app.current_transcript = ""
+    app.overlay_controller.current_text = ""
+    copied = []
+    app._copy_text_with_feedback = lambda text, **_kw: copied.append(text) or True
+    app.history_store.list_entries = lambda: []
+    app.copy_current_transcript()
+    assert calls[-1] == "No transcript to copy" and copied == []
+    app.history_store.list_entries = lambda: [SimpleNamespace(text="Newest words "), SimpleNamespace(text="Older")]
+    app.copy_current_transcript()
+    assert copied == ["Newest words"]
+
+
+def test_the_idle_status_keeps_saying_the_shortcut_does_not_work(monkeypatch):
+    """Finishing a dictation started from the menu must not bury a shortcut problem under "Ready"."""
+    app, _ = controller(monkeypatch)
+    assert app._idle_status() == "Ready"
+    app._hotkey_error_message = module.unregistered_status("Option+Space")
+    app._compact_session = False
+    app._refresh_recordings_window = lambda: None
+    app.indicator.finish = lambda message, duration: None
+    app._complete_operation_on_main(0)
+    assert app._resting_status == module.unregistered_status("Option+Space")
+    app._hotkey_error_message = None
+    app.transcriber.is_ready = lambda: False
+    assert app._idle_status() == "Speech model ready"   # The stub's status message: not "Ready" before it is.
+
+
+def test_the_menu_offers_a_model_retry_only_after_a_failed_load(monkeypatch):
+    app, _ = controller(monkeypatch)
+    app.retry_model_item.hidden = None
+    app.transcriber.load_error = None
+    app._show_model_state()
+    assert app.retry_model_item.hidden is True
+    app.transcriber.load_error = RuntimeError("offline")
+    app._show_model_state()
+    assert app.retry_model_item.hidden is False
+    # A failed high-accuracy model stops needing a retry once it is turned off.
+    app.transcriber.load_error = None
+    app.config.high_accuracy = True
+    app.qwen.failed = True
+    app._show_model_state()
+    assert app.retry_model_item.hidden is False
+    app._save_settings = lambda: True
+    app.toggle_setting("high_accuracy")
+    assert app.retry_model_item.hidden is True
+
+
+def test_the_menu_shows_the_dictation_shortcut_as_the_layout_names_it(monkeypatch):
+    from AppKit import NSEventModifierFlagControl, NSEventModifierFlagOption
+
+    app, _ = controller(monkeypatch)
+    shown = {}
+    app.record_menu = SimpleNamespace(_menuitem=SimpleNamespace(
+        setKeyEquivalent_=lambda key: shown.update(key=key),
+        setKeyEquivalentModifierMask_=lambda mask: shown.update(mask=mask)))
+    monkeypatch.setattr(module, "layout_key_names", lambda: KEY_NAMES)
+    app._show_shortcut_in_menu()
+    assert shown == {"key": " ", "mask": NSEventModifierFlagOption}          # Option+Space
+    app._dictate = module.dictation_shortcut(0x02, controlKey | optionKey, KEY_NAMES)
+    app._show_shortcut_in_menu()
+    assert shown == {"key": "d", "mask": NSEventModifierFlagControl | NSEventModifierFlagOption}
+
+
+def test_pressing_the_shortcut_after_a_failed_model_load_tries_again(monkeypatch):
+    app, calls = controller(monkeypatch)
+    app.transcriber.is_ready = lambda: False
+    app.transcriber.load_error = RuntimeError("offline")
+    app.retry_speech_model = lambda: calls.append("retry")
+    app.config.compact_dictation = False
+    assert not app.start_recording()
+    assert "retry" in calls
+    app.transcriber.load_error = None                     # Still loading: nothing to retry.
+    calls.clear()
+    app.start_recording()
+    assert "retry" not in calls
+
+
+def test_retry_also_reloads_a_high_accuracy_model_whose_download_failed(monkeypatch):
+    app, calls = controller(monkeypatch)
+    app.config.high_accuracy = True
+    app.transcriber.retry_loading = lambda: False                    # The standard model is fine.
+    app.qwen = SimpleNamespace(failed=True, start_loading=lambda: calls.append("qwen load"),
+                               status_message=lambda: "Loading the high-accuracy model…")
+    app.retry_model_item = SimpleNamespace(hidden=True)
+    app._preferences_window = None
+    assert app.models_failed()
+    app.retry_speech_model()
+    assert "qwen load" in calls
+    app.config.high_accuracy = False                                 # Not wanted: nothing to retry.
+    assert not app.models_failed()
+
+
+def test_stopping_while_the_microphone_still_connects_is_not_blamed_on_the_microphone():
+    outcome = module.empty_capture_outcome(has_audio=True, has_signal=False, faint=True, cancelled=False,
+                                           place=module.AudioPlace.ARCHIVED, ready=False)
+    assert outcome == ("cancelled", "Stopped before the microphone was ready — nothing was recorded")
+
+
+def test_a_confirmed_clear_deletes_every_recording_and_kept_capture(monkeypatch, tmp_path):
+    from parakeet_dictation import recovery
+
+    app, calls = controller(monkeypatch)
+    app.recordings = RecordingStore(tmp_path / "recordings")
+    app.recordings.save(b"\x01\x00" * 16000)
+    app._support_dir = tmp_path
+    recovery.keep_unsaved(tmp_path, b"\x02\x00" * 16000)                 # From a failed archive.
+    recovery.in_progress_path(tmp_path).write_bytes(b"\x03\x00" * 16000)  # One that could not be set aside.
+    app.recorder.discard_recovery = lambda: None
+    app.history_store = SimpleNamespace(render=lambda: None, clear=lambda: True)
+    app.current_transcript = "words"
+    app.overlay_controller.set_current_text = lambda _text: None
+    monkeypatch.setattr(module.rumps, "alert", lambda **_kwargs: 1)
+    app.clear_history_requested()
+    assert app.recordings.list_recordings() == [] and recovery.unsaved_recordings(tmp_path) == []
+    assert not recovery.in_progress_path(tmp_path).exists()
+    assert calls[-1] == "History and recordings cleared"

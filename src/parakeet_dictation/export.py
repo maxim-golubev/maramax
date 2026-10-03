@@ -3,112 +3,112 @@
 from __future__ import annotations
 
 import enum
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import assert_never
 
 from .clipboard import ClipboardError, copy_text
 from .file_queue import QueuedFile, QueueStatus
 
 
 class OutputMode(enum.Enum):
+    """The destinations that need no place chosen by the user."""
     CLIPBOARD = "clipboard"
-    INDIVIDUAL_SAME_DIR = "individual_same_dir"
-    INDIVIDUAL_CHOSEN_DIR = "individual_chosen_dir"
-    SINGLE_FILE = "single_file"
+    NEXT_TO_ORIGINALS = "next_to_originals"
 
 
-@dataclass
-class OutputConfig:
-    mode: OutputMode
-    output_path: str | None = None
+@dataclass(frozen=True)
+class ToFolder:
+    """One text file per transcript, in a folder the user chose."""
+    path: Path
+
+
+@dataclass(frozen=True)
+class ToFile:
+    """Every transcript in one text file the user chose."""
+    path: Path
+
+
+# Where a queue run's transcripts go. A destination that needs a path carries
+# one, and one that does not cannot be given one.
+Destination = OutputMode | ToFolder | ToFile
 
 
 class ExportError(RuntimeError):
-    pass
+    """Why the transcripts did not reach their destination. The message is the
+    cause alone, worded to follow "Export failed: "."""
 
 
-def export_results(items: list[QueuedFile], config: OutputConfig) -> str:
+def export_results(items: list[QueuedFile], destination: Destination) -> str:
+    """Deliver the completed transcripts among `items`; returns what was done,
+    worded for the status line."""
     completed = [i for i in items if i.status == QueueStatus.DONE and i.result_text]
     if not completed:
-        raise ExportError("No completed transcriptions to export")
+        raise ExportError("no completed transcripts to export")
 
-    try:
-        if config.mode == OutputMode.CLIPBOARD:
-            return _export_clipboard(completed)
-        elif config.mode == OutputMode.INDIVIDUAL_SAME_DIR:
-            return _export_individual(completed, target_dir=None)
-        elif config.mode == OutputMode.INDIVIDUAL_CHOSEN_DIR:
-            if not config.output_path:
-                raise ExportError("No output directory specified")
-            return _export_individual(completed, target_dir=config.output_path)
-        elif config.mode == OutputMode.SINGLE_FILE:
-            if not config.output_path:
-                raise ExportError("No output file specified")
-            return _export_single_file(completed, config.output_path)
-        else:
-            raise ExportError(f"Unknown output mode: {config.mode}")
-    except ExportError:
-        raise
-    except OSError as exc:
-        # mkdir/exists on a vanished output volume raises bare OSError;
-        # callers only handle ExportError.
-        raise ExportError(f"Export failed: {exc}") from exc
+    match destination:
+        case OutputMode.CLIPBOARD:
+            _copy_to_clipboard(completed)
+            return f"Copied {_transcripts(len(completed))} to clipboard"
+        case OutputMode.NEXT_TO_ORIGINALS:
+            _save_each(completed, lambda source: source.parent)
+            originals = "its original" if len(completed) == 1 else "their originals"
+            return f"Saved {_transcripts(len(completed))} next to {originals}"
+        case ToFolder(path=folder):
+            _save_each(completed, lambda _source: folder)
+            return f"Saved {_transcripts(len(completed))} to {folder.name}"
+        case ToFile(path=path):
+            _save_together(completed, path)
+            return f"Saved {_transcripts(len(completed))} to {path.name}"
+        case _:
+            assert_never(destination)
 
 
-def _export_clipboard(items: list[QueuedFile]) -> str:
+def _transcripts(count: int) -> str:
+    return f"{count} transcript{'s' if count != 1 else ''}"
+
+
+def _reason(exc: OSError) -> str:
+    """What went wrong, without the errno and path that str() adds: the
+    message names the file itself."""
+    return exc.strerror if exc.strerror is not None else str(exc)
+
+
+def _joined(items: list[QueuedFile]) -> str:
     if len(items) == 1:
-        text = items[0].result_text
-    else:
-        sections = [f"## {i.filename}\n\n{i.result_text}" for i in items]
-        text = "\n\n".join(sections)
+        return items[0].result_text
+    return "\n\n".join(f"## {i.filename}\n\n{i.result_text}" for i in items)
 
+
+def _copy_to_clipboard(items: list[QueuedFile]) -> None:
     try:
-        copy_text(text)
+        copy_text(_joined(items))
     except ClipboardError as exc:
-        raise ExportError(f"Clipboard copy failed: {exc}") from exc
-
-    count = len(items)
-    return f"Copied {count} transcript{'s' if count != 1 else ''} to clipboard"
+        raise ExportError("could not copy to the clipboard") from exc
 
 
-def _export_individual(items: list[QueuedFile], target_dir: str | None) -> str:
-    written = 0
-
+def _save_each(items: list[QueuedFile], folder_for: Callable[[Path], Path]) -> None:
+    """One text file per transcript, named after its source, in the folder
+    `folder_for` gives for that source. An existing file is never replaced."""
     for item in items:
         source = Path(item.path)
-        stem = source.stem
-        out_dir = Path(target_dir) if target_dir else source.parent
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        out_path = out_dir / f"{stem}.txt"
-        counter = 1
-        while out_path.exists():
-            counter += 1
-            out_path = out_dir / f"{stem}_{counter}.txt"
-
+        folder = folder_for(source)
         try:
+            folder.mkdir(parents=True, exist_ok=True)
+            out_path = folder / f"{source.stem}.txt"
+            counter = 1
+            while out_path.exists():
+                counter += 1
+                out_path = folder / f"{source.stem}_{counter}.txt"
             out_path.write_text(item.result_text, encoding="utf-8")
-            written += 1
         except OSError as exc:
-            raise ExportError(f"Failed to write {out_path.name}: {exc}") from exc
-
-    dir_label = target_dir or "source directories"
-    return f"Saved {written} file{'s' if written != 1 else ''} to {dir_label}"
+            raise ExportError(f"could not write {source.stem}.txt to {folder.name}: {_reason(exc)}") from exc
 
 
-def _export_single_file(items: list[QueuedFile], output_path: str) -> str:
-    if len(items) == 1:
-        text = items[0].result_text
-    else:
-        sections = [f"## {i.filename}\n\n{i.result_text}" for i in items]
-        text = "\n\n".join(sections)
-
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
+def _save_together(items: list[QueuedFile], path: Path) -> None:
     try:
-        path.write_text(text, encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_joined(items), encoding="utf-8")
     except OSError as exc:
-        raise ExportError(f"Failed to write {path.name}: {exc}") from exc
-
-    return f"Saved transcript to {path.name}"
+        raise ExportError(f"could not write {path.name}: {_reason(exc)}") from exc

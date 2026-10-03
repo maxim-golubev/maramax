@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import objc
 from AppKit import (
-    NSApplication, NSBackingStoreBuffered, NSButton, NSFont, NSFontWeightSemibold, NSLayoutAttributeLeading,
-    NSLayoutConstraint, NSMakeRect, NSPanel, NSStackView, NSTextField, NSUserInterfaceLayoutOrientationHorizontal,
-    NSUserInterfaceLayoutOrientationVertical, NSWindowStyleMaskClosable, NSWindowStyleMaskTitled,
+    NSApplication, NSBackingStoreBuffered, NSButton, NSFont, NSFontWeightSemibold, NSLayoutConstraint,
+    NSMakeRect, NSPanel, NSTextField, NSWindowStyleMaskClosable, NSWindowStyleMaskTitled,
 )
 from Foundation import NSObject
 
 from .config import AppConfig, Delivery
 from .hotkeys import STOP
-from .layout import aligned_width, small_text, spacer
+from .layout import Notice, aligned_width, show_notice, small_text, spacer, stack
 from .main_thread import call_later
+from .preferences import CHECKBOX_INDENT, DELIVERY_LABELS
 from .shortcut_picker import ShortcutPicker
 
 MARGIN = 28
@@ -24,9 +24,15 @@ STATUS_SECONDS = 1.0
 
 
 _OUTCOMES = {
-    Delivery.PASTED: "copied and pasted where you are typing",
+    Delivery.PASTED: "pasted where you are typing",
     Delivery.COPIED: "copied, ready to paste with Cmd+V",
     Delivery.KEPT: "under Open Transcript in the menu bar icon",
+}
+# The two choices offered here; Settings also offers keeping transcripts in Maramax.
+_CHOICES = (Delivery.PASTED, Delivery.COPIED)
+_CHOICE_HELP = {
+    Delivery.PASTED: "Maramax presses Cmd+V for you in the app you were typing in. macOS asks you once to allow it.",
+    Delivery.COPIED: "Paste it yourself with Cmd+V. Nothing needs extra permission.",
 }
 
 
@@ -53,14 +59,14 @@ def recording_note(config: AppConfig) -> str:
     shown = ("A small bar at the bottom of the screen shows the microphone and the time."
              if config.compact_dictation and config.auto_start_recording else
              "The Maramax window shows the microphone while you speak.")
-    return (f"{shown} Bluetooth headphones take two or three seconds to connect: start speaking when it says "
-            "Recording. macOS asks for the microphone the first time.")
+    return (f"{shown} While it says “Don’t speak yet” in orange, wait: Bluetooth headphones take two or three "
+            "seconds to connect. macOS asks for the microphone the first time.")
 
 
 class WelcomeController(NSObject):
     """`delegate` provides what the picker needs (see shortcut_picker.py) and
-    config, transcriber, choose_delivery(paste), paste_permitted(),
-    open_accessibility_settings(), and finish_welcome()."""
+    config, transcriber, choose_delivery(delivery), paste_permitted(),
+    request_paste_permission(), and finish_welcome()."""
 
     def initWithDelegate_(self, delegate):
         self = objc.super(WelcomeController, self).init()
@@ -85,7 +91,7 @@ class WelcomeController(NSObject):
         self.back = NSButton.buttonWithTitle_target_action_("Back", self, "goBack:")
         self.forward = NSButton.buttonWithTitle_target_action_("Continue", self, "goForward:")
         self.forward.setKeyEquivalent_("\r")
-        row = self._stack([self.counter, spacer(), self.back, self.forward], horizontal=True)
+        row = stack([self.counter, spacer(), self.back, self.forward], horizontal=True, spacing=10)
         # One width for both (once they share a parent), whatever they say, so
         # neither moves from step to step when "Continue" becomes "Done".
         self.forward.widthAnchor().constraintEqualToConstant_(aligned_width(self.forward)).setActive_(True)
@@ -106,16 +112,6 @@ class WelcomeController(NSObject):
     # -- Building blocks --
 
     @objc.python_method
-    def _stack(self, views, horizontal=False, spacing=10):
-        stack = NSStackView.stackViewWithViews_(views)
-        stack.setOrientation_(NSUserInterfaceLayoutOrientationHorizontal if horizontal
-                              else NSUserInterfaceLayoutOrientationVertical)
-        if not horizontal:
-            stack.setAlignment_(NSLayoutAttributeLeading)
-        stack.setSpacing_(spacing)
-        return stack
-
-    @objc.python_method
     def _title(self, text, size=17):
         label = NSTextField.labelWithString_(text)
         label.setFont_(NSFont.systemFontOfSize_weight_(size, NSFontWeightSemibold))
@@ -134,7 +130,7 @@ class WelcomeController(NSObject):
     @objc.python_method
     def _welcome_page(self):
         self.model_status = small_text("", CONTENT_WIDTH)
-        return self._stack([
+        return stack([
             self._title("Welcome to Maramax", 20),
             self._body("Dictation that runs entirely on this Mac. Press a shortcut, speak, press it again, and the "
                        "text is ready to paste. Nothing you say leaves your computer."),
@@ -144,7 +140,7 @@ class WelcomeController(NSObject):
     @objc.python_method
     def _shortcut_page(self):
         self.shortcut_text = self._body("")
-        return self._stack([
+        return stack([
             self._title("Choose your shortcut"),
             self.shortcut_text,
             self.picker.view,
@@ -152,47 +148,41 @@ class WelcomeController(NSObject):
 
     @objc.python_method
     def _result_page(self):
-        self.copy_choice = NSButton.radioButtonWithTitle_target_action_("Copy the transcript", self, "choosePaste:")
-        self.paste_choice = NSButton.radioButtonWithTitle_target_action_(
-            "Copy it and paste it into the app you are using", self, "choosePaste:")
-        self.permission = NSButton.buttonWithTitle_target_action_("Open Accessibility Settings", self,
-                                                                 "openAccessibility:")
-        self.permission_note = small_text("", CONTENT_WIDTH)
-        self.permission_row = self._stack([self.permission, self.permission_note], horizontal=True, spacing=8)
-        title = self._title("When you finish speaking")
-        page = self._stack([
-            title,
-            self.copy_choice,
-            self._indented(small_text("Paste it yourself with Cmd+V. Nothing needs extra permission.",
-                                      CONTENT_WIDTH)),
-            self.paste_choice,
-            self._indented(small_text("Maramax presses Cmd+V for you in the app you were typing in. This needs "
-                                      "Maramax turned on under Privacy & Security → Accessibility in "
-                                      "System Settings.", CONTENT_WIDTH)),
-            self._indented(self.permission_row),
-        ], spacing=10)
+        self.choices = {delivery: NSButton.radioButtonWithTitle_target_action_(
+            DELIVERY_LABELS[delivery], self, "chooseDelivery:") for delivery in _CHOICES}
+        self.permission = NSButton.buttonWithTitle_target_action_("Allow…", self, "requestPermission:")
+        self.permission_note = small_text("", CONTENT_WIDTH - 120)
+        self.permission_row = stack([self.permission_note, self.permission], horizontal=True)
+        title = self._title("When you finish dictating")
+        views = [title]
+        for delivery in _CHOICES:
+            explanation = [small_text(_CHOICE_HELP[delivery], CONTENT_WIDTH - CHECKBOX_INDENT)]
+            if delivery is Delivery.PASTED:
+                explanation.append(self.permission_row)
+            views += [self.choices[delivery], self._indented(explanation)]
+        page = stack(views, spacing=10)
         # As in Settings: the title stands apart as on every step, and each
         # choice's explanation sits close under it.
         page.setCustomSpacing_afterView_(12, title)
-        for choice in (self.copy_choice, self.paste_choice):
+        for choice in self.choices.values():
             page.setCustomSpacing_afterView_(3, choice)
         return page
 
     @objc.python_method
-    def _indented(self, view):
-        stack = self._stack([view])
-        stack.setEdgeInsets_((0, 20, 0, 0))
-        return stack
+    def _indented(self, views):
+        indented = stack(views, spacing=6)
+        indented.setEdgeInsets_((0, CHECKBOX_INDENT, 0, 0))
+        return indented
 
     @objc.python_method
     def _try_page(self):
         self.try_text = self._body("")
         self.recording_note = small_text("", CONTENT_WIDTH)
-        return self._stack([
+        return stack([
             self._title("Try it"),
             self.try_text,
             self.recording_note,
-            small_text("Settings and Recordings are in the menu bar icon; this window is under More → Welcome.",
+            small_text("Settings and Recordings are in the menu bar icon. This guide is in Settings → General.",
                        CONTENT_WIDTH),
         ], spacing=12)
 
@@ -219,7 +209,6 @@ class WelcomeController(NSObject):
         self.counter.setStringValue_(f"{step + 1} of {STEPS}")
         self.back.setHidden_(step == 0)
         self.forward.setTitle_("Done" if step == STEPS - 1 else "Continue")
-        self._fit_window()
 
     @objc.python_method
     def refresh(self):
@@ -228,16 +217,19 @@ class WelcomeController(NSObject):
         self.picker.refresh()
         self.shortcut_text.setStringValue_(shortcut_page_text(config))
         delivery = config.delivery()
-        # With copying turned off in Settings, neither choice is what happens now.
-        self.copy_choice.setState_(int(delivery is Delivery.COPIED))
-        self.paste_choice.setState_(int(delivery is Delivery.PASTED))
-        pastes = delivery is Delivery.PASTED
+        # With "Keep in Maramax only" chosen in Settings, neither choice here is what happens now.
+        for choice, button in self.choices.items():
+            button.setState_(int(choice is delivery))
         permitted = self.delegate.paste_permitted()
-        self.permission_row.setHidden_(not pastes)
+        self.permission_row.setHidden_(delivery is not Delivery.PASTED)
         self.permission.setHidden_(permitted)
-        self.permission_note.setStringValue_("Permission granted." if permitted else "Not granted yet.")
+        if permitted:
+            show_notice(self.permission_note, Notice.ALLOWED, "Allowed.")
+        else:
+            show_notice(self.permission_note, Notice.WARNING, "Not allowed yet.")
         self.try_text.setStringValue_(try_it_text(self.delegate.current_shortcut().label, config))
         self.recording_note.setStringValue_(recording_note(config))
+        self._fit_window()  # Allow… comes and goes with the permission, wherever the refresh came from.
 
     @objc.python_method
     def _fit_window(self):
@@ -247,6 +239,8 @@ class WelcomeController(NSObject):
         height = MARGIN + page.fittingSize().height + 28 + 52
         frame = self.panel.frameRectForContentRect_(NSMakeRect(0, 0, CONTENT_WIDTH + 2 * MARGIN, height))
         current = self.panel.frame()
+        if abs(current.size.height - frame.size.height) < 0.5:
+            return  # Refreshed with nothing that changes the height (the model watch looks every second).
         top = current.origin.y + current.size.height
         self.panel.setFrame_display_(
             NSMakeRect(current.origin.x, top - frame.size.height, frame.size.width, frame.size.height), True)
@@ -273,14 +267,15 @@ class WelcomeController(NSObject):
         else:
             self.show_step(self.step + 1)
 
-    def choosePaste_(self, sender):
-        self.delegate.choose_delivery(sender is self.paste_choice)
+    def chooseDelivery_(self, sender):
+        for delivery, button in self.choices.items():
+            if button is sender:
+                self.delegate.choose_delivery(delivery)
         self.refresh()
-        self._fit_window()
 
-    def openAccessibility_(self, sender):
+    def requestPermission_(self, sender):
         del sender
-        self.delegate.open_accessibility_settings()
+        self.delegate.request_paste_permission()
 
     def windowWillClose_(self, notification):
         del notification

@@ -11,7 +11,6 @@ import pyaudio
 
 from .audio_format import CHANNELS, SAMPLE_RATE
 from .capture import CaptureMeter, CaptureSnapshot
-from .helper_protocol import InputDevice
 from .logger_config import logger
 
 FRAMES_PER_BUFFER = 512
@@ -119,7 +118,9 @@ class AudioRecorder:
         self._cleaned_up = False
         self._released_cleanly = False
         self.meter = CaptureMeter()
-        self.abandoned_sessions = 0
+        # A wedged close leaked a PortAudio session: this process's device
+        # list is frozen from then on (see cleanup()).
+        self.session_abandoned = False
 
     def _reinit_audio(self) -> None:
         # Callers must hold _audio_lock. Close any live stream first:
@@ -140,9 +141,10 @@ class AudioRecorder:
             logger.warning(f"PortAudio did not terminate cleanly: {exc}")
         self.audio = pyaudio.PyAudio()
 
-    def list_input_devices(self) -> list[InputDevice] | None:
-        """Input devices, or None when the audio session is busy (callers
-        should keep their current list rather than show an empty one)."""
+    def list_input_devices(self) -> list[str] | None:
+        """The input devices' names in PortAudio's order, or None when the
+        audio session is busy (callers should keep their current list rather
+        than show an empty one)."""
         if not self._audio_lock.acquire(timeout=3.0):
             logger.warning("Audio session busy; skipping device enumeration")
             return None
@@ -150,24 +152,15 @@ class AudioRecorder:
             if not self.is_recording():
                 self._reinit_audio()
 
-            try:
-                default_index = self.audio.get_default_input_device_info()["index"]
-            except (IOError, OSError):
-                default_index = -1  # No default input: no entry is marked.
-
-            devices: list[InputDevice] = []
+            names: list[str] = []
             for i in range(self.audio.get_device_count()):
                 try:
                     info = self.audio.get_device_info_by_index(i)
                 except (IOError, OSError):
                     continue  # A device that vanished mid-enumeration.
                 if info.get("maxInputChannels", 0) > 0:
-                    devices.append(InputDevice(
-                        device_index=i,
-                        name=info["name"],
-                        is_default=(i == default_index),
-                    ))
-            return devices
+                    names.append(str(info["name"]))
+            return names
         finally:
             self._audio_lock.release()
 
@@ -227,9 +220,6 @@ class AudioRecorder:
         with self._state_lock:
             if self._cleaned_up or self.recording:
                 return False
-            if self.abandoned_sessions >= 2:
-                self.last_error = RuntimeError("Microphone driver repeatedly stalled — restart Maramax")
-                return False
 
             self.frames = []
             self.recording = True
@@ -283,7 +273,7 @@ class AudioRecorder:
         measurements carry over; an explicitly selected microphone that is
         gone still fails rather than silently switching."""
         with self._state_lock:
-            if self._cleaned_up or not self.recording or self.abandoned_sessions >= 2:
+            if self._cleaned_up or not self.recording:
                 return False
             previous = self._recording_thread
             self._recording_thread = None
@@ -294,10 +284,13 @@ class AudioRecorder:
             previous.join(timeout=2.0)
 
         if not self._audio_lock.acquire(timeout=5.0):
+            logger.error("Microphone could not be reopened: audio session lock timeout")
+            with self._state_lock:
+                self.last_error = TimeoutError("audio session busy")
             return False
         try:
             self._reinit_audio()
-            if self.abandoned_sessions:
+            if self.session_abandoned:
                 # The old session could not be shut down, so PortAudio kept
                 # its device list: it still names the device that vanished.
                 raise OSError("the audio session could not be rebuilt after the device stopped responding")
@@ -389,7 +382,7 @@ class AudioRecorder:
             try:
                 if self.audio is not None:
                     self.audio.terminate()
-                self._released_cleanly = self.abandoned_sessions == 0
+                self._released_cleanly = not self.session_abandoned
             except Exception as exc:
                 logger.warning(f"PortAudio did not terminate cleanly: {exc}")
             finally:
@@ -405,10 +398,8 @@ class AudioRecorder:
         abort the process. The old session leaks; the replacement works.
         The zombie thread keeps the old lock and only ever touches its own
         local stream reference."""
-        if self.abandoned_sessions >= 2:
-            raise RuntimeError("Microphone driver repeatedly stalled — restart Maramax")
         logger.warning("Abandoning wedged audio session")
-        self.abandoned_sessions += 1
+        self.session_abandoned = True
         self._stream_lock = threading.Lock()
         with self._stream_lock:
             self._stream = None

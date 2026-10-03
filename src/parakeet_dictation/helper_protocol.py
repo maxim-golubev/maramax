@@ -1,21 +1,21 @@
 """The line protocol between the app and its audio helper process.
 
 Each message is one JSON object per line: requests on the helper's stdin,
-events on its stdout. EOF on stdin means the app is gone.
+events on its stdout. EOF on stdin means the app is gone. The helper's
+stderr carries its log lines, which the app copies into its own log.
 """
 
 from __future__ import annotations
 
 import json
 from enum import StrEnum
-from typing import NamedTuple
 
 
 class Operation(StrEnum):
     RECORD = "record"    # device, prefer_builtin → READY, AUDIO…, then on STOP: DONE, IDLE or WARM
     STOP = "stop"        # keep_warm: seconds to leave the device open afterwards
-    LIST = "list"        # prefer_builtin → DEVICES
-    RELEASE = "release"  # close a device that is being kept warm → IDLE
+    LIST = "list"        # prefer_builtin → DEVICES, or ERROR
+    RELEASE = "release"  # close a device that is being kept warm → CLOSING, IDLE (nothing if none is warm)
     PING = "ping"        # → PONG
 
 
@@ -25,18 +25,12 @@ class Event(StrEnum):
     DONE = "done"                  # every captured buffer has been sent
     IDLE = "idle"                  # no device open; waiting for a request
     WARM = "warm"                  # device kept open; waiting for a request
-    CLOSING = "closing"            # helper is closing a device on its own initiative
+    CLOSING = "closing"            # helper is closing a kept-warm device (warm window over, or RELEASE)
     RECONNECTING = "reconnecting"  # the input failed; a replacement is being opened
-    DEVICE = "device"              # device, reopened: the outcome of RECONNECTING
-    DEVICES = "devices"            # devices, automatic
+    DEVICE = "device"              # device, reopened (error when not): the outcome of RECONNECTING
+    DEVICES = "devices"            # devices (input names, in PortAudio order), automatic
     ERROR = "error"                # message
     PONG = "pong"
-
-
-class InputDevice(NamedTuple):
-    device_index: int
-    name: str
-    is_default: bool
 
 
 def request(operation: Operation, **fields) -> str:

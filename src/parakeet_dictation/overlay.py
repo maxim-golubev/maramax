@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import warnings
 from enum import StrEnum
+from pathlib import Path
 
 import objc
 from AppKit import (
@@ -36,7 +37,8 @@ from AppKit import (
 )
 from Foundation import NSMakeRange, NSNotificationCenter, NSObject
 
-from .export import OutputConfig, OutputMode
+from .capture import CaptureHealth
+from .export import Destination, OutputMode, ToFile, ToFolder
 from .file_queue import QueueStatus
 from .hotkeys import STOP
 from .main_thread import call_later
@@ -44,11 +46,6 @@ from .main_thread import call_later
 MEDIA_EXTENSIONS = [
     "aac", "aiff", "flac", "m4a", "mov", "mp3", "mp4", "ogg", "opus", "wav", "webm",
 ]
-
-try:
-    from UniformTypeIdentifiers import UTType
-except ImportError:  # Older macOS: the panels fall back to file extensions.
-    UTType = None
 
 _COMMAND_ONLY_MASK = (
     NSEventModifierFlagCommand
@@ -64,7 +61,7 @@ _QUEUE_STATUS_TEXT = {
     QueueStatus.FAILED: "failed",
     QueueStatus.CANCELLED: "cancelled",
 }
-DROP_HINT = "Drop a file to transcribe. Switch to Queue to batch process multiple files."
+DROP_HINT = "Drop a file to transcribe it, or several to add them to the queue."
 
 # One set of measurements for every state of the window. Positions are of
 # what the eye sees (alignment rectangles), not of control frames.
@@ -77,6 +74,8 @@ CONTROL_FRAME_HEIGHT = 34  # push-button frames are taller than what they draw
 GAP = 10             # between a row of controls and a text area
 BUTTON_GAP = 12
 STATUS_BELOW_TOP = 40
+STATUS_HEIGHT = 20
+STATUS_TO_TABS = 8   # between the status line and the tab row below it
 CLOSE_WIDTH = 76
 CANCEL_WIDTH = 108   # the same button, alone and centred, while something is running
 
@@ -92,13 +91,22 @@ class Mode(StrEnum):
     QUEUE = "queue"
 
 
+class DropTarget(StrEnum):
+    TRANSCRIBE = "transcribe"   # one file, at once
+    QUEUE = "queue"
+
+
+def drop_target(mode: Mode, count: int, transcribing: bool) -> DropTarget:
+    """What dropping `count` media files does. One file dropped outside the
+    Queue tab is transcribed at once, unless something is being transcribed:
+    then it waits in the queue like several would."""
+    return DropTarget.TRANSCRIBE if mode != Mode.QUEUE and count == 1 and not transcribing else DropTarget.QUEUE
+
+
+_DROP_FEEDBACK = {DropTarget.TRANSCRIBE: "Drop to transcribe", DropTarget.QUEUE: "Drop to add to the queue"}
+
+
 _SEGMENTS = (Mode.RESULT, Mode.HISTORY, Mode.QUEUE)
-
-
-def _media_content_types():
-    if UTType is None:
-        return []
-    return [t for t in (UTType.typeWithFilenameExtension_(ext) for ext in MEDIA_EXTENSIONS) if t is not None]
 
 
 def _is_media(path: str) -> bool:
@@ -196,14 +204,15 @@ class OverlayDropView(NSView):
     def draggingEntered_(self, sender):
         # A drop starts or queues work and opens the Queue tab, over Stop
         # and the live draft: not while recording.
-        if not self.controller.is_recording and self._dragged_media(sender):
-            self.controller.set_drop_state(True)
+        media = self._dragged_media(sender)
+        if not self.controller.is_recording and media:
+            self.controller.set_drop_state(self.controller.drop_target(len(media)))
             return NSDragOperationCopy
         return 0
 
     def draggingExited_(self, sender):
         del sender
-        self.controller.set_drop_state(False)
+        self.controller.set_drop_state(None)
 
     def prepareForDragOperation_(self, sender):
         del sender
@@ -211,7 +220,7 @@ class OverlayDropView(NSView):
 
     def performDragOperation_(self, sender):
         paths = self._dragged_media(sender)
-        self.controller.set_drop_state(False)
+        self.controller.set_drop_state(None)
         if not paths:
             return False
         self.controller.files_dropped(paths)
@@ -422,9 +431,12 @@ class OverlayController(NSObject):
     @objc.python_method
     def _resize_panel(self, height: int):
         frame = self.panel.frame()
-        # Grow and shrink around the window's centre, wherever the user put it.
+        if frame.size.height == height and frame.size.width == WIDTH:
+            return
+        # Grow and shrink downwards from the top edge, wherever the user put
+        # the window: the status line and the tabs stay where the eye is.
         x = frame.origin.x + (frame.size.width - WIDTH) / 2
-        y = frame.origin.y + (frame.size.height - height) / 2
+        y = frame.origin.y + frame.size.height - height
         screen = self.panel.screen()
         if screen:
             visible = screen.visibleFrame()
@@ -458,7 +470,7 @@ class OverlayController(NSObject):
     def _layout_transcribing(self):
         height = self.TRANSCRIBING_HEIGHT
         self._resize_panel(height)
-        self._place_text(self.status_label, height - STATUS_BELOW_TOP, 20)
+        self._place_text(self.status_label, height - STATUS_BELOW_TOP, STATUS_HEIGHT)
         self._place(self.close_button, (WIDTH - CANCEL_WIDTH) / 2, BOTTOM, CANCEL_WIDTH)
         self._show_only(self.status_label, self.close_button)
 
@@ -470,10 +482,10 @@ class OverlayController(NSObject):
                   self.IDLE_HEIGHT if show_drop_hint else self.RECORDING_HEIGHT)
         self._resize_panel(height)
         status_bottom = height - STATUS_BELOW_TOP
-        row_bottom = (status_bottom - 8 - ROW if show_text else
+        row_bottom = (status_bottom - STATUS_TO_TABS - ROW if show_text else
                       BOTTOM + 16 + 6 if show_drop_hint else BOTTOM)
 
-        self._place_text(self.status_label, status_bottom, 20)
+        self._place_text(self.status_label, status_bottom, STATUS_HEIGHT)
         self._place_text(self.detail_label, status_bottom - 22, 16)
         left = self._place_tabs_row(row_bottom)
         close_left = WIDTH - MARGIN - CLOSE_WIDTH
@@ -503,7 +515,7 @@ class OverlayController(NSObject):
         self._resize_panel(height)
         status_bottom = height - STATUS_BELOW_TOP
         list_bottom = BOTTOM + ROW + GAP
-        self._place_text(self.status_label, status_bottom, 20)
+        self._place_text(self.status_label, status_bottom, STATUS_HEIGHT)
         self._place_text(self.queue_scroll_view, list_bottom, status_bottom - GAP - list_bottom)
         self._place(self.close_button, (WIDTH - CANCEL_WIDTH) / 2, BOTTOM, CANCEL_WIDTH)
         self._show_only(self.status_label, self.queue_scroll_view, self.close_button)
@@ -513,9 +525,9 @@ class OverlayController(NSObject):
         height = self.QUEUE_HEIGHT
         self._resize_panel(height)
         status_bottom = height - STATUS_BELOW_TOP
-        row_bottom = status_bottom - 8 - ROW
+        row_bottom = status_bottom - STATUS_TO_TABS - ROW
         list_bottom = BOTTOM + ROW + GAP
-        self._place_text(self.status_label, status_bottom, 20)
+        self._place_text(self.status_label, status_bottom, STATUS_HEIGHT)
         self._place_tabs_row(row_bottom)
         self._place_text(self.queue_scroll_view, list_bottom, row_bottom - GAP - list_bottom)
         x = MARGIN
@@ -586,7 +598,9 @@ class OverlayController(NSObject):
         digits = len(str(len(self._queue_files)))
         lines = []
         for number, queued in enumerate(self._queue_files, start=1):
-            status = _QUEUE_STATUS_TEXT.get(queued.status, str(queued.status))
+            status = _QUEUE_STATUS_TEXT[queued.status]
+            if queued.status == QueueStatus.FAILED and queued.error:
+                status = f"{status}: {queued.error}"  # Why, in full: often what to do about it.
             marker = f"  [{status}]" if status else ""
             prefix = "▶ " if queued.status == QueueStatus.PROCESSING else "  "
             lines.append(f"{prefix}{number:>{digits}}. {queued.filename}{marker}")
@@ -651,18 +665,19 @@ class OverlayController(NSObject):
         self._update_layout()
 
     @objc.python_method
-    def show_output_mode_dialog(self):
+    def show_output_mode_dialog(self) -> Destination | None:
+        """Where the queue's transcripts should go, or None if the user cancels."""
         alert = NSAlert.alloc().init()
-        alert.setMessageText_("Choose Output")
-        alert.setInformativeText_("Where should the transcription results be saved?")
+        alert.setMessageText_("Where should the transcripts go?")
+        alert.setInformativeText_("Each file in the queue is transcribed, then its transcript goes where you choose.")
         alert.addButtonWithTitle_("Start")
         alert.addButtonWithTitle_("Cancel")
 
         popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, 300, 26), False)
         popup.addItemWithTitle_("Copy to Clipboard")
-        popup.addItemWithTitle_("Save as Individual Files (same directory)")
-        popup.addItemWithTitle_("Save as Individual Files (choose directory)")
-        popup.addItemWithTitle_("Save as Single File")
+        popup.addItemWithTitle_("Save Each Next to Its Original")
+        popup.addItemWithTitle_("Save Each in a Folder…")
+        popup.addItemWithTitle_("Save All in One File…")
         alert.setAccessoryView_(popup)
 
         response = alert.runModal()
@@ -672,10 +687,10 @@ class OverlayController(NSObject):
         selected = popup.indexOfSelectedItem()
 
         if selected == 0:
-            return OutputConfig(mode=OutputMode.CLIPBOARD)
+            return OutputMode.CLIPBOARD
 
         elif selected == 1:
-            return OutputConfig(mode=OutputMode.INDIVIDUAL_SAME_DIR)
+            return OutputMode.NEXT_TO_ORIGINALS
 
         elif selected == 2:
             panel = NSOpenPanel.openPanel()
@@ -685,25 +700,15 @@ class OverlayController(NSObject):
             panel.setPrompt_("Choose Folder")
             if not panel.runModal():
                 return None
-            return OutputConfig(
-                mode=OutputMode.INDIVIDUAL_CHOSEN_DIR,
-                output_path=str(panel.URL().path()),
-            )
+            return ToFolder(Path(str(panel.URL().path())))
 
         else:
             panel = NSSavePanel.savePanel()
-            txt_type = UTType.typeWithFilenameExtension_("txt") if UTType is not None else None
-            if txt_type is not None:
-                panel.setAllowedContentTypes_([txt_type])
-            else:
-                panel.setAllowedFileTypes_(["txt"])
+            panel.setAllowedFileTypes_(["txt"])
             panel.setNameFieldStringValue_("transcript.txt")
             if not panel.runModal():
                 return None
-            return OutputConfig(
-                mode=OutputMode.SINGLE_FILE,
-                output_path=str(panel.URL().path()),
-            )
+            return ToFile(Path(str(panel.URL().path())))
 
     @objc.python_method
     def _choose_media_files(self):
@@ -711,11 +716,7 @@ class OverlayController(NSObject):
         panel.setCanChooseDirectories_(False)
         panel.setCanChooseFiles_(True)
         panel.setAllowsMultipleSelection_(True)
-        content_types = _media_content_types()
-        if content_types:
-            panel.setAllowedContentTypes_(content_types)
-        else:
-            panel.setAllowedFileTypes_(MEDIA_EXTENSIONS)
+        panel.setAllowedFileTypes_(MEDIA_EXTENSIONS)
         return [url.path() for url in panel.URLs()] if panel.runModal() else []
 
     # -- Showing and hiding --
@@ -769,6 +770,7 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def prepare_for_recording(self):
+        self._show_waiting(True)  # The microphone is not open yet.
         self.detail_label.setStringValue_("")
         self.intro_text = ""
         self.mode = Mode.RESULT
@@ -807,6 +809,7 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def set_transcribing(self, is_transcribing: bool):
+        self._show_waiting(False)
         self.is_transcribing = is_transcribing
         self.close_button.setTitle_("Cancel" if is_transcribing else "Close")
         self._update_layout()
@@ -817,8 +820,13 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def set_capture(self, snapshot):
-        seconds = int(snapshot.audio_seconds)
-        self.detail_label.setStringValue_(f"{snapshot.device_name} · {seconds // 60}:{seconds % 60:02d}")
+        self.detail_label.setStringValue_(snapshot.summary())
+        self._show_waiting(snapshot.health is not CaptureHealth.RECEIVING)
+
+    @objc.python_method
+    def _show_waiting(self, waiting: bool):
+        """Orange while what is said would not be recorded, as on the compact bar."""
+        self.status_label.setTextColor_(NSColor.systemOrangeColor() if waiting else NSColor.labelColor())
 
     @objc.python_method
     def set_recording(self, is_recording: bool):
@@ -827,6 +835,8 @@ class OverlayController(NSObject):
         self.is_recording = is_recording
         if is_recording:
             self._cancel_copy_feedback()
+        else:
+            self._show_waiting(False)
         self._apply_recording_state()
         self._update_layout()
 
@@ -849,20 +859,25 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def set_history_text(self, text: str):
+        """The History tab always shows its text area, so only its text changes."""
         self.history_text = text
-        self._refresh_text_view()
-        self._update_layout()
+        if self.mode == Mode.HISTORY:
+            self._refresh_text_view()
 
     @objc.python_method
-    def set_drop_state(self, active: bool):
+    def drop_target(self, count: int) -> DropTarget:
+        return drop_target(self.mode, count, self.is_transcribing)
+
+    @objc.python_method
+    def set_drop_state(self, target: DropTarget | None):
+        """What a drop in progress would do, or None when the drag has left."""
         if self.drop_label.isHidden():
             # The hint label is only part of the empty Result layout; elsewhere
             # the status line carries the feedback and gets its text back.
-            feedback = "Drop to add to the queue" if self.mode == Mode.QUEUE else "Drop to transcribe"
-            self.status_label.setStringValue_(feedback if active else self._status)
+            self.status_label.setStringValue_(self._status if target is None else _DROP_FEEDBACK[target])
             return
-        self.drop_label.setStringValue_("Drop to transcribe." if active else DROP_HINT)
-        self.drop_label.setTextColor_(NSColor.systemBlueColor() if active else NSColor.secondaryLabelColor())
+        self.drop_label.setStringValue_(DROP_HINT if target is None else f"{_DROP_FEEDBACK[target]}.")
+        self.drop_label.setTextColor_(NSColor.secondaryLabelColor() if target is None else NSColor.systemBlueColor())
 
     @objc.python_method
     def flash_copy_feedback(self):
@@ -876,7 +891,7 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def files_dropped(self, paths):
-        if self.mode != Mode.QUEUE and len(paths) == 1:
+        if self.drop_target(len(paths)) is DropTarget.TRANSCRIBE:
             self.delegate.transcribe_file_directly(paths[0])
         else:
             self.delegate.queue_add_files(paths)

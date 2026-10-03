@@ -1,5 +1,6 @@
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -124,10 +125,24 @@ def test_audio_moved_in_after_a_crash_is_not_pruned_as_it_arrives(tmp_path):
     """After a crash every unsaved recording is moved in at once, and each
     spill is deleted once archived; none may push out another."""
     store = RecordingStore(tmp_path, limit=2, max_bytes=100000)
-    adopted = [store.adopt(bytes(32000)) for _ in range(4)]
+    adopted = [store.adopt(bytes(32000), created_at=datetime.now(timezone.utc)) for _ in range(4)]
     assert {r.id for r in store.list_recordings()} == {r.id for r in adopted}
     newest = store.save(bytes(32000))
     assert len(store.list_recordings()) == 2 and store.audio_path(newest.id).exists()   # The next save prunes.
+
+
+def test_audio_moved_in_after_a_crash_keeps_the_date_it_was_spoken_but_not_its_place_to_be_pruned(tmp_path):
+    """A capture whose archive write failed is moved in at the next launch,
+    after later dictations were archived. It is listed by when it was spoken,
+    but nobody has heard it back yet: the next save must not prune it first."""
+    store = RecordingStore(tmp_path, limit=2)
+    spoken = datetime.now(timezone.utc) - timedelta(days=2)
+    later = store.save(b"\x02\x00" * 16000)
+    adopted = store.adopt(b"\x01\x00" * 16000, created_at=spoken)
+    assert [r.id for r in store.list_recordings()] == [later.id, adopted.id]
+    assert store.list_recordings()[1].created_at == spoken.isoformat()
+    newest = store.save(b"\x03\x00" * 16000)
+    assert [r.id for r in store.list_recordings()] == [newest.id, adopted.id]   # The one archived longest goes.
 
 
 def test_recording_identifiers_cannot_escape_storage(tmp_path):
@@ -219,3 +234,13 @@ def test_recovery_prefers_audio_that_never_reached_the_recognizer(tmp_path):
     assert recovery_candidate(store.list_recordings()).id == interrupted.id
     store.update(interrupted.id, status="done")
     assert recovery_candidate(store.list_recordings()).id == failed.id
+
+
+def test_a_lower_limit_chosen_in_settings_applies_at_the_next_save(tmp_path):
+    store = RecordingStore(tmp_path, limit=3)
+    for _ in range(3):
+        store.save(b"\x01\x00" * 1600)
+    store.limit = 1
+    assert len(store.list_recordings()) == 3       # Nothing is deleted by the choice itself.
+    newest = store.save(b"\x01\x00" * 1600)
+    assert [record.id for record in store.list_recordings()] == [newest.id]

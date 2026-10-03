@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
+import warnings
 from enum import StrEnum
 
 import objc
-import warnings
 from AppKit import (
     NSBackingStoreBuffered, NSBezierPath, NSButton, NSColor, NSFont, NSFontWeightSemibold,
     NSLineBreakByTruncatingTail, NSLineCapStyleRound, NSMakeRect, NSPanel, NSScreen, NSStatusWindowLevel, NSTextField, NSView,
@@ -15,6 +16,7 @@ from AppKit import (
 )
 from Foundation import NSObject
 
+from .capture import CaptureHealth
 from .hotkeys import STOP
 from .main_thread import call_later
 
@@ -24,6 +26,10 @@ MARGIN = 18
 BUTTON = 30
 BUTTON_GAP = 8
 METER_BARS = 7
+# While nothing said would be recorded, the meter is a slow orange wave
+# instead of levels: one step per capture update (150 ms), about a second a cycle.
+WAVE_STEP = 0.9
+WAVE_SPREAD = 0.9
 # How far the expand arrow is shifted down-left, as a share of its reach. At 0
 # its outline is centred but the heavier arrowhead makes it look high and to
 # the right; at 0.22 it visibly sat low and left. At 0.10 the outline and the
@@ -144,32 +150,52 @@ class RoundIconButton(NSButton):
         path.stroke()
 
 
+def wave_levels(phase: float) -> list[float]:
+    """The meter while nothing said would be recorded: a wave travelling
+    left to right, from a quarter of the height to just over half."""
+    return [0.25 + 0.3 * (1 + math.sin(phase - index * WAVE_SPREAD)) / 2 for index in range(METER_BARS)]
+
+
 class InputLevelView(NSView):
-    """Recent input level as a short row of bars; the newest is on the right."""
+    """Recent input level as a short row of bars, the newest on the right; an
+    orange wave while the microphone does not yet deliver sound."""
 
     def initWithFrame_(self, frame):
         self = objc.super(InputLevelView, self).initWithFrame_(frame)
         if self is not None:
             self.levels = [0.0] * METER_BARS
+            self.wave: float | None = 0.0  # The wave's phase while waiting; None once sound arrives.
             self.setAccessibilityLabel_("Microphone input level")
         return self
 
     @objc.python_method
     def push(self, level):
+        self.wave = None
         self.levels = (self.levels + [max(0.0, min(1.0, float(level)))])[-METER_BARS:]
+        self.setNeedsDisplay_(True)
+
+    @objc.python_method
+    def wait(self):
+        """Nothing said now would be recorded: move the wave on a step."""
+        self.wave = (self.wave or 0.0) + WAVE_STEP
         self.setNeedsDisplay_(True)
 
     @objc.python_method
     def reset(self):
         self.levels = [0.0] * METER_BARS
+        self.wave = 0.0
         self.setNeedsDisplay_(True)
 
     def drawRect_(self, rect):
         del rect
         height = self.bounds().size.height
-        for index, level in enumerate(self.levels):
+        waiting = self.wave is not None
+        for index, level in enumerate(wave_levels(self.wave) if waiting else self.levels):
             bar = max(4.0, level * height)
-            color = NSColor.systemGreenColor() if level > 0.02 else NSColor.tertiaryLabelColor()
+            if waiting:
+                color = NSColor.systemOrangeColor()
+            else:
+                color = NSColor.systemGreenColor() if level > 0.02 else NSColor.tertiaryLabelColor()
             color.setFill()
             NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
                 NSMakeRect(index * 6, (height - bar) / 2, 3, bar), 1.5, 1.5,
@@ -213,8 +239,8 @@ class DictationIndicator(NSObject):
         self.expand_button.set_kind(Glyph.EXPAND, "Open transcript and controls")
         self._text_right = stop_x - 12
         self._text_left_with_meter = MARGIN + meter_width + 12
-        self.title = self._label(13, NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold))
-        self.detail = self._label(11, NSFont.systemFontOfSize_(11))
+        self.title = self._label(NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold))
+        self.detail = self._label(NSFont.systemFontOfSize_(11))
         self.detail.setTextColor_(NSColor.secondaryLabelColor())
         self._layout_text(True)
         for view in (self.meter, self.title, self.detail, self.stop_button, self.expand_button):
@@ -222,8 +248,7 @@ class DictationIndicator(NSObject):
         return self
 
     @objc.python_method
-    def _label(self, size, font):
-        del size
+    def _label(self, font):
         label = NSTextField.alloc().initWithFrame_(NSMakeRect(0, 0, 10, 10))
         label.setEditable_(False)
         label.setSelectable_(False)
@@ -257,9 +282,10 @@ class DictationIndicator(NSObject):
         self.stop_button.set_kind(Glyph.STOP, f"Finish dictation ({shortcut} or {STOP.label})")
         self.stop_button.setEnabled_(True)
         self.meter.reset()
+        self._show_waiting(True)  # The microphone is not open yet.
         self._layout_text(True)
-        self.set_status("Connecting microphone…")
         self.detail.setStringValue_(f"{shortcut} or {STOP.label} to finish")
+        self.detail.setToolTip_(None)
         screen = NSScreen.mainScreen()
         if screen is not None:
             visible = screen.visibleFrame()
@@ -276,14 +302,26 @@ class DictationIndicator(NSObject):
 
     @objc.python_method
     def set_capture(self, snapshot):
-        seconds = int(snapshot.audio_seconds)
-        detail = f"{snapshot.device_name} · {seconds // 60}:{seconds % 60:02d}"
+        detail = snapshot.summary()
         self.detail.setStringValue_(detail)
         self.detail.setToolTip_(detail)
-        self.meter.push(snapshot.level)
+        receiving = snapshot.health is CaptureHealth.RECEIVING
+        if receiving:
+            self.meter.push(snapshot.level)
+        else:
+            self.meter.wait()
+        self._show_waiting(not receiving)
+
+    @objc.python_method
+    def _show_waiting(self, waiting):
+        """Orange while what is said would not be recorded: before the
+        microphone opens, while a Bluetooth headset sends only silence, and
+        while an input is replaced or has gone quiet."""
+        self.title.setTextColor_(NSColor.systemOrangeColor() if waiting else NSColor.labelColor())
 
     @objc.python_method
     def set_transcribing(self):
+        self._show_waiting(False)
         self.set_status("Transcribing…")
         self.detail.setStringValue_("Your audio is saved")
         self._layout_text(False)
@@ -299,6 +337,7 @@ class DictationIndicator(NSObject):
         with a later status restarts the countdown for that status."""
         self._finished = True
         self._token += 1
+        self._show_waiting(False)
         title, detail = split_status(message)
         self.title.setStringValue_(title)
         self.title.setToolTip_(message)

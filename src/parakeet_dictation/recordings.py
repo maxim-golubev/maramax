@@ -17,7 +17,9 @@ from .atomic_file import TEMP_SUFFIX, write_text_atomically
 from .audio_format import CHANNELS, SAMPLE_RATE, SAMPLE_WIDTH, seconds
 from .logger_config import logger
 
-MAX_RECORDINGS = 20
+# How many recordings are kept unless the user chooses otherwise; whatever
+# the number, the archive also stays under MAX_ARCHIVE_BYTES.
+DEFAULT_RECORDINGS = 20
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 # What a recording leaves on disk: its audio, its metadata, and the temporary
 # files of an atomic write of either.
@@ -61,7 +63,8 @@ def recovery_candidate(records: list[Recording]) -> Recording | None:
 
 class RecordingStore:
     # Always keep the newest recording, even if it alone exceeds the budget.
-    def __init__(self, base_dir: Path, limit: int = MAX_RECORDINGS, max_bytes: int = MAX_ARCHIVE_BYTES):
+    # A lower `limit` applies at the next save.
+    def __init__(self, base_dir: Path, limit: int = DEFAULT_RECORDINGS, max_bytes: int = MAX_ARCHIVE_BYTES):
         self.base_dir = base_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.limit = limit
@@ -124,9 +127,10 @@ class RecordingStore:
         return sorted(records, key=lambda r: (r.created_at, r.id), reverse=True)
 
     def save(self, pcm: bytes, diagnostics: dict | None = None) -> Recording | None:
-        """Archive a capture, then prune the archive back to its budget."""
+        """Archive a capture that has just ended, then prune the archive back
+        to its budget."""
         with self._lock:
-            record = self._archive(pcm, diagnostics)
+            record = self._archive(pcm, diagnostics, datetime.now(timezone.utc))
             if record is not None:
                 # Pruning is after durable audio+metadata, never before saving.
                 try:
@@ -135,19 +139,21 @@ class RecordingStore:
                     logger.error(f"Recording {record.id} was saved, but older recordings could not be pruned: {exc}")
         return record
 
-    def adopt(self, pcm: bytes, diagnostics: dict | None = None) -> Recording | None:
-        """Archive audio a crash left behind, without pruning: when several are
-        moved in at once, each may be the only copy of its dictation, and one
-        must not push out another. The next save applies the budget again."""
-        return self._archive(pcm, diagnostics)
+    def adopt(self, pcm: bytes, diagnostics: dict | None = None, *, created_at: datetime) -> Recording | None:
+        """Archive audio a crash left behind, dated when it was captured
+        (`created_at`) so that it takes its place among the recordings made
+        since. Nothing is pruned: when several are moved in at once, each may
+        be the only copy of its dictation, and one must not push out another.
+        The next save applies the budget again."""
+        return self._archive(pcm, diagnostics, created_at)
 
-    def _archive(self, pcm: bytes, diagnostics: dict | None) -> Recording | None:
+    def _archive(self, pcm: bytes, diagnostics: dict | None, created_at: datetime) -> Recording | None:
         if not pcm:
             return None
         if len(pcm) % SAMPLE_WIDTH:
             raise ValueError("Expected complete 16-bit PCM samples")
         record = Recording(
-            uuid.uuid4().hex, datetime.now(timezone.utc).isoformat(), seconds(pcm),
+            uuid.uuid4().hex, created_at.isoformat(), seconds(pcm),
             diagnostics=dict(diagnostics or {}),
         )
         with self._lock:
@@ -223,11 +229,15 @@ class RecordingStore:
         for path in self._own_files(_TEMP_SUFFIXES):
             path.unlink(missing_ok=True)
         total = 0
-        records = self.list_recordings()
-        records.sort(key=lambda r: r.id != newest_id)
-        for index, record in enumerate(records):
-            path = self.audio_path(record.id)
-            total += path.stat().st_size
-            if record.id != newest_id and (index >= self.limit or total > self.max_bytes):
+        # Kept in the order audio entered the archive, not the order it was
+        # spoken: audio recovered after a crash is dated when it was spoken,
+        # possibly days ago, yet nobody has heard it back yet. It is pruned
+        # after the recordings that were already here, as if it were new.
+        stats = {record.id: self.audio_path(record.id).stat() for record in self.list_recordings()}
+        records = sorted(stats, key=lambda record_id: (record_id != newest_id, -stats[record_id].st_mtime_ns))
+        for index, record_id in enumerate(records):
+            path = self.audio_path(record_id)
+            total += stats[record_id].st_size
+            if record_id != newest_id and (index >= self.limit or total > self.max_bytes):
                 path.unlink(missing_ok=True)
-                self._metadata_path(record.id).unlink(missing_ok=True)
+                self._metadata_path(record_id).unlink(missing_ok=True)

@@ -1,3 +1,4 @@
+import AppKit
 import pytest
 
 from parakeet_dictation.hotkeys import _four_char_code
@@ -173,3 +174,13 @@ def test_cmd_r_is_registered_on_the_key_that_gives_r_with_command(monkeypatch):
     monkeypatch.setattr(hotkeys, "command_key_code", lambda character: None)
     with pytest.raises(HotKeyError, match=r"Cmd\+R"):
         manager.set_recording_shortcut(lambda: None)
+
+
+@pytest.mark.parametrize("key_code, modifiers, key, flags", [
+    (0x31, hotkeys.optionKey, " ", AppKit.NSEventModifierFlagOption),
+    (0x60, hotkeys.controlKey | hotkeys.shiftKey, AppKit.NSF5FunctionKey,
+     AppKit.NSEventModifierFlagControl | AppKit.NSEventModifierFlagShift),
+    (0x02, hotkeys.cmdKey | hotkeys.optionKey, "d", AppKit.NSEventModifierFlagCommand | AppKit.NSEventModifierFlagOption),
+])
+def test_the_menu_shows_the_shortcut_as_appkit_draws_it(key_code, modifiers, key, flags):
+    assert hotkeys.menu_key_equivalent(key_code, modifiers, hotkeys.KEY_NAMES) == (key, flags)

@@ -40,33 +40,33 @@ def test_config_validates_and_persists_rules(tmp_path):
 def test_publication_keeps_raw_text_and_pastes_only_new_dictation(tmp_path, monkeypatch):
     app = object.__new__(module.DictationApp)
     app.config = AppConfig(paste_to_active_app=True, replacements=[{"heard": "mara max", "replacement": "Maramax"}])
-    app.history_store = HistoryStore(base_dir=tmp_path)
+    app.history_store = HistoryStore(base_dir=tmp_path, history_limit=app.config.history_limit)
     app._cancel_event = threading.Event()
     app._set_current_text_on_main = lambda *_args: None
     app._refresh_history_on_main = lambda: None
     copied, pending = [], []
     app._copy_text_with_feedback = lambda text, **kwargs: copied.append(text) or True
     monkeypatch.setattr(module.AppHelper, "callAfter", lambda *args: pending.append(args))
-    assert app._publish_transcript("mara max", module.Source.MICROPHONE, "Dictation", 1) == ("Maramax", True)
+    assert app._publish_transcript("mara max", module.Source.MICROPHONE, "Dictation", 1) == "Maramax"
     assert copied == ["Maramax"]
     assert len(pending) == 1
     assert pending[0][1:] == (1, "Maramax")
     entry = app.history_store.list_entries()[0]
     assert entry.text == "Maramax" and entry.raw_text == "mara max"
-    assert "Before word replacements" in HistoryStore(base_dir=tmp_path).render()
+    assert "Before word replacements" in HistoryStore(base_dir=tmp_path, history_limit=app.config.history_limit).render()
     pending.clear()
     app._publish_transcript("mara max", module.Source.RECOVERY, "Retry", 2)
     assert not pending  # Retry must not paste into a stale destination.
-    assert app._publish_transcript("mara max", module.Source.FILE, "File", 3)[0] == "mara max"
+    assert app._publish_transcript("mara max", module.Source.FILE, "File", 3) == "mara max"
     app.config.use_corrections = False
-    assert app._publish_transcript("mara max", module.Source.MICROPHONE, "Raw", 4)[0] == "mara max"
+    assert app._publish_transcript("mara max", module.Source.MICROPHONE, "Raw", 4) == "mara max"
     # The copy setting is honoured on every path; nothing forces a copy.
     app.config.paste_to_active_app = app.config.auto_copy_to_clipboard = False
     copied.clear()
     statuses = []
     app._push_status = lambda message, revert_after=0: statuses.append(message)
     app._publish_transcript("words", module.Source.MICROPHONE, "Quiet", 5)
-    assert copied == [] and statuses == ["Transcript ready"]
+    assert copied == [] and statuses == [module.NOT_COPIED_STATUS]  # Said, so an empty clipboard is no mystery.
 
 
 def test_vocabulary_hint_lists_wanted_spellings_once():
@@ -145,7 +145,7 @@ def test_whatever_the_editor_saves_survives_loading():
 def test_while_pasting_every_transcript_is_copied_as_settings_shows(tmp_path, monkeypatch):
     app = object.__new__(module.DictationApp)
     app.config = AppConfig(paste_to_active_app=True, auto_copy_to_clipboard=False)
-    app.history_store = HistoryStore(base_dir=tmp_path)
+    app.history_store = HistoryStore(base_dir=tmp_path, history_limit=app.config.history_limit)
     app._cancel_event = threading.Event()
     app._set_current_text_on_main = lambda *_args: None
     app._refresh_history_on_main = lambda: None

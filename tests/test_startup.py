@@ -68,12 +68,23 @@ with patch.object(module, "ParakeetTranscriber", lambda: transcriber), \
     import rumps
     for bind in getattr(rumps.clicked, "*buttons", []):
         bind(app)
-    assert app.menu["Start Dictation"].callback is not None
-    assert app.menu["Recordings…"].callback is not None
-    assert app.menu["More"]["History"].callback is not None
+    # One flat menu, status first; every item it shows is wired to an action (a
+    # title rumps could not find would have been added at the end instead).
+    assert list(app.menu.keys())[:2] == ["Status", "Retry Speech Model"]
+    titles = [key for key in app.menu.keys() if not str(key).startswith("SeparatorMenuItem")]
+    assert titles == ["Status", "Retry Speech Model", "Start Dictation", "Copy Last Transcript", "Open Transcript",
+                      "History", "Recordings…", "Recover Last Recording", "Transcribe Files…", "Settings…",
+                      "Check for Updates…", "Quit Maramax"], titles
+    assert all(app.menu[title].callback is not None for title in titles[1:])
+    assert app.menu["Retry Speech Model"].hidden            # The model has not failed to load.
+    assert app.status_line._menuitem.view() is not None and app.status_line.text == app._resting_status
+    from AppKit import NSEventModifierFlagControl, NSEventModifierFlagOption
+    start = app.menu["Start Dictation"]._menuitem
+    assert (str(start.keyEquivalent()), start.keyEquivalentModifierMask()) == (
+        "d", NSEventModifierFlagControl | NSEventModifierFlagOption)
     assert "pyaudio" not in sys.modules  # The audio driver lives in the helper process only.
     from parakeet_dictation.preferences import PreferencesController
-    prefs = PreferencesController.alloc().initWithDelegate_labels_(app, module._SETTING_LABELS)
+    prefs = PreferencesController.alloc().initWithDelegate_(app)
     app._preferences_window = prefs
     prefs.toggleSetting_(prefs.options["use_corrections"])
     assert not AppConfig.load(base / "settings.json").use_corrections

@@ -21,6 +21,63 @@ import time
 from types import SimpleNamespace
 
 
+def check_windows() -> None:
+    """Build every window the app has, hidden, against a stub of the app, and
+    round-trip a recording through the archive and the Recordings window.
+    tests/test_release.py runs this from source, so a changed window
+    interface fails the tests, not the next build."""
+    from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
+    from parakeet_dictation.indicator import DictationIndicator
+    from parakeet_dictation.recordings import RecordingStore
+    from parakeet_dictation.config import AppConfig
+    from parakeet_dictation.preferences import PreferencesController
+    from parakeet_dictation.recordings_window import RecordingsController
+    from parakeet_dictation.overlay import OverlayController
+    from parakeet_dictation.hotkeys import DEFAULT_DICTATE
+    from parakeet_dictation.recordings import RecordingStatus
+
+    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+    # Creating the native view does not order it onto the screen.
+    indicator = DictationIndicator.alloc().initWithDelegate_(None)
+    assert not indicator.panel.isVisible()
+    assert not indicator.panel.canBecomeKeyWindow()
+    assert not indicator.panel.canBecomeMainWindow()
+
+    with tempfile.TemporaryDirectory(prefix="maramax-bundle-check-") as directory:
+        store = RecordingStore(Path(directory))
+        delegate = SimpleNamespace(
+            config=AppConfig(), is_busy=False,
+            transcriber=SimpleNamespace(status_message=lambda: "Speech model ready"), models_failed=lambda: False,
+            qwen=SimpleNamespace(status_message=lambda: "High-accuracy model ready"),
+            updates=SimpleNamespace(status_text=lambda: "Not checked yet.", can_check=lambda: True),
+            current_shortcut=lambda: DEFAULT_DICTATE, choose_shortcut=lambda key, modifiers: None,
+            pause_shortcut=lambda: None, resume_shortcut=lambda: None,
+            paste_permitted=lambda: False, choose_delivery=lambda delivery: None,
+            request_paste_permission=lambda: None, finish_welcome=lambda: None,
+        )
+        preferences = PreferencesController.alloc().initWithDelegate_(delegate)
+        recordings = RecordingsController.alloc().initWithDelegate_store_(delegate, store)
+        overlay = OverlayController.alloc().initWithDelegate_(delegate)
+        from parakeet_dictation.update_prompt import UpdatePromptWindow
+        from parakeet_dictation.update_window import UpdateProgressWindow
+        from parakeet_dictation.welcome import WelcomeController
+        update_window = UpdateProgressWindow.alloc().initWithCancel_(lambda: None)
+        update_prompt = UpdatePromptWindow.alloc().initWithChoice_(lambda choice: None)
+        welcome = WelcomeController.alloc().initWithDelegate_(delegate)
+        for controller in (preferences, recordings, overlay, update_window, update_prompt, welcome):
+            assert not controller.panel.isVisible()
+        assert recordings.sound is None
+        pcm = b"\x01\x00" * 16000
+        recording = store.save(pcm, {"validation": True})
+        assert store.load_pcm(recording.id) == pcm
+        store.update(recording.id, status=RecordingStatus.FAILED, message="Synthetic validation", raw_text="Original")
+        recordings.refresh()
+        assert recordings.records[0].raw_text == "Original"
+        assert store.list_recordings()[0].status == RecordingStatus.FAILED
+        store.clear()
+        assert not store.list_recordings()
+
+
 def check(args: argparse.Namespace) -> dict:
     resources = args.bundle / "Contents" / "Resources"
     version = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -63,16 +120,6 @@ def check(args: argparse.Namespace) -> dict:
     ensure_ssl_certs()
     ssl.create_default_context()
 
-    from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
-    from parakeet_dictation.indicator import DictationIndicator
-    from parakeet_dictation.recordings import RecordingStore
-    from parakeet_dictation.config import AppConfig
-    from parakeet_dictation.preferences import PreferencesController
-    from parakeet_dictation.recordings_window import RecordingsController
-    from parakeet_dictation.overlay import OverlayController
-    from parakeet_dictation.app import _SETTING_LABELS
-    from parakeet_dictation.hotkeys import DEFAULT_DICTATE
-    from parakeet_dictation.recordings import RecordingStatus
 
     # The spectrogram front end pulls in a filter-bank dependency that no
     # import above touches; build one and run audio through it. No model.
@@ -86,46 +133,7 @@ def check(args: argparse.Namespace) -> dict:
     if mel.shape[-1] != 128:
         raise RuntimeError(f"Spectrogram front end produced shape {mel.shape}, expected 128 features")
 
-    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyProhibited)
-    # Creating the native view does not order it onto the screen.
-    indicator = DictationIndicator.alloc().initWithDelegate_(None)
-    assert not indicator.panel.isVisible()
-    assert not indicator.panel.canBecomeKeyWindow()
-    assert not indicator.panel.canBecomeMainWindow()
-
-    with tempfile.TemporaryDirectory(prefix="maramax-bundle-check-") as directory:
-        store = RecordingStore(Path(directory))
-        delegate = SimpleNamespace(
-            config=AppConfig(), is_busy=False,
-            transcriber=SimpleNamespace(load_error=None, status_message=lambda: "Speech model ready"),
-            qwen=SimpleNamespace(status_message=lambda: "High-accuracy model ready"),
-            updates=SimpleNamespace(status_text=lambda: "Not checked yet.", can_check=lambda: True),
-            current_shortcut=lambda: DEFAULT_DICTATE, choose_shortcut=lambda key, modifiers: None,
-            pause_shortcut=lambda: None, resume_shortcut=lambda: None,
-            paste_permitted=lambda: False, choose_delivery=lambda paste: None,
-            open_accessibility_settings=lambda: None, finish_welcome=lambda: None,
-        )
-        preferences = PreferencesController.alloc().initWithDelegate_labels_(delegate, _SETTING_LABELS)
-        recordings = RecordingsController.alloc().initWithDelegate_store_(delegate, store)
-        overlay = OverlayController.alloc().initWithDelegate_(delegate)
-        from parakeet_dictation.update_prompt import UpdatePromptWindow
-        from parakeet_dictation.update_window import UpdateProgressWindow
-        from parakeet_dictation.welcome import WelcomeController
-        update_window = UpdateProgressWindow.alloc().initWithCancel_(lambda: None)
-        update_prompt = UpdatePromptWindow.alloc().initWithChoice_(lambda choice: None)
-        welcome = WelcomeController.alloc().initWithDelegate_(delegate)
-        for controller in (preferences, recordings, overlay, update_window, update_prompt, welcome):
-            assert not controller.panel.isVisible()
-        assert recordings.sound is None
-        pcm = b"\x01\x00" * 16000
-        recording = store.save(pcm, {"validation": True})
-        assert store.load_pcm(recording.id) == pcm
-        store.update(recording.id, status=RecordingStatus.FAILED, message="Synthetic validation", raw_text="Original")
-        recordings.refresh()
-        assert recordings.records[0].raw_text == "Original"
-        assert store.list_recordings()[0].status == RecordingStatus.FAILED
-        store.clear()
-        assert not store.list_recordings()
+    check_windows()
 
     report = {
         "bundle": str(args.bundle),
@@ -140,41 +148,37 @@ def check(args: argparse.Namespace) -> dict:
     }
     if args.audio:
         from parakeet_dictation.audio_format import seconds as audio_seconds
-        from parakeet_dictation.transcription import ParakeetTranscriber, normalize_media
+        from parakeet_dictation.transcription import ParakeetTranscriber, converted_media
         import wave
 
         started = time.perf_counter()
         transcriber = ParakeetTranscriber()
         transcriber.wait_until_ready()
         load_seconds = time.perf_counter() - started
-        normalized = normalize_media(args.audio)
-        try:
-            # normalize_media produces the app's own PCM format.
-            with wave.open(normalized, "rb") as audio:
-                pcm = audio.readframes(audio.getnframes())
-            results = []
-            for _ in range(args.repeats):
-                started = time.perf_counter()
-                text = transcriber.transcribe_pcm(pcm)
-                results.append({
-                    "seconds": round(time.perf_counter() - started, 3), "text": text,
-                    "mlx_active_bytes": mx.get_active_memory(),
-                    "mlx_cache_bytes": mx.get_cache_memory(),
-                    "python_threads": threading.active_count(),
-                    "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
-                })
-            durations = [result["seconds"] for result in results]
-            report["recognition"] = {
-                "model": transcriber.model_id,
-                "audio_seconds": audio_seconds(pcm),
-                "load_and_warm_seconds": round(load_seconds, 3),
-                "runs": results,
-                "median_seconds": statistics.median(durations),
-                "max_seconds": max(durations),
-                "scope": "PCM to transcript; excludes capture, UI, clipboard, and insertion",
-            }
-        finally:
-            Path(normalized).unlink(missing_ok=True)
+        # The conversion produces the app's own PCM format.
+        with converted_media(args.audio) as converted, wave.open(converted, "rb") as audio:
+            pcm = audio.readframes(audio.getnframes())
+        results = []
+        for _ in range(args.repeats):
+            started = time.perf_counter()
+            text = transcriber.transcribe_pcm(pcm)
+            results.append({
+                "seconds": round(time.perf_counter() - started, 3), "text": text,
+                "mlx_active_bytes": mx.get_active_memory(),
+                "mlx_cache_bytes": mx.get_cache_memory(),
+                "python_threads": threading.active_count(),
+                "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            })
+        durations = [result["seconds"] for result in results]
+        report["recognition"] = {
+            "model": transcriber.model_id,
+            "audio_seconds": audio_seconds(pcm),
+            "load_and_warm_seconds": round(load_seconds, 3),
+            "runs": results,
+            "median_seconds": statistics.median(durations),
+            "max_seconds": max(durations),
+            "scope": "PCM to transcript; excludes capture, UI, clipboard, and insertion",
+        }
     return report
 
 

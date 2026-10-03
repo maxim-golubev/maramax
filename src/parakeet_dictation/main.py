@@ -12,6 +12,8 @@ from .paths import app_support_dir, ensure_runtime_path, ensure_ssl_certs
 
 # Must match CFBundleIdentifier in packaging/setup.py.
 BUNDLE_ID = "com.maramax.dictation"
+ALREADY_RUNNING = ("Maramax is already running",
+                   "Use the Maramax icon in the menu bar, or quit that copy before opening another.")
 
 
 def _ensure_gui_app() -> None:
@@ -26,14 +28,16 @@ def main():
             "Maramax for macOS.\n\n"
             "Press your dictation shortcut (Option+Space unless you chose another) to start dictating "
             "and again, or Cmd+R, to finish. "
-            "The transcript is copied to the clipboard; turn on “Paste into the active app” in Settings for insertion."
+            "Where the transcript goes is set under Settings → General: pasted into the app you are using, "
+            "copied to the clipboard, or kept in Maramax only."
         )
     )
     parser.add_argument("--version", action="version", version=f"maramax {__version__}")
     parser.add_argument("--audio-worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.audio_worker:
-        # The helper needs none of the app's environment, logging, or GUI.
+        # The helper needs none of the app's environment or GUI. Its own
+        # logging goes to stderr, which the app reads (audio_worker.main).
         from .audio_worker import main as audio_main
         audio_main()
         return
@@ -53,7 +57,7 @@ def main():
     # One that is exiting (the copy an update just replaced) does not count.
     others = NSRunningApplication.runningApplicationsWithBundleIdentifier_(BUNDLE_ID)
     if any(app.processIdentifier() != os.getpid() and not app.isTerminated() for app in others):
-        rumps.alert(title="Maramax is already running", message="Quit the other copy from its menu bar before opening this version.")
+        rumps.alert(title=ALREADY_RUNNING[0], message=ALREADY_RUNNING[1])
         return
 
     support_dir = app_support_dir()
@@ -66,7 +70,7 @@ def main():
         ))
         return
     if not acquired:
-        rumps.alert(title="Maramax is already running", message="Use the Maramax menu bar icon, or quit that copy before opening another.")
+        rumps.alert(title=ALREADY_RUNNING[0], message=ALREADY_RUNNING[1])
         return
 
     app = None

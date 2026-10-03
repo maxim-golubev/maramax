@@ -6,12 +6,12 @@ from parakeet_dictation.capture import CaptureMeter
 def test_silent_frames_never_become_a_healthy_microphone():
     now = [0.0]
     meter = CaptureMeter(clock=lambda: now[0])
-    for second in range(7):
+    for second in range(8):
         now[0] = float(second)
         meter.feed(bytes(32000))
     snapshot = meter.snapshot()
     assert snapshot.health == "silent"
-    assert snapshot.audio_seconds == 7
+    assert snapshot.audio_seconds == 8
     assert snapshot.nonzero_samples == 0
     assert snapshot.level == 0
 
@@ -133,7 +133,19 @@ def test_helper_repairs_a_route_before_the_app_gives_up_on_it():
     # helper was about to rescue.
     assert audio_worker.STALL_SECONDS < capture.STALLED_SECONDS
     assert audio_worker.NO_AUDIO_SECONDS < capture.NO_FRAME_SECONDS
-    assert audio_worker.SILENT_ROUTE_SECONDS < capture.QUIET_SECONDS
+    assert audio_worker.SILENT_ROUTE_SECONDS < capture.NO_SIGNAL_SECONDS
+
+    # A route that only ever delivers zeros: the helper rebuilds it after
+    # SILENT_ROUTE_SECONDS, and until then the app is still waiting rather
+    # than telling the user to check their input.
+    now = [0.0]
+    meter = CaptureMeter(clock=lambda: now[0])
+    meter.mark_open()
+    while now[0] < audio_worker.SILENT_ROUTE_SECONDS + 0.1:
+        meter.feed(bytes(1024))
+        now[0] += 0.032
+    assert audio_worker.route_failed(meter.snapshot(), now[0], 0, 0)
+    assert meter.snapshot().health == "waiting"
 
     # A replacement for a stream that had delivered: the helper gives it
     # NO_AUDIO_SECONDS for a first buffer before reopening again, so the app

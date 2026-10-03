@@ -56,7 +56,7 @@ def adopt_legacy_history(support_dir: Path) -> None:
 
 
 class HistoryStore:
-    def __init__(self, base_dir: Path, history_limit: int = 100):
+    def __init__(self, base_dir: Path, *, history_limit: int):
         self.history_limit = history_limit
         self.base_dir = base_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -118,8 +118,10 @@ class HistoryStore:
         write_text_atomically(self.path, json.dumps(payload, indent=2))
 
     def list_entries(self) -> list[HistoryEntry]:
+        # A lower `history_limit` shows at once; the transcripts beyond it go
+        # with the next save, so raising it again before then loses nothing.
         with self._lock:
-            return list(self._entries)
+            return self._entries[: self.history_limit]
 
     def add_entry(self, source_kind: str, source_label: str, text: str, raw_text: str = "") -> HistoryEntry:
         entry = HistoryEntry(

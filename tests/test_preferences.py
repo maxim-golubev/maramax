@@ -10,9 +10,9 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
-from parakeet_dictation.preferences import PreferencesController
-from parakeet_dictation.config import AppConfig
-from parakeet_dictation.app import _SETTING_LABELS
+from parakeet_dictation.preferences import SETTING_LABELS, PreferencesController, _DELIVERY_HELP
+from parakeet_dictation.config import AppConfig, Delivery
+_DELIVERY_HELP_KEPT = _DELIVERY_HELP[Delivery.KEPT]
 from parakeet_dictation.hotkeys import DEFAULT_DICTATE
 
 NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyProhibited)
@@ -20,18 +20,18 @@ path = Path(sys.argv[1]) / "settings.json"
 config = AppConfig()
 delegate = SimpleNamespace(
     config=config, is_busy=False,
-    transcriber=SimpleNamespace(load_error=None, status_message=lambda: "Speech model ready"),
+    transcriber=SimpleNamespace(status_message=lambda: "Speech model ready"), models_failed=lambda: False,
     qwen=SimpleNamespace(status_message=lambda: "Loading the high-accuracy model…"),
     updates=SimpleNamespace(status_text=lambda: "This is the newest version.", can_check=lambda: True),
     current_shortcut=lambda: DEFAULT_DICTATE, choose_shortcut=lambda key, modifiers: None,
-    pause_shortcut=lambda: None, resume_shortcut=lambda: None,
+    pause_shortcut=lambda: None, resume_shortcut=lambda: None, paste_permitted=lambda: False,
 )
 def replace_word_rules(rules):
     config.replacements = rules
     config.save(path)
     return True
 delegate.replace_word_rules = replace_word_rules
-panel = PreferencesController.alloc().initWithDelegate_labels_(delegate, _SETTING_LABELS)
+panel = PreferencesController.alloc().initWithDelegate_(delegate)
 editor = panel.replacements
 heard_column, replacement_column = editor.table.tableColumns()
 def saved():
@@ -136,53 +136,62 @@ assert "could not be saved" in note() and config.replacements == [{"heard": "lir
 config.replacements = []
 delegate.replace_word_rules = replace_word_rules
 editor.refresh()
-from parakeet_dictation.helper_protocol import InputDevice
 calls = []
 delegate.refresh_input_devices = lambda: calls.append("refresh")
 delegate.select_input_device = lambda name: calls.append(name)
-assert len(panel.pages) == 3
+assert len(panel.pages) == 4
 panel.show_tab(0)
 assert not panel.pages[0].isHidden()
 assert panel.pages[1].isHidden()
 # The tabs are a Settings toolbar, each with its symbol; the window is named for the tab.
 items = panel.panel.toolbar().items()
-assert [str(item.label()) for item in items] == ["General", "Microphone", "Words"]
+assert [str(item.label()) for item in items] == ["General", "Microphone", "Words", "Advanced"]
 assert all(item.image() is not None for item in items)
 panel.selectTab_(items[1])
 assert calls == ["refresh"] and str(panel.panel.title()) == "Microphone"
 assert str(panel.panel.toolbar().selectedItemIdentifier()) == "Microphone"
 assert panel.pages[0].isHidden()
 assert not panel.pages[1].isHidden()
-panel.update_input_devices([InputDevice(1, "AirPods", False)], "AirPods")
+assert str(panel.device_picker.titleOfSelectedItem()) == "Automatic"            # Nothing listed yet.
+panel.update_input_devices(None, "AirPods")                                       # Chosen, not listed yet:
+assert str(panel.device_picker.titleOfSelectedItem()) == "AirPods"               # never "(not connected)".
+panel.update_input_devices(["AirPods"], "AirPods")
 panel.selectDevice_(None)
 assert calls[-1] == "AirPods"
 panel.update_input_devices([], "Disconnected mic")
-assert panel.device_picker.titleOfSelectedItem() == "Disconnected mic"
-panel.update_input_devices([InputDevice(0, "MacBook Pro Microphone", True)], None, "MacBook Pro Microphone")
+assert panel.device_picker.titleOfSelectedItem() == "Disconnected mic (not connected)"   # Not one that will record.
+panel.selectDevice_(None)
+assert calls[-1] == "Disconnected mic"                                                 # Still the name saved.
+panel.update_input_devices(["MacBook Pro Microphone"], None, "MacBook Pro Microphone")
 assert panel.device_picker.titleOfSelectedItem() == "Automatic — MacBook Pro Microphone"
 panel.selectDevice_(None)
 assert calls[-1] is None
 delegate.is_busy = True
 panel.show_busy_state()                  # Told when a dictation starts, not only on a refresh.
-assert not panel.device_picker.isEnabled()
+assert not panel.device_picker.isEnabled() and not panel.clear_history.isEnabled()
 delegate.is_busy = False
 panel.show_busy_state()
-assert panel.device_picker.isEnabled()
+assert panel.device_picker.isEnabled() and panel.clear_history.isEnabled()
 delegate.set_keep_microphone_ready = lambda seconds: calls.append(seconds) or setattr(config, "keep_mic_ready_seconds", seconds)
 assert panel.keep_ready.titleOfSelectedItem() == "Off"
-panel.keep_ready.selectItemWithTitle_("2 minutes")
+panel.keep_ready.selectItemWithTitle_("For 2 minutes")
 panel.selectKeepReady_(None)
 assert calls[-1] == 120
 panel.refresh()
-assert panel.keep_ready.titleOfSelectedItem() == "2 minutes"
+assert panel.keep_ready.titleOfSelectedItem() == "For 2 minutes"
 config.keep_mic_ready_seconds = 45  # Hand-edited settings stay visible instead of snapping to a preset.
 panel.refresh()
-assert panel.keep_ready.titleOfSelectedItem() == "45 seconds"
+assert panel.keep_ready.titleOfSelectedItem() == "For 45 seconds"
 config.keep_mic_ready_seconds = 60
 panel.refresh()
-assert panel.keep_ready.titleOfSelectedItem() == "1 minute"
+assert panel.keep_ready.titleOfSelectedItem() == "For 1 minute"
 assert panel.model_retry.isHidden()
-assert set(panel.options) == set(_SETTING_LABELS)
+delegate.models_failed = lambda: True                      # The standard model, or the chosen high-accuracy one.
+panel.refresh()
+assert not panel.model_retry.isHidden()
+delegate.models_failed = lambda: False
+panel.refresh()
+assert set(panel.options) == set(SETTING_LABELS)
 # Every tab's window ends the same distance below its content.
 from parakeet_dictation.preferences import CONTENT_WIDTH, MARGIN, duration_label
 content = panel.panel.contentView()
@@ -190,30 +199,77 @@ for index, page in enumerate(panel.pages):
     panel.show_tab(index)
     content.layoutSubtreeIfNeeded()
     assert abs(page.frame().origin.y - MARGIN) < 1, (index, page.frame())
-assert [duration_label(n) for n in (0, 1, 30, 60, 120, 90)] == ["Off", "1 second", "30 seconds", "1 minute", "2 minutes", "90 seconds"]
-# Pasting copies whatever the copy box says, so while it is on the box shows that and cannot be changed.
-copy = panel.options["auto_copy_to_clipboard"]
-config.auto_copy_to_clipboard, config.paste_to_active_app = False, True
+assert [duration_label(n) for n in (0, 1, 30, 60, 120, 90)] == [
+    "Off", "For 1 second", "For 30 seconds", "For 1 minute", "For 2 minutes", "For 90 seconds"]
+# Where a transcript goes is one choice of three; keeping it in Maramax is said plainly.
+chosen = []
+delegate.choose_delivery = lambda delivery: chosen.append(delivery) or config.set_delivery(delivery)
+def shown_delivery():
+    return [delivery for delivery, button in panel.delivery_buttons.items() if button.state() == 1]
+assert shown_delivery() == [Delivery.COPIED] and panel.permission_row.isHidden()
+kept_help = panel.delivery_help[Delivery.KEPT]
+assert str(kept_help.stringValue()) == _DELIVERY_HELP_KEPT                            # No symbol: plain help.
+panel.chooseDelivery_(panel.delivery_buttons[Delivery.KEPT])
 panel.refresh()
-assert copy.state() == 1 and not copy.isEnabled()
-config.paste_to_active_app = False
+assert chosen == [Delivery.KEPT] and shown_delivery() == [Delivery.KEPT]
+assert str(kept_help.stringValue()) == "\ufffc " + _DELIVERY_HELP_KEPT                 # The warning symbol leads it.
+assert str(kept_help.stringValue()).endswith("Transcripts wait in Open Transcript and History.")
+panel.chooseDelivery_(panel.delivery_buttons[Delivery.PASTED])
 panel.refresh()
-assert copy.state() == 0 and copy.isEnabled()
-config.auto_copy_to_clipboard = True
+assert str(kept_help.stringValue()) == _DELIVERY_HELP_KEPT                            # Plain again.
+assert shown_delivery() == [Delivery.PASTED] and not panel.permission_row.isHidden()
+assert "Not allowed yet" in str(panel.permission_note.stringValue()) and not panel.permission_button.isHidden()
+asked = []
+delegate.request_paste_permission = lambda: asked.append("ask")
+panel.requestPastePermission_(None)
+assert asked == ["ask"]
+delegate.paste_permitted = lambda: True
+panel.refresh()
+assert "Allowed" in str(panel.permission_note.stringValue()) and panel.permission_button.isHidden()
+config.set_delivery(Delivery.COPIED)
+panel.refresh()
 config.high_accuracy = True
 panel.refresh()
 assert str(panel.model_status.stringValue()) == "Speech model ready. Loading the high-accuracy model."
+config.high_accuracy = False
+# The guide and clearing history are a click away, in General and Advanced.
+opened = []
+delegate.show_welcome = lambda: opened.append("welcome")
+delegate.clear_history_requested = lambda: opened.append("clear")
+panel.showWelcome_(None)
+panel.clearHistory_(None)
+assert opened == ["welcome", "clear"]
+# How many transcripts History keeps: 100 by default, a hand-edited number kept on view.
+delegate.set_history_limit = lambda count: calls.append(count) or setattr(config, "history_limit", count)
+assert panel.history_limit.titleOfSelectedItem() == "100 transcripts"
+panel.history_limit.selectItemWithTitle_("1,000 transcripts")
+panel.selectHistoryLimit_(None)
+assert calls[-1] == 1000
+panel.refresh()
+assert panel.history_limit.titleOfSelectedItem() == "1,000 transcripts"
+config.history_limit = 37
+panel.refresh()
+assert panel.history_limit.titleOfSelectedItem() == "37 transcripts"
+config.history_limit = 1
+panel.refresh()
+assert panel.history_limit.titleOfSelectedItem() == "1 transcript"
+config.history_limit = 100
 # The version is at the top of General; Check Now asks the updater and shows what it says.
 from parakeet_dictation import __version__
 def labels(view):
     found = [str(view.stringValue())] if hasattr(view, "stringValue") and view.isKindOfClass_(__import__("AppKit").NSTextField) else []
     return found + [text for child in view.subviews() for text in labels(child)]
 general = labels(panel.pages[0])
+# And how many recordings: 20 by default, under the archive's size cap either way.
+assert panel.recordings_limit.titleOfSelectedItem() == "20 recordings"
+delegate.set_recordings_limit = lambda count: calls.append(count) or setattr(config, "recordings_limit", count)
+panel.recordings_limit.selectItemWithTitle_("100 recordings")
+panel.selectRecordingsLimit_(None)
+assert calls[-1] == 100
+assert any("under 512 MB" in text for text in labels(panel.pages[3]))
 assert general[:2] == ["Maramax", f"Version {__version__}"], general[:3]
-# Automatic prefers the Mac's own microphone by default, and macOS shows no
-# Accessibility prompt of its own: the help says what really happens.
+# Automatic prefers the Mac's own microphone by default: the help says what really happens.
 assert any(text.startswith("Automatic uses the Mac’s own microphone") for text in labels(panel.pages[1]))
-assert any("turn Maramax on there" in text for text in general)
 assert str(panel.update_status.stringValue()) == "This is the newest version." and panel.update_check.isEnabled()
 checks = []
 delegate.updates = SimpleNamespace(status_text=lambda: "Checking for updates…", can_check=lambda: False,
@@ -236,11 +292,12 @@ def choose_other():
     panel.show_tab(0)
     picker.popup.selectItemAtIndex_(picker.popup.numberOfItems() - 1)
     picker.chooseItem_(None)
-def check_now_bottom():
+def last_option_bottom():
     content.layoutSubtreeIfNeeded()
-    return panel.update_check.convertRect_toView_(panel.update_check.bounds(), None).origin.y
+    last = panel.options["live_preview"]
+    return last.convertRect_toView_(last.bounds(), None).origin.y
 panel.show_tab(0)
-bottom = check_now_bottom()
+bottom = last_option_bottom()
 choose_other()
 assert shortcut_calls == ["pause"] and picker.is_recording()
 picker.key_pressed(0x24, 0)                      # Return: refused with two lines of explanation.
@@ -249,7 +306,7 @@ note = picker.note
 needed = note.cell().cellSizeForBounds_(NSMakeRect(0, 0, note.frame().size.width, 10000)).height
 assert note.frame().size.height >= needed - 0.5, (note.frame(), needed)   # "or press Esc." is not cut off.
 assert note.preferredMaxLayoutWidth() <= note.frame().size.width + 0.5, note.frame()   # It wraps where it ends.
-assert abs(check_now_bottom() - bottom) < 1, (check_now_bottom(), bottom)   # The window grew to fit it.
+assert abs(last_option_bottom() - bottom) < 1, (last_option_bottom(), bottom)   # The window grew to fit it.
 panel.show_tab(2)                                # Typing a replacement is not choosing a shortcut.
 assert shortcut_calls == ["pause", "resume"] and not picker.is_recording()
 choose_other()

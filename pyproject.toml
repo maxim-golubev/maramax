@@ -1,6 +1,6 @@
 [project]
 name = "parakeet-dictation"
-version = "0.8.1"
+version = "0.9.0"
 description = "A dictation tool powered by Parakeet"
 readme = "README.md"
 license = { text = "MIT" }
@@ -8,11 +8,14 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "parakeet-mlx>=0.5.3,<0.6",
     "qwen3-asr-mlx>=0.2.0,<0.3",
+    # Imported directly (Metal cache, the model cache, TLS), not only through the two above.
+    "mlx>=0.31,<0.32",
+    "huggingface-hub>=1.18,<2",
+    "certifi>=2025.8.3",
     "numpy<2.3",
     "pyaudio~=0.2.14",
     "rumps~=0.4.0",
     "pyperclip~=1.9.0",
-    "python-dotenv~=1.1.1",
     "pyobjc-framework-cocoa~=11.1; platform_system == 'Darwin'",
 ]
 
@@ -44,6 +47,5 @@ module = [
     "AppKit.*",
     "Foundation.*",
     "PyObjCTools.*",
-    "UniformTypeIdentifiers.*",
 ]
 ignore_missing_imports = true
