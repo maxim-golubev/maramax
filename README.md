@@ -1,11 +1,11 @@
-<p align="center">
+<h1 align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/icon-dark.png">
-    <img alt="The Maramax icon: a white M on a graphite tile" src="docs/images/icon-light.png" width="128">
+    <img alt="The Maramax icon: a white M on a graphite tile" src="docs/images/icon-light.png" width="112">
   </picture>
-</p>
-
-<h1 align="center">Maramax</h1>
+  <br>
+  Maramax
+</h1>
 
 <p align="center">On-device dictation for Apple Silicon Macs.</p>
 

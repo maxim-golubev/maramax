@@ -27,6 +27,8 @@ ICTOOL = Path("/Applications/Xcode.app/Contents/Applications/Icon Composer.app/C
 CANVAS, TILE, LIFT = 1024, 824, 10
 ICNS_POINTS = (16, 32, 128, 256, 512)
 README_PIXELS = 256
+# On a web page the grid's margin is only empty space: the README's icon keeps just room for the shadow.
+README_TILE = 944
 
 
 def render_tile(rendition: str, pixels: int, path: Path) -> None:
@@ -36,13 +38,13 @@ def render_tile(rendition: str, pixels: int, path: Path) -> None:
                    check=True, capture_output=True)
 
 
-def icon_png(tile_png: Path, pixels: int) -> bytes:
-    """The tile placed on the icon grid with the system's drop shadow."""
+def icon_png(tile_png: Path, pixels: int, tile_size: int = TILE) -> bytes:
+    """The tile placed on the icon grid (`tile_size` of the 1024 canvas) with the system's drop shadow."""
     rep = NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel_(  # noqa: E501
         None, pixels, pixels, 8, 4, True, False, NSDeviceRGBColorSpace, 0, 0)
     rep.setSize_(NSMakeSize(pixels, pixels))
     scale = pixels / CANVAS
-    margin = (CANVAS - TILE) / 2 * scale
+    margin = (CANVAS - tile_size) / 2 * scale
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.setCurrentContext_(NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep))
     shadow = NSShadow.alloc().init()
@@ -52,7 +54,7 @@ def icon_png(tile_png: Path, pixels: int) -> bytes:
     shadow.set()
     tile = NSImage.alloc().initWithContentsOfFile_(str(tile_png))
     tile.drawInRect_fromRect_operation_fraction_(
-        NSMakeRect(margin, margin + LIFT * scale, TILE * scale, TILE * scale), NSMakeRect(0, 0, 0, 0),
+        NSMakeRect(margin, margin + LIFT * scale, tile_size * scale, tile_size * scale), NSMakeRect(0, 0, 0, 0),
         NSCompositingOperationSourceOver, 1.0)
     NSGraphicsContext.restoreGraphicsState()
     return bytes(rep.representationUsingType_properties_(NSPNGFileType, None))
@@ -86,8 +88,8 @@ def write_assets_car(scratch: Path) -> None:
 def write_readme_icons(scratch: Path) -> None:
     for rendition, name in (("Default", "light"), ("Dark", "dark")):
         tile = scratch / f"readme-{name}.png"
-        render_tile(rendition, round(README_PIXELS * TILE / CANVAS), tile)
-        (ROOT / "docs" / "images" / f"icon-{name}.png").write_bytes(icon_png(tile, README_PIXELS))
+        render_tile(rendition, round(README_PIXELS * README_TILE / CANVAS), tile)
+        (ROOT / "docs" / "images" / f"icon-{name}.png").write_bytes(icon_png(tile, README_PIXELS, README_TILE))
 
 
 if __name__ == "__main__":
