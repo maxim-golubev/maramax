@@ -2,6 +2,7 @@
 from types import SimpleNamespace
 import threading
 import time
+import weakref
 import zlib
 
 import numpy as np
@@ -39,6 +40,21 @@ def test_model_cache_is_released_when_inference_fails(monkeypatch):
     with pytest.raises(transcription.TranscriptionError, match="inference failed"):
         transcriber.transcribe_pcm(b"\x01\x00" * 1600)
     assert calls == ["collect", "clear"]
+
+
+def test_the_capture_is_out_of_memory_before_the_cache_is_cleared(monkeypatch):
+    held, alive = [], []
+    transcriber = recognizer([], generate=lambda mel: [recognized("spoken", "words.")])
+    monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: audio)
+
+    def first_pass_only(audio, tokens, progress_callback):
+        held.append(weakref.ref(audio))
+        return tokens
+
+    transcriber._repair_collapses = first_pass_only
+    monkeypatch.setattr(transcription.mx, "clear_cache", lambda: alive.append(held[0]() is not None))
+    assert transcriber.transcribe_pcm(b"\x01\x00" * 1600) == "spoken words."
+    assert alive == [False]  # Otherwise its buffer waits in the cache until the next inference.
 
 
 def test_empty_high_accuracy_result_falls_back_without_loading_another_model():
@@ -80,6 +96,28 @@ def test_stuck_draft_stream_is_rescued_by_the_other_engine_or_reported():
     stranded.transcriber.transcribe_pcm = lambda *_a, **_k: pytest.fail("the stuck encoder must not be used")
     with pytest.raises(transcription.TranscriptionError, match="stalled"):
         stranded._final_transcribe_pcm(b"\x01\x02")
+
+
+def test_vocabulary_alone_stands_only_if_the_standard_engine_also_hears_speech():
+    controller = routing()
+    controller.config.replacements = [{"heard": "mara max", "replacement": "Maramax"}]
+    controller.qwen.transcribe_pcm = lambda pcm, context=None: "Maramax."
+    assert controller._final_transcribe_pcm(b"\x01\x02") == "Maramax."    # The user said it.
+    controller.transcriber.transcribe_pcm = lambda *_a, **_k: ""
+    assert controller._final_transcribe_pcm(b"\x01\x02") == ""            # Context repeated over no speech.
+    controller.qwen.transcribe_pcm = lambda pcm, context=None: "Maramax is ready."
+    controller.transcriber.transcribe_pcm = lambda *_a, **_k: pytest.fail("a sentence needs no second opinion")
+    assert controller._final_transcribe_pcm(b"\x01\x02") == "Maramax is ready."
+
+
+def test_an_echo_is_never_reported_as_a_stalled_engine():
+    controller = routing(high_accuracy=False, encoder_free=False)
+    controller.config.replacements = [{"heard": "mara max", "replacement": "Maramax"}]
+    controller.transcriber.transcribe_pcm = lambda *_a, **_k: pytest.fail("the stuck encoder must not be used")
+    controller.qwen.transcribe_pcm = lambda pcm, context=None: ""            # An echo, already discarded.
+    assert controller._final_transcribe_pcm(b"\x01\x02") == ""
+    controller.qwen.transcribe_pcm = lambda pcm, context=None: "Maramax."    # Nothing can check it: it stands.
+    assert controller._final_transcribe_pcm(b"\x01\x02") == "Maramax."
 
 
 def test_high_accuracy_pass_is_given_the_users_vocabulary():
@@ -325,31 +363,36 @@ def collapse(word):
     return word.lower().strip(".,")
 
 
-def timed_audio_model(calls, collapses):
+def timed_audio_model(calls, collapses, script=FORMATTED, stretches=((10, 20),)):
     """A model that reads where its window starts from the audio itself (each
     sample holds its position in tenths of a second) and answers with the
-    words spoken in that window. `collapses(window_seconds)` says whether it
-    leaves the stretch spoken between 10 and 20 s unformatted."""
+    words of `script` spoken in that window. `collapses(start, seconds)`
+    says whether a window leaves what is spoken in `stretches` unformatted."""
     def generate(audio):
         start = round(float(audio[0]) * transcription.FULL_SCALE) / 10
         length = len(audio) / 16000
         calls.append((start, round(length, 1)))
-        spoken = [(at, word) for at, word in FORMATTED if start <= at < start + length]
-        if collapses(length):
-            spoken = [(at, collapse(word) if 10 <= at < 20 else word) for at, word in spoken]
+        spoken = [(at, word) for at, word in script if start <= at < start + length]
+        if collapses(start, length):
+            spoken = [(at, collapse(word) if any(low <= at < high for low, high in stretches) else word)
+                      for at, word in spoken]
         tokens = [AlignedToken(zlib.crc32(word.encode()), f" {word}", start=at - start, duration=0.4)
                   for at, word in spoken]
         return [SimpleNamespace(sentences=[SimpleNamespace(tokens=tokens)], tokens=tokens)]
     return generate
 
 
-FORTY_SECONDS = np.repeat(np.arange(400, dtype="<i2"), 1600).tobytes()
+def timed_audio(seconds):
+    return np.repeat(np.arange(seconds * 10, dtype="<i2"), 1600).tobytes()
+
+
+FORTY_SECONDS = timed_audio(40)
 
 
 def test_an_unformatted_stretch_is_recognized_again_and_spliced_in(monkeypatch):
     calls, progress = [], []
     monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: audio)
-    transcriber = recognizer(calls, timed_audio_model(calls, collapses=lambda seconds: seconds > 30))
+    transcriber = recognizer(calls, timed_audio_model(calls, collapses=lambda start, seconds: seconds > 30))
     text = transcriber.transcribe_pcm(FORTY_SECONDS, progress_callback=lambda *a: progress.append(a))
     assert text == "Hello there. So I think we should go. And then I said that we can do it later today. Thanks."
     # The whole capture, then the stretch with 5 s either side (10.0-18.4 s).
@@ -361,31 +404,111 @@ def test_a_repair_that_changes_the_words_is_not_accepted():
     original = words("so i think we should go and then we said that we can")
     reworded = words("So, I thought we could go. And then she said that we can.")
     same = words("So I think we should go. And then we said that we can.")
-    span = (0.0, 6.4)
-    assert transcription.repair_acceptable(original, same, span, span)
-    assert not transcription.repair_acceptable(original, reworded, span, span)
-    assert not transcription.repair_acceptable(original, original, span, span)  # Still unformatted.
+    assert transcription.repair_acceptable(original, same)
+    assert not transcription.repair_acceptable(original, reworded)
+    assert not transcription.repair_acceptable(original, original)  # Still unformatted.
 
 
-def test_a_repair_may_not_reword_the_formatted_text_around_the_stretch():
-    lead_in = words("The meeting went well. We agreed on the plan.", start=0.0)
-    stretch = words("so i think we should go and then we said that we", start=10.0)
-    fixed = words("So I think we should go. And then we said that we.", start=10.0)
-    reworded_lead_in = words("The meeting went badly. We argued about the plan.", start=0.0)
-    span, replaced = (10.0, 15.9), (0.0, 15.9)
-    assert transcription.repair_acceptable(lead_in + stretch, lead_in + fixed, span, replaced)
-    assert not transcription.repair_acceptable(lead_in + stretch, reworded_lead_in + fixed, span, replaced)
+def test_word_agreement_does_not_depend_on_which_recognition_comes_first():
+    original = words("for so i the then so and milk some")
+    candidate = words("for so i the then so and some milk the some")
+    # Nine words in common, in order: 2 x 9 / (9 + 11). A greedy match finds 8 one way round.
+    assert transcription.word_agreement(original, candidate) == pytest.approx(0.9)
+    assert transcription.word_agreement(candidate, original) == pytest.approx(0.9)
+    assert transcription.word_agreement(words("b c"), words("c b a c")) == pytest.approx(2 / 3)
+    assert transcription.word_agreement(words("c b a c"), words("b c")) == pytest.approx(2 / 3)
 
 
-def test_a_splice_and_its_check_agree_on_what_is_replaced():
-    assert transcription.replaced_range(5.0, 30.0, 60.0) == (9.0, 26.0)
-    assert transcription.replaced_range(0.0, 60.0, 60.0) == (0.0, 60.0)   # Nothing beyond the audio to merge with.
+def timed(*spoken):
+    """Tokens as the model gives them: (start, text) each, a leading space starting a word."""
+    return [AlignedToken(zlib.crc32(text.encode()), text, start=at, duration=0.08) for at, text in spoken]
+
+
+def text_of(tokens):
+    return "".join(token.text for token in tokens).strip()
+
+
+LEAD_IN = [(5.5, " finished"), (5.9, " it"), (6.2, " yet"), (6.4, ","), (6.5, " including"), (6.8, " me"),
+           (7.0, "."), (7.3, " So"), (7.4, ","), (7.5, " that"), (7.6, " is"), (7.7, " on"), (7.9, " my"),
+           (8.0, " list"), (8.3, ".")]
+STRETCH = "so i think we should go and then i said that we can"
+REDONE = "So, I think we should go. And then I said that we can."
+
+
+def spoken_from(start, text):
+    return [(start + index * 0.5, f" {word}") for index, word in enumerate(text.split())]
+
+
+def test_a_repair_changes_only_the_stretch_even_where_the_context_was_heard_differently():
+    # The first pass is formatted up to "list." and then collapses. The
+    # repair window hears the lead-in as "me, so that": merged on their
+    # shared words (the library's alignment pairs the two commas), that
+    # read "me. So, so that", a word said once written twice.
+    first_pass = timed(*LEAD_IN, *spoken_from(10.0, STRETCH), (17.0, " Thanks"), (17.3, "."))
+    heard_again = timed(*LEAD_IN[:6], (7.04, ","), (7.28, " so"), *LEAD_IN[9:], *spoken_from(10.0, REDONE),
+                        (17.0, " Thanks"), (17.3, "."))
+    span = transcription.collapsed_spans(transcription._words(first_pass))[0]
+    assert text_of(transcription.repaired(first_pass, heard_again, span, (5.0, 21.4))) == (
+        "finished it yet, including me. So, that is on my list. "
+        "So, I think we should go. And then I said that we can. Thanks.")
+
+
+def test_a_repair_needs_the_words_either_side_of_the_stretch_heard_alike():
+    first_pass = timed(*LEAD_IN, *spoken_from(10.0, STRETCH), (17.0, " Thanks"), (17.3, "."))
+    misheard_edge = timed(*LEAD_IN[:-2], (8.0, " lists"), (8.3, "."), *spoken_from(10.0, REDONE),
+                          (17.0, " Thanks"), (17.3, "."))
+    span = transcription.collapsed_spans(transcription._words(first_pass))[0]
+    assert transcription.repaired(first_pass, misheard_edge, span, (5.0, 21.4)) is None
+
+
+def test_a_repair_beside_a_long_pause_is_cut_at_the_stretch():
+    # "Thanks." comes 9 s after the stretch, beyond the window: it cannot be
+    # heard again, and whatever the window hears in the pause is not taken.
+    first_pass = timed(*LEAD_IN, *spoken_from(10.0, STRETCH), (25.0, " Thanks"), (25.3, "."))
+    heard_again = timed(*LEAD_IN, *spoken_from(10.0, REDONE), (19.0, " Hm"), (19.3, "."))
+    span = transcription.collapsed_spans(transcription._words(first_pass))[0]
+    assert text_of(transcription.repaired(first_pass, heard_again, span, (5.0, 21.4))) == (
+        "finished it yet, including me. So, that is on my list. "
+        "So, I think we should go. And then I said that we can. Thanks.")
+
+
+def test_every_unformatted_stretch_of_a_capture_is_repaired(monkeypatch):
+    calls = []
+    sentence = "So I think we should go. And then I said that we can do it later today."
+    script = FORMATTED + [(40.0 + index * 0.5, word) for index, word in enumerate(sentence.split())] + [
+        (60.0, "Bye.")]
+    monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: audio)
+    transcriber = recognizer(calls, timed_audio_model(calls, lambda start, seconds: seconds > 30, script,
+                                                      stretches=((10, 20), (40, 50))))
+    text = transcriber.transcribe_pcm(timed_audio(70))
+    assert text == f"Hello there. {sentence} Thanks. {sentence} Bye."
+    assert calls == [(0.0, 70.0), (5.0, 18.4), (35.0, 18.4)]
+
+
+def test_a_short_capture_is_not_recognized_again_as_its_own_window(monkeypatch):
+    calls = []
+    script = [(1.0 + index * 0.6, word) for index, word in
+              enumerate("So I think we should go. And then I said that we can do it later today.".split())]
+    monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: audio)
+    transcriber = recognizer(calls, timed_audio_model(calls, lambda start, seconds: True, script,
+                                                      stretches=((0, 15),)))
+    assert transcriber.transcribe_pcm(timed_audio(15)).startswith("so i think")
+    assert calls == [(0.0, 15.0)]  # Both windows would be the whole capture again.
+
+
+def test_a_window_that_collapses_too_is_retried_from_earlier(monkeypatch):
+    calls = []
+    monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: audio)
+    transcriber = recognizer(calls, timed_audio_model(calls, lambda start, seconds: seconds > 30 or start == 5.0))
+    text = transcriber.transcribe_pcm(FORTY_SECONDS)
+    assert text == "Hello there. So I think we should go. And then I said that we can do it later today. Thanks."
+    assert calls == [(0.0, 40.0), (5.0, 18.4), (0.0, 20.0), (16.0, 7.4)]
 
 
 def test_a_cancel_during_the_repair_keeps_the_finished_first_pass(monkeypatch):
     calls, progress = [], []
     monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: audio)
-    transcriber = recognizer(calls, timed_audio_model(calls, collapses=lambda seconds: seconds > 30))
+    transcriber = recognizer(calls, timed_audio_model(calls, collapses=lambda start, seconds: seconds > 30))
 
     def cancel_after_first_pass(*position):
         progress.append(position)
@@ -406,15 +529,14 @@ def test_no_chunk_lies_wholly_inside_the_previous_ones_overlap(monkeypatch):
     assert calls == [16000 * 120, 16000 * 115]
 
 
-def test_repair_seams_fall_outside_the_stretch():
-    assert transcription.REPAIR_CONTEXT_SECONDS > transcription.REPAIR_OVERLAP_SECONDS
+def test_a_retry_starts_earlier_than_the_first_try():
     assert transcription.REPAIR_RETRY_LEAD_SECONDS > transcription.REPAIR_CONTEXT_SECONDS
 
 
 def test_a_stretch_that_stays_unformatted_is_left_as_it_was(monkeypatch):
     calls = []
     monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: audio)
-    transcriber = recognizer(calls, timed_audio_model(calls, collapses=lambda seconds: True))
+    transcriber = recognizer(calls, timed_audio_model(calls, collapses=lambda start, seconds: True))
     text = transcriber.transcribe_pcm(FORTY_SECONDS)
     assert text == "Hello there. so i think we should go and then i said that we can do it later today Thanks."
     # One window, then one starting half a repair chunk earlier (two 20 s
@@ -433,7 +555,8 @@ def test_high_accuracy_pass_receives_the_users_vocabulary():
 @pytest.mark.parametrize("heard, expected", [
     ("Vocabulary: Maramax, Cairos.", ""),            # The model repeated its context: not a transcript.
     ("vocabulary maramax", ""),                      # A partial echo.
-    ("Maramax, Cairos.", ""),                        # The term list without its label.
+    ("Vocabulary: Maramax, Cairos. Okay.", ""),      # The context and more.
+    ("Maramax, Cairos.", "Maramax, Cairos."),        # The terms alone: the caller asks the audio.
     ("Maramax is ready.", "Maramax is ready."),      # Real speech that uses a vocabulary word.
     ("Okay.", "Okay."),
 ])
@@ -442,3 +565,16 @@ def test_vocabulary_echoed_back_on_silence_is_not_a_transcript(heard, expected):
     model.model = SimpleNamespace(transcribe=lambda samples, **kwargs: SimpleNamespace(text=heard))
     assert model.transcribe_pcm(b"\x01\x02" * 100, context="Vocabulary: Maramax, Cairos.") == expected
     assert model.transcribe_pcm(b"\x01\x02" * 100) == heard  # No context, nothing to echo.
+
+
+@pytest.mark.parametrize("heard, context, echo", [
+    ("Vocabulary: Maramax.", "Vocabulary: Maramax.", transcription.Echo.CERTAIN),
+    ("Vocabulary", "Vocabulary: Maramax.", transcription.Echo.CERTAIN),
+    ("Maramax.", "Vocabulary: Maramax.", transcription.Echo.POSSIBLE),        # Said, or the list repeated.
+    ("Maramax, Cairos.", "Vocabulary: Maramax, Cairos.", transcription.Echo.POSSIBLE),
+    ("Maramax is ready.", "Vocabulary: Maramax.", transcription.Echo.NONE),
+    ("Maramax, Cairos and the rest are fine.", "Vocabulary: Maramax, Cairos.", transcription.Echo.NONE),
+    ("Cairos.", "Vocabulary: Maramax, Cairos.", transcription.Echo.NONE),     # Not where an echo begins.
+])
+def test_only_text_that_cannot_be_speech_is_a_certain_echo(heard, context, echo):
+    assert transcription.context_echo(heard, context) is echo

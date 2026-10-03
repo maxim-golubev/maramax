@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import difflib
 import gc
 import os
 import re
@@ -13,6 +12,7 @@ import threading
 import time
 import wave
 from collections.abc import Callable
+from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
 
@@ -49,8 +49,8 @@ COLLAPSE_WORDS_WITH_LOWER_I = 12    # words without punctuation, one of them a l
 COLLAPSE_WORDS = 40                 # or this many without punctuation or any capital letter
 REPAIR_CHUNK_SECONDS = 20.0
 REPAIR_OVERLAP_SECONDS = 4.0
-# Audio either side of the stretch. It must exceed the overlap, so the seams
-# fall in formatted text, outside the stretch.
+# Audio either side of the stretch, so the words next to it are heard again
+# too: the splice cuts at them.
 REPAIR_CONTEXT_SECONDS = 5.0
 REPAIR_RETRY_LEAD_SECONDS = 15.0    # a window that collapsed too is tried once more, starting this early
 # A repair may change capitals and punctuation, not what was said.
@@ -68,6 +68,11 @@ class TranscriptionError(RuntimeError):
 
 class TranscriptionCancelled(TranscriptionError):
     """The user cancelled: raised from a progress callback to stop recognition."""
+
+
+def _bare(text: str) -> str:
+    """A word or text as said, not as written: no case, no punctuation, no spaces."""
+    return re.sub(r"[\W_]+", "", text.casefold())
 
 
 class Word(NamedTuple):
@@ -96,50 +101,42 @@ def collapsed_spans(words: list[Word]) -> list[tuple[float, float]]:
 
 
 def word_agreement(original: list[Word], candidate: list[Word]) -> float:
-    """How much of the wording two recognitions share (0–1), ignoring case and punctuation."""
-    def bare(words: list[Word]) -> list[str]:
-        return [re.sub(r"[\W_]+", "", word.text.casefold()) for word in words]
-    return difflib.SequenceMatcher(a=bare(original), b=bare(candidate), autojunk=False).ratio()
+    """How much of the wording two recognitions share (0–1), ignoring case and
+    punctuation: twice the longest common subsequence of their words over
+    their total, so the order of the arguments does not matter."""
+    first, second = [_bare(word.text) for word in original], [_bare(word.text) for word in candidate]
+    if not first and not second:
+        return 1.0
+    shared = [0] * (len(second) + 1)  # One row of the subsequence table.
+    for said in first:
+        diagonal = 0
+        for column, heard in enumerate(second, 1):
+            diagonal, shared[column] = shared[column], (diagonal + 1 if said == heard
+                                                         else max(shared[column], shared[column - 1]))
+    return 2 * shared[-1] / (len(first) + len(second))
 
 
-def replaced_range(start: float, end: float, seconds: float) -> tuple[float, float]:
-    """The part of a repair window from `start` to `end` seconds that a
-    splice takes from the re-recognition alone. Within one overlap of an
-    inner edge the two are merged on the words they share; an edge at the
-    start or end of the audio has nothing to merge with."""
-    return (start + REPAIR_OVERLAP_SECONDS if start > 0 else 0.0,
-            end - REPAIR_OVERLAP_SECONDS if end < seconds else seconds)
+def repair_acceptable(stretch: list[Word], replacement: list[Word]) -> bool:
+    """Whether `replacement` may stand in for the unformatted `stretch`:
+    formatted throughout, and saying the same words."""
+    return (bool(replacement) and not collapsed_spans(replacement)
+            and word_agreement(stretch, replacement) >= MIN_WORD_AGREEMENT)
 
 
-def repair_acceptable(original: list[Word], candidate: list[Word], span: tuple[float, float],
-                      replaced: tuple[float, float]) -> bool:
-    """Whether `candidate` may replace what lies in `replaced`: formatted
-    throughout, and saying the same words both in the unformatted `span` and
-    in the formatted text around it, judged apart so agreeing context cannot
-    hide a change inside the stretch. Word times move a little between
-    recognitions, so each comparison reaches slightly past its ends."""
-    def within(words: list[Word], low: float, high: float) -> list[Word]:
-        return [word for word in words if low - _TIMING_SLACK_SECONDS <= word.start < high + _TIMING_SLACK_SECONDS]
-
-    def around_span(words: list[Word]) -> list[Word]:
-        inside = set(map(id, within(words, *span)))
-        return [word for word in within(words, *replaced) if id(word) not in inside]
-
-    return (bool(candidate) and not collapsed_spans(candidate)
-            and word_agreement(within(original, *span), within(candidate, *span)) >= MIN_WORD_AGREEMENT
-            and word_agreement(around_span(original), around_span(candidate)) >= MIN_WORD_AGREEMENT)
+def _word_tokens(tokens: list[AlignedToken]) -> list[list[AlignedToken]]:
+    """Tokens grouped into words: a token that begins with a space starts one."""
+    groups: list[list[AlignedToken]] = []
+    for token in tokens:
+        if groups and not token.text.startswith(" "):
+            groups[-1].append(token)
+        else:
+            groups.append([token])
+    return groups
 
 
 def _words(tokens: list[AlignedToken]) -> list[Word]:
-    """Tokens joined into words: a token that begins with a space starts one."""
-    words: list[Word] = []
-    for token in tokens:
-        if words and not token.text.startswith(" "):
-            last = words[-1]
-            words[-1] = Word(last.start, token.end, last.text + token.text)
-        else:
-            words.append(Word(token.start, token.end, token.text))
-    return words
+    return [Word(group[0].start, group[-1].end, "".join(token.text for token in group))
+            for group in _word_tokens(tokens)]
 
 
 def _merge(left: list[AlignedToken], right: list[AlignedToken], overlap_seconds: float) -> list[AlignedToken]:
@@ -151,17 +148,38 @@ def _merge(left: list[AlignedToken], right: list[AlignedToken], overlap_seconds:
         return merge_longest_common_subsequence(left, right, overlap_duration=overlap_seconds)
 
 
-def _splice(tokens: list[AlignedToken], replacement: list[AlignedToken], start: float, end: float,
-            seconds: float) -> list[AlignedToken]:
-    """`tokens` with what lies between `start` and `end` seconds taken from
-    `replacement`, joined on the words both have near each edge. An edge at
-    the start or end of the audio has nothing beyond it to join to: the
-    replacement runs to it."""
-    low, high = replaced_range(start, end, seconds)
-    before = [token for token in tokens if token.start < low] if start > 0 else []
-    after = [token for token in tokens if token.end > high] if end < seconds else []
-    joined = _merge(before, replacement, REPAIR_OVERLAP_SECONDS) if before else replacement
-    return _merge(joined, after, REPAIR_OVERLAP_SECONDS) if after else joined
+def repaired(tokens: list[AlignedToken], candidate: list[AlignedToken], span: tuple[float, float],
+             window: tuple[float, float]) -> list[AlignedToken] | None:
+    """`tokens` with the unformatted `span` (seconds) replaced by what
+    `candidate`, a recognition of `window`, heard there; None when it may
+    not be. Only the stretch changes: the cut falls at the words on either
+    side of it, which both recognitions must have heard alike (the same
+    word, starting within the timing slack), and everything outside is kept
+    as it was. Where there is no such word inside the window, the stretch
+    begins or ends the capture or a pause longer than the context: the
+    candidate is cut at the span's edge instead."""
+    said, heard = _words(tokens), _words(candidate)
+
+    def reachable(index: int) -> bool:
+        return 0 <= index < len(said) and window[0] <= said[index].start and said[index].end <= window[1]
+
+    def heard_alike(index: int) -> int | None:
+        neighbour = said[index]
+        alike = [position for position, word in enumerate(heard) if _bare(word.text) == _bare(neighbour.text)
+                 and abs(word.start - neighbour.start) <= _TIMING_SLACK_SECONDS]
+        return min(alike, key=lambda position: abs(heard[position].start - neighbour.start), default=None)
+
+    def first_from(seconds: float) -> int:
+        return next((position for position, word in enumerate(heard) if word.start >= seconds), len(heard))
+
+    inside = [index for index, word in enumerate(said) if span[0] <= word.start and word.end <= span[1]]
+    before, after = inside[0] - 1, inside[-1] + 1
+    low = heard_alike(before) if reachable(before) else first_from(span[0] - _TIMING_SLACK_SECONDS) - 1
+    high = heard_alike(after) if reachable(after) else first_from(span[1] + _TIMING_SLACK_SECONDS)
+    if low is None or high is None or not repair_acceptable(said[before + 1:after], heard[low + 1:high]):
+        return None
+    original, redone = _word_tokens(tokens), _word_tokens(candidate)
+    return [token for word in [*original[:before + 1], *redone[low + 1:high], *original[after:]] for token in word]
 
 
 def cached_model_source(model_id: str) -> str:
@@ -281,7 +299,7 @@ class ParakeetTranscriber:
         # less than one analysis hop cannot form a spectrogram frame.
         if len(samples) < config.hop_length:
             return ""
-        tokens = None
+        tokens = audio = None
         try:
             audio = mx.array(samples).astype(mx.float32) / FULL_SCALE
             tokens = self._tokens_in_chunks(audio, 0, len(audio), CHUNK_SECONDS, OVERLAP_SECONDS, progress_callback)
@@ -290,7 +308,9 @@ class ParakeetTranscriber:
         finally:
             # Cancellation and inference errors need cleanup too, otherwise
             # repeated failed sessions can retain Metal's cached allocations.
-            del tokens
+            # The audio goes too: once this returns, its buffer would wait in
+            # the cache until the next inference.
+            del tokens, audio
             gc.collect()
             mx.clear_cache()
 
@@ -349,7 +369,6 @@ class ParakeetTranscriber:
         and keeps what is recognized: the first pass is a whole transcript."""
         assert self.model is not None
         rate = self.model.preprocessor_config.sample_rate
-        seconds = len(audio) / rate
         # Recognition is deterministic, so a window is never recognized
         # twice; a short capture's first pass already was its only window.
         tried = {(0, len(audio))} if len(audio) <= int(REPAIR_CHUNK_SECONDS * rate) else set()
@@ -374,9 +393,9 @@ class ParakeetTranscriber:
                         return tokens
                 candidate = self._tokens_in_chunks(audio, first, last, REPAIR_CHUNK_SECONDS, REPAIR_OVERLAP_SECONDS,
                                                    None)
-                if repair_acceptable(_words(tokens), _words(candidate), (span_start, span_end),
-                                     replaced_range(first / rate, last / rate, seconds)):
-                    tokens = _splice(tokens, candidate, first / rate, last / rate, seconds)
+                spliced = repaired(tokens, candidate, (span_start, span_end), (first / rate, last / rate))
+                if spliced is not None:
+                    tokens = spliced
                     logger.info(f"Recognized an unformatted stretch again ({span_start:.0f}–{span_end:.0f} s)")
                     break
         return tokens
@@ -441,6 +460,28 @@ class ParakeetTranscriber:
         finally:
             gc.collect()
             mx.clear_cache()
+
+
+class Echo(Enum):
+    """Whether the high-accuracy model's answer is its context said back,
+    which it tends to answer with on audio that has no speech in it."""
+    NONE = "none"           # a transcript
+    POSSIBLE = "possible"   # only vocabulary terms: said by the user, or the term list repeated
+    CERTAIN = "certain"     # the context with its label ("Vocabulary: …"): not speech
+
+
+def context_echo(text: str, context: str) -> Echo:
+    """How far `text` could be `context` repeated: the beginning of the
+    context with its label, or all of it and more, is an echo; the
+    beginning of its term list could be one. Speech that only starts with
+    the terms is a transcript."""
+    heard = _bare(text)
+    labelled, terms = _bare(context), _bare(context.partition(":")[2])
+    if heard and terms.startswith(heard):
+        return Echo.POSSIBLE
+    if heard and (labelled.startswith(heard) or heard.startswith(labelled)):
+        return Echo.CERTAIN
+    return Echo.NONE
 
 
 class QwenTranscriber:
@@ -581,20 +622,17 @@ class QwenTranscriber:
         mx.clear_cache()
 
     @staticmethod
-    def _without_echo(text: str, context: str | None) -> str:
-        """Given audio with no speech in it, the model tends to answer with
-        the context it was handed. That is not a transcript: report no text
-        so the caller's fallback decides."""
-        if not context or not text:
-            return text
-
-        def squash(value: str) -> str:
-            return re.sub(r"[\W_]+", "", value.casefold())
-
-        heard = squash(text)
-        # The whole context, or just what follows its label ("Vocabulary: …").
-        echoes = [squash(context), squash(context.partition(":")[2])]
-        return "" if heard and any(e and (e.startswith(heard) or heard.startswith(e)) for e in echoes) else text
+    def _transcript(model, audio: np.ndarray | str, context: str | None) -> str:
+        """What `model` hears in `audio` (samples or a WAV file), told the
+        spellings in `context`. An answer that is certainly the context said
+        back is no text, so the caller's fallback decides. One made only of
+        vocabulary terms is returned: context_echo() tells the caller it may
+        be either, and only the audio can tell which (without its context
+        the model answers noise with words of its own)."""
+        result = model.transcribe(audio, language="en", context=context)
+        text = (result.text or "").strip()
+        del result
+        return "" if context and context_echo(text, context) is Echo.CERTAIN else text
 
     def transcribe_pcm(self, pcm_bytes: bytes, context: str | None = None) -> str:
         """Recognize a capture in the app's PCM format. `context` is free
@@ -604,21 +642,18 @@ class QwenTranscriber:
             return ""
 
         model = self._acquire_model()
-        result = None
         samples = None
         try:
             samples = _samples(pcm_bytes).astype(np.float32) / FULL_SCALE
-            result = model.transcribe(samples, language="en", context=context)
-            return self._without_echo((result.text or "").strip(), context)
+            return self._transcript(model, samples, context)
         finally:
-            del result, samples
+            del samples
             self._release_model()
             gc.collect()
             mx.clear_cache()
 
     def transcribe_file(self, file_path: str | Path, context: str | None = None) -> str:
         model = self._acquire_model()
-        result = None
         try:
             normalized_path = normalize_media(file_path)
             try:
@@ -628,15 +663,13 @@ class QwenTranscriber:
                             return ""
                 except (wave.Error, OSError):
                     pass  # Not inspectable as WAV: let the model report what it finds.
-                result = model.transcribe(normalized_path, language="en", context=context)
-                return self._without_echo((result.text or "").strip(), context)
+                return self._transcript(model, normalized_path, context)
             finally:
                 try:
                     os.unlink(normalized_path)
                 except OSError:
                     pass
         finally:
-            del result
             self._release_model()
             gc.collect()
             mx.clear_cache()

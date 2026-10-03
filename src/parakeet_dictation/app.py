@@ -33,7 +33,8 @@ from .paths import app_bundle, app_support_dir, resource_path
 from .preferences import PreferencesController
 from .recordings import RecordingStatus, RecordingStore, recovery_candidate
 from .recordings_window import RecordingsController
-from .transcription import ParakeetTranscriber, QwenTranscriber, TranscriptionCancelled, TranscriptionError
+from .transcription import (Echo, ParakeetTranscriber, QwenTranscriber, TranscriptionCancelled, TranscriptionError,
+                            context_echo)
 from .update_offer import CHECK_TITLE, UpdateOffer
 from .welcome import WelcomeController
 
@@ -616,40 +617,54 @@ class DictationApp(rumps.App):
         # jargon are spelled; the replacement targets are exactly that list.
         return vocabulary_hint(self.config.replacements) if self.config.use_corrections else None
 
-    def _final_pass(self, qwen_pass, parakeet_pass, cancel_event: threading.Event) -> str:
+    def _final_pass(self, qwen_pass, parakeet_pass, cancel_event: threading.Event, vocabulary: str | None) -> str:
         """Which engine produces the final text. The draft stream must have
         let go of Parakeet's encoder first; if it never does, only Qwen can
         still produce a transcript."""
         encoder_free = self.transcriber.finish_drafts()
         if cancel_event.is_set():
             raise TranscriptionCancelled("Cancelled")
+        heard: str | None = None  # What Qwen heard; None when it did not run or failed.
         if self.qwen.is_ready() and (self.config.high_accuracy or not encoder_free):
             try:
-                text = qwen_pass()
-                if text:
-                    return text
-                logger.warning("High-accuracy model returned no text; trying the standard model")
+                heard = qwen_pass()
             except Exception as exc:
                 # Any Qwen failure falls back to the standard engine.
                 logger.error(f"High-accuracy transcription failed, falling back: {exc}")
+        if heard and (not encoder_free or vocabulary is None or context_echo(heard, vocabulary) is not Echo.POSSIBLE):
+            return heard
         if cancel_event.is_set():
             raise TranscriptionCancelled("Cancelled")
         if not encoder_free:
-            raise TranscriptionError("Transcription engine stalled — restart the app")
+            if heard is None:
+                raise TranscriptionError("Transcription engine stalled — restart the app")
+            # Nothing else can listen and Qwen heard no speech: that is the
+            # outcome, not a stalled engine.
+            return heard
+        if heard:
+            # Only vocabulary terms: the user said them, or Qwen repeated its
+            # context over no speech. The standard engine hears which.
+            return heard if parakeet_pass() else ""
+        if heard is not None:
+            logger.warning("High-accuracy model returned no text; trying the standard model")
         return parakeet_pass()
 
     def _final_transcribe_pcm(self, pcm_bytes: bytes) -> str:
+        vocabulary = self._vocabulary_hint()
         return self._final_pass(
-            lambda: self.qwen.transcribe_pcm(pcm_bytes, context=self._vocabulary_hint()),
+            lambda: self.qwen.transcribe_pcm(pcm_bytes, context=vocabulary),
             lambda: self.transcriber.transcribe_pcm(pcm_bytes, progress_callback=self._check_cancel),
             self._cancel_event,
+            vocabulary,
         )
 
     def _final_transcribe_file(self, path: str, progress_callback, cancel_event: threading.Event) -> str:
+        vocabulary = self._vocabulary_hint()
         return self._final_pass(
-            lambda: self.qwen.transcribe_file(path, context=self._vocabulary_hint()),
+            lambda: self.qwen.transcribe_file(path, context=vocabulary),
             lambda: self.transcriber.transcribe_file(path, progress_callback=progress_callback),
             cancel_event,
+            vocabulary,
         )
 
     def _settle_spill(self, record) -> bool:
