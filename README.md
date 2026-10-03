@@ -1,21 +1,31 @@
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/icon-dark.png">
-  <img alt="The Maramax icon: a white M on a graphite tile" src="docs/images/icon-light.png" width="96">
-</picture>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/icon-dark.png">
+    <img alt="The Maramax icon: a white M on a graphite tile" src="docs/images/icon-light.png" width="128">
+  </picture>
+</p>
 
-# Maramax
+<h1 align="center">Maramax</h1>
 
-On-device dictation for Apple Silicon Macs. Press **Option+Space** (or a
-shortcut you choose), speak, press it again: NVIDIA's Parakeet model
-transcribes on the GPU through MLX, and the text is copied, or pasted into the
-app you were using. No audio or text leaves the Mac.
+<p align="center">On-device dictation for Apple Silicon Macs.</p>
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/dictation-dark.gif">
-  <img alt="The Maramax dictation bar through one dictation: connecting, recording with a live level meter and timer, transcribing, then 'Copied transcript to clipboard'" src="docs/images/dictation-light.gif" width="460">
-</picture>
+<p align="center">
+  <a href="https://github.com/maxim-golubev/maramax/releases/latest"><b>Download for Apple Silicon</b></a> ·
+  <a href="docs/guide.md">User guide</a> ·
+  <a href="docs/architecture.md">Architecture</a> ·
+  <a href="docs/validation.md">What was measured</a>
+</p>
 
-**[Download for Apple Silicon](https://github.com/maxim-golubev/maramax/releases/latest)** · [User guide](docs/guide.md) · [Architecture](docs/architecture.md) · [What was measured](docs/validation.md)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/dictation-dark.gif">
+    <img alt="The Maramax dictation bar through one dictation: connecting, recording with a live level meter and timer, transcribing, then 'Copied transcript to clipboard'" src="docs/images/dictation-light.gif" width="460">
+  </picture>
+</p>
+
+Press **Option+Space** (or a shortcut you choose), speak, press it again:
+NVIDIA's Parakeet model transcribes on the GPU through MLX, and the text is
+copied, or pasted into the app you were using. No audio or text leaves the Mac.
 
 - **Fast:** on an M3 Pro, a dictation under 30 seconds is transcribed in about
   0.3 s and one over two minutes in about 3 s (medians over 20 real dictations).
