@@ -530,7 +530,8 @@ animation and a diagram rendered from the app's own views (Mermaid's controls
 covered the diagram on GitHub), qualifies what was tested only with a fake
 audio device, and credits the forked projects with a measured share.
 *(Note, October 2, 2026: that share, 53 lines, could not be reproduced; the
-README now gives what plain `git blame` over `src/` attributes to them.)* The
+README no longer gives a count, and the fake-device qualification now lives
+only in this file.)* The
 architecture has its own document, `docs/architecture.md`; the launch
 guide no longer describes the author's own Mac.
 
