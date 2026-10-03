@@ -9,7 +9,7 @@ from parakeet_dictation.config import AppConfig
 from parakeet_dictation.hotkeys import (
     DEFAULT_DICTATE, KEY_NAMES, HotKeyError, cmdKey, controlKey, dictation_shortcut, optionKey,
 )
-from parakeet_dictation.welcome import recording_note, try_it_text
+from parakeet_dictation.welcome import recording_note, shortcut_page_text, try_it_text
 
 D, E, SPACE = 0x02, 0x0E, 0x31
 
@@ -112,9 +112,10 @@ def test_either_welcome_choice_copies_the_transcript(monkeypatch, tmp_path):
     app.choose_delivery(False)                                     # "Copy the transcript"
     saved = AppConfig.load(app._settings_path)
     assert (saved.auto_copy_to_clipboard, saved.paste_to_active_app) == (True, False)
-    assert "copied automatically" in intro[-1]
+    shown = [module.intro_text("Option+Space", app.config), module.empty_history_text("Option+Space")]
+    assert intro[-2:] == shown and "copied automatically" in intro[-2]
     app.choose_delivery(True)
-    assert app.config.paste_to_active_app and "pasted into the app" in intro[-1]
+    assert app.config.paste_to_active_app and "pasted into the app" in intro[-2]
 
 
 def test_changing_a_setting_rewrites_what_the_window_and_the_welcome_say(monkeypatch, tmp_path):
@@ -122,7 +123,8 @@ def test_changing_a_setting_rewrites_what_the_window_and_the_welcome_say(monkeyp
     refreshed = []
     app._welcome_window = SimpleNamespace(refresh=lambda: refreshed.append("welcome"))
     app.toggle_setting("auto_copy_to_clipboard")                   # Turned off.
-    assert intro == [module.intro_text("Option+Space", app.config)] and "stays here" in intro[0]
+    assert intro == [module.intro_text("Option+Space", app.config), module.empty_history_text("Option+Space")]
+    assert "stays here" in intro[0]
     assert refreshed == ["welcome"]
 
 
@@ -143,6 +145,8 @@ def test_try_it_describes_what_these_settings_do():
     assert "copied" not in kept and "Open Transcript" in kept
     manual = try_it_text("Option+Space", AppConfig(auto_start_recording=False))
     assert "to open Maramax, then Cmd+R to start" in manual
+    assert "Press it to start dictating" in shortcut_page_text(AppConfig())
+    assert "Press it to open Maramax, then Cmd+R" in shortcut_page_text(AppConfig(auto_start_recording=False))
     assert "small bar" in recording_note(AppConfig())
     for config in (AppConfig(compact_dictation=False), AppConfig(auto_start_recording=False)):
         assert "small bar" not in recording_note(config) and "Maramax window" in recording_note(config)

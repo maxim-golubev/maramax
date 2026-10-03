@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 
-from .atomic_file import write_text_atomically
+from .atomic_file import TEMP_SUFFIX, write_text_atomically
 from .audio_format import CHANNELS, SAMPLE_RATE, SAMPLE_WIDTH, seconds
 from .logger_config import logger
 
@@ -22,7 +22,7 @@ MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 # What a recording leaves on disk: its audio, its metadata, and the temporary
 # files of an atomic write of either.
 _AUDIO_SUFFIX, _METADATA_SUFFIX = ".wav", ".json"
-_TEMP_SUFFIXES = (_AUDIO_SUFFIX + ".tmp", _METADATA_SUFFIX + ".tmp")
+_TEMP_SUFFIXES = (_AUDIO_SUFFIX + TEMP_SUFFIX, _METADATA_SUFFIX + TEMP_SUFFIX)
 
 
 class RecordingStatus(StrEnum):
@@ -104,10 +104,10 @@ class RecordingStore:
         snapshot is read without the writer lock and the UI stays responsive
         during a large save."""
         records = []
-        for path in self.base_dir.glob("*.wav"):
+        for path in self.base_dir.glob(f"*{_AUDIO_SUFFIX}"):
             try:
                 self.audio_path(path.stem)
-                payload = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+                payload = json.loads(path.with_suffix(_METADATA_SUFFIX).read_text(encoding="utf-8"))
                 record = self._from_metadata(payload, path.stem)
             except (OSError, ValueError, TypeError):
                 # A crash between WAV and metadata writes must not hide

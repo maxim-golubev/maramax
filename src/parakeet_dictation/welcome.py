@@ -39,6 +39,14 @@ def try_it_text(shortcut: str, config: AppConfig) -> str:
             f"sentence and press {STOP.label} again: in a moment the text is {outcome}.")
 
 
+def shortcut_page_text(config: AppConfig) -> str:
+    if config.auto_start_recording:
+        return (f"Press it to start dictating, and again to finish. While you dictate, {STOP.label} finishes too. "
+                "You can change it later in Settings.")
+    return (f"Press it to open Maramax, then {STOP.label} to start dictating and again to finish. You can change "
+            "it later in Settings.")
+
+
 def recording_note(config: AppConfig) -> str:
     """What shows while the first dictation records."""
     # The shortcut opens the full window instead when it does not start recording.
@@ -140,10 +148,10 @@ class WelcomeController(NSObject):
 
     @objc.python_method
     def _shortcut_page(self):
+        self.shortcut_text = self._body("")
         return self._stack([
             self._title("Choose your shortcut"),
-            self._body(f"Press it to start dictating, and again to finish. While you dictate, {STOP.label} "
-                       "finishes too. You can change it later in Settings."),
+            self.shortcut_text,
             self.picker.view,
         ], spacing=12)
 
@@ -214,6 +222,7 @@ class WelcomeController(NSObject):
         config = self.delegate.config
         self.model_status.setStringValue_(self.delegate.transcriber.status_message() + ".")
         self.picker.refresh()
+        self.shortcut_text.setStringValue_(shortcut_page_text(config))
         delivery = config.delivery()
         # With copying turned off in Settings, neither choice is what happens now.
         self.copy_choice.setState_(int(delivery is Delivery.COPIED))

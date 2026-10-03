@@ -87,7 +87,7 @@ class UpdateProgressWindow(NSObject):
     @objc.python_method
     def show_ready(self, version, busy):
         self.title.setStringValue_(f"Maramax {version} is ready")
-        self.detail.setStringValue_("Maramax restarts as soon as you finish dictating." if busy
+        self.detail.setStringValue_("Maramax restarts as soon as it is idle." if busy
                                     else "Maramax restarts in a moment.")
         # Also after "Restarting…" gave way to waiting again: the wait can still be cancelled.
         self.cancel.setEnabled_(True)

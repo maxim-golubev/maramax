@@ -91,7 +91,7 @@ def default_input_device() -> int | None:
     except Exception as exc:
         # Unknown compares equal to unknown, so a kept-warm stream is then
         # reused as it was before the default was checked.
-        logger.debug(f"Default input device unavailable: {exc}")
+        logger.warning(f"Default input device unavailable: {exc}")
         return None
 
 

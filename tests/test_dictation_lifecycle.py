@@ -37,6 +37,7 @@ def controller(monkeypatch):
     app._recordings_window = None
     app._preferences_window = None
     app._welcome_window = None
+    app.history_store = SimpleNamespace(render=lambda: None)
     app._previous_app = None
     app._capture_health = None
     app._capture_device = ""
@@ -50,6 +51,7 @@ def controller(monkeypatch):
         prepare_for_recording=lambda: None,
         show_mode=lambda _mode: calls.append("activated window"),
         focus=lambda: calls.append("focused"),
+        set_history_text=lambda _text: None,
         show_active_microphone=lambda _name: None,
         set_capture=lambda _snapshot: None,
         set_transcribing=lambda _on: None,

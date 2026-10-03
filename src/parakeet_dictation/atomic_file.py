@@ -8,11 +8,14 @@ from pathlib import Path
 
 from .logger_config import logger
 
+# What an interrupted write_text_atomically() leaves beside its file.
+TEMP_SUFFIX = ".tmp"
+
 
 def write_text_atomically(path: Path, text: str) -> None:
     """Replace a file's contents so that a crash or a kill leaves either the
     old version or the new one, never a partial file."""
-    temp = path.with_name(path.name + ".tmp")
+    temp = path.with_name(path.name + TEMP_SUFFIX)
     try:
         with temp.open("w", encoding="utf-8") as handle:
             handle.write(text)
@@ -47,6 +50,6 @@ def remove_leftovers(path: Path) -> None:
     """Delete what this module may have left beside `path`: copies set aside
     by set_aside() and the temporary file of an interrupted write. For a
     caller erasing the file's contents for good."""
-    for leftover in (path.with_name(path.name + ".tmp"), path.with_name(path.name + ".corrupt"),
+    for leftover in (path.with_name(path.name + TEMP_SUFFIX), path.with_name(path.name + ".corrupt"),
                      *path.parent.glob(f"{glob.escape(path.name)}.corrupt-*")):
         leftover.unlink(missing_ok=True)

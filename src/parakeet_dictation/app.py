@@ -63,6 +63,10 @@ _DELIVERY_TEXT = {
 
 
 
+def unregistered_status(shortcut: str) -> str:
+    return f"Maramax could not register {shortcut} — choose another shortcut in Settings"
+
+
 def intro_text(shortcut: str, config: AppConfig) -> str:
     """What the empty window says; it is open when there is nothing to show yet.
     Without auto_start_recording the shortcut brings this window up, where
@@ -359,8 +363,7 @@ class DictationApp(rumps.App):
             logger.info(f"Registered global shortcut: {self._dictate.label}")
         except HotKeyError as exc:
             logger.error(f"Global hotkey registration failed: {exc}")
-            self._hotkey_error_message = (f"Maramax could not register {self._dictate.label} — choose another "
-                                          "shortcut in Settings")
+            self._hotkey_error_message = unregistered_status(self._dictate.label)
             self._push_status(self._hotkey_error_message)
             return
         # Chosen before macOS took it for itself: it would never reach Maramax.
@@ -474,15 +477,16 @@ class DictationApp(rumps.App):
         self._capture_at_stop = None
         self._stop_when_connected = False
         self._compact_session = self.config.compact_dictation and not self.overlay_visible
-        self._set_phase(Phase.CONNECTING)
         session = self._session
         # The microphone opens first: every millisecond of window drawing
         # ahead of it is speech that would not be captured. The cancel
-        # event belongs to this one attempt.
+        # event belongs to this one attempt. Its result comes back through
+        # callAfter, so the phase is set before the worker can report.
         self._start_cancel = threading.Event()
         self._start_thread = threading.Thread(
             target=self._start_recording_worker, args=(session, self._start_cancel), daemon=True)
         self._start_thread.start()
+        self._set_phase(Phase.CONNECTING)  # Settings and Recordings disable what a recording forbids.
         if self._recordings_window is not None:
             self._recordings_window.stop_playback()
         self.overlay_controller.prepare_for_recording()
@@ -1191,7 +1195,6 @@ class DictationApp(rumps.App):
         value = not getattr(self.config, name)
         setattr(self.config, name, value)
         self._save_settings()
-        self._refresh_intro()
         if name == "paste_to_active_app" and value and not accessibility_trusted():
             self._push_status("Grant Accessibility access to enable auto-paste", revert_after=8)
             self.open_accessibility_settings()
@@ -1204,9 +1207,7 @@ class DictationApp(rumps.App):
                 self._push_status("High-accuracy model unloaded", revert_after=5)
         elif name == "prefer_builtin_mic":
             self._microphone_settings_changed()
-        self._refresh_preferences()
-        if self._welcome_window is not None:
-            self._welcome_window.refresh()  # Its choices and its Try it step describe these settings.
+        self._show_settings_changed()
 
     def replace_word_rules(self, rules: list[dict[str, str]]) -> bool:
         self.config.replacements = rules
@@ -1281,24 +1282,22 @@ class DictationApp(rumps.App):
         if problem is not None:
             return problem
         spec = dictation_shortcut(key_code, modifiers, layout_key_names())
-        if self.hotkey_manager is not None:
-            try:
-                self.hotkey_manager.set_dictation_shortcut(spec)
-            except HotKeyError as exc:
-                logger.warning(f"Could not register {spec.label}: {exc}")
-                self.resume_shortcut()  # The previous one, if recording had paused it.
-                return f"Maramax could not register {spec.label}. Choose another."
+        if self.hotkey_manager is None:
+            # Installing the shortcut handler failed at launch.
+            return "Global shortcuts are unavailable. Restart Maramax, then choose again."
+        try:
+            self.hotkey_manager.set_dictation_shortcut(spec)
+        except HotKeyError as exc:
+            logger.warning(f"Could not register {spec.label}: {exc}")
+            self.resume_shortcut()  # The previous one, if recording had paused it.
+            return f"Maramax could not register {spec.label}. Choose another."
         self._dictate = spec
         recovered = self._hotkey_error_message is not None
         self._hotkey_error_message = None
         self.config.dictation_shortcut = [key_code, modifiers]
         self._save_settings()
         logger.info(f"Dictation shortcut is now {spec.label}")
-        self._refresh_intro()
-        self._refresh_history_on_main()
-        self._refresh_preferences()
-        if self._welcome_window is not None:
-            self._welcome_window.refresh()
+        self._show_settings_changed()
         if recovered and not self.is_busy:
             # The status was telling the user to choose another shortcut.
             self._show_status("Ready" if self.transcriber.is_ready() else self.transcriber.status_message())
@@ -1315,8 +1314,7 @@ class DictationApp(rumps.App):
                 self.hotkey_manager.set_dictation_shortcut(self._dictate)
             except HotKeyError as exc:
                 logger.error(f"Could not register {self._dictate.label} again: {exc}")
-                self._hotkey_error_message = (f"Maramax could not register {self._dictate.label} — choose another "
-                                              "shortcut in Settings")
+                self._hotkey_error_message = unregistered_status(self._dictate.label)
                 self._push_status(self._hotkey_error_message)
 
     # -- Welcome --
@@ -1336,8 +1334,7 @@ class DictationApp(rumps.App):
         self.config.auto_copy_to_clipboard = True
         self.config.paste_to_active_app = paste
         self._save_settings()
-        self._refresh_intro()
-        self._refresh_preferences()
+        self._show_settings_changed()
 
     def paste_permitted(self) -> bool:
         return accessibility_trusted()
@@ -1386,6 +1383,14 @@ class DictationApp(rumps.App):
         self._push_status("History cleared" if cleared else
                           "Audio cleared, but transcript history could not be deleted from disk",
                           revert_after=8)
+
+    def _show_settings_changed(self) -> None:
+        """Every view that describes the settings or the shortcut says it again."""
+        self._refresh_intro()
+        self._refresh_history_on_main()
+        self._refresh_preferences()
+        if self._welcome_window is not None:
+            self._welcome_window.refresh()
 
     def _refresh_intro(self) -> None:
         self.overlay_controller.set_intro_text(intro_text(self._dictate.label, self.config))

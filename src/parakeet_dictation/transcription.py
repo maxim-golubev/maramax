@@ -569,9 +569,6 @@ class QwenTranscriber:
     def is_ready(self) -> bool:
         return self.model is not None
 
-    def is_loading(self) -> bool:
-        return self._loading
-
     def status_message(self) -> str:
         if self.is_ready():
             return "High-accuracy model ready"

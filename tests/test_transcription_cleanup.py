@@ -578,3 +578,13 @@ def test_vocabulary_echoed_back_on_silence_is_not_a_transcript(heard, expected):
 ])
 def test_only_text_that_cannot_be_speech_is_a_certain_echo(heard, context, echo):
     assert transcription.context_echo(heard, context) is echo
+
+
+def test_the_echo_filter_reads_the_hint_that_corrections_writes():
+    # The two modules share the hint's wording; this keeps them in step.
+    from parakeet_dictation.corrections import vocabulary_hint
+    hint = vocabulary_hint([{"heard": "mara max", "replacement": "Maramax"},
+                            {"heard": "par a keet", "replacement": "Parakeet"}])
+    assert transcription.context_echo(hint, hint) is transcription.Echo.CERTAIN
+    assert transcription.context_echo("Maramax, Parakeet.", hint) is transcription.Echo.POSSIBLE
+    assert transcription.context_echo("Maramax is ready.", hint) is transcription.Echo.NONE
