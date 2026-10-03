@@ -624,3 +624,17 @@ test that fails on the old code where one could be written:
 every Settings tab, the Software Update window, and the progress window were
 checked in Light and Dark; the welcome renders pixel-identical to 0.7.0 after
 its views moved to `layout.py`.
+
+### Live results
+
+- The build left the keychain search list exactly as it was (login, then
+  openvpn); the bundle is signed by Maramax Release Signing and its seal
+  verifies with the pinned requirement.
+- `create_release.py` proved the 0.7.0 → 0.8.0 delta (1,248,583 bytes; 36
+  paths changed, none removed) by rebuilding the release from a clone of 0.7.0.
+- On this Mac 0.7.0 was replaced by hand, as the swap script does it (quit,
+  old copy to `updates/previous`, new one in place), because 0.7.0's prompt
+  needs a click: 0.8.0 started with Option+Space registered, loaded Parakeet
+  in 2.7 s, kept the user's settings, and its first check, 57 s after launch,
+  found itself the newest release. The 0.8.0 updater itself is first
+  exercised live by the next release.
