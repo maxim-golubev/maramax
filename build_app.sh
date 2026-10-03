@@ -70,8 +70,15 @@ shutil.move(tmp, src)
 print(f"Rewrote {os.path.basename(src)} reproducibly; stripped {removed} stub entries")
 PY
 fi
-# Bytecode left in the checkout by another Python version is not this app's.
-find "$BUNDLE_SITE_PACKAGES/parakeet_dictation" -name "*.pyc" ! -name "*.cpython-$(echo "$PYTHON_SHORT_VERSION" | tr -d .).pyc" -delete
+# The app's own bytecode is compiled here from the bundled sources. py2app
+# copies the checkout's git-ignored __pycache__, which holds whatever the last
+# test run or another Python version left, stamped with file times that change
+# with every checkout or stash. Hash-based .pyc depend only on the source bytes
+# and are checked against them at import; the fixed hash seed and recorded
+# path keep two builds of one commit identical wherever they are built.
+find "$BUNDLE_SITE_PACKAGES/parakeet_dictation" -name __pycache__ -type d -prune -exec rm -rf {} +
+PYTHONHASHSEED=0 python -m compileall -q -d parakeet_dictation --invalidation-mode checked-hash \
+  "$BUNDLE_SITE_PACKAGES/parakeet_dictation"
 # py2app's bootstrap site.pyc carries the same build time, and sits sourceless.
 python - "$BUNDLE_RESOURCES/site.pyc" <<'PY'
 import sys
@@ -139,9 +146,8 @@ if [ -f "$SIGNING_KEYCHAIN" ]; then
   # keychain is appended to it for this one call. That list is what every
   # app uses to find its passwords: it is checked before it is touched,
   # recorded on disk, put back on any exit, and proved restored afterwards.
-  SAVED_LISTING="$SIGNING_DIR/search-list-before-signing"
   if [ -e "$SAVED_LISTING" ]; then
-    echo "ERROR: an earlier build stopped while signing. Your keychain search list before it was:" >&2
+    echo "ERROR: an earlier build or signing setup stopped with the signing keychain on your search list. The list before it was:" >&2
     cat "$SAVED_LISTING" >&2
     echo "Compare with 'security list-keychains -d user', restore it if they differ, then delete $SAVED_LISTING." >&2
     exit 1
@@ -153,6 +159,12 @@ if [ -f "$SIGNING_KEYCHAIN" ]; then
     if [ -z "$line" ] || [ ! -f "$line" ]; then
       echo "ERROR: the keychain search list has an entry that is not a keychain file: '$line'." >&2
       echo "Not touching it. Fix it first (security list-keychains -d user -s <each keychain>)." >&2
+      exit 1
+    fi
+    # Restoring a list that already holds it would keep it there for good.
+    if [ "$line" -ef "$SIGNING_KEYCHAIN" ]; then
+      echo "ERROR: the signing keychain is already on your keychain search list, where it should never stay." >&2
+      echo "Not touching it. Remove it first (security list-keychains -d user -s <each other keychain, in order>)." >&2
       exit 1
     fi
     ORIGINAL_KEYCHAINS+=("$line")
