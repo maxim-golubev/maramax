@@ -548,3 +548,32 @@ guide no longer describes the author's own Mac.
 - A bundle check run with `--audio` compiled modules into the signed bundle and
   broke its seal; `create_release.py` refused it. The check now runs without
   writing bytecode and verifies the seal when it finishes.
+
+## 0.7.0 welcome, chosen shortcut, app icon, and a layered audit — October 2, 2026
+
+### Audit
+
+Twelve auditors, one per area (onboarding, update security, update flow, audio,
+recognition, windows, data, build and release, design, docs, tests, and a
+fuzzing pass over the pure rules), reported 84 distinct findings once
+duplicates were merged. Each was checked by a verifier that tried to
+reproduce it, judged whether a real user could reach it, and reviewed the
+proposed fix; 73 held, none of them high severity. They were fixed in six
+areas in parallel, each with tests that fail on the old code, then reviewed
+together for interactions between the fixes. 456 tests pass (355 before).
+Declined, with reasons in the commits: splitting `hotkeys.py`, relabelling the
+bar for a shortcut changed mid-recording, and holding an install for a file
+queue that was never started.
+
+### Live results
+
+- The build left the keychain search list exactly as it was (login, then
+  openvpn) and no record file behind.
+- `create_release.py` proved the 0.6.3 → 0.7.0 delta (3,912,816 bytes; 66 paths
+  changed, 2 removed) by rebuilding the release from a clone of 0.6.3.
+- **0.6.3 → 0.7.0**, through 0.6.3's prompt against the published release:
+  the prompt appeared a minute after launch; the download was verified 40 s
+  later, the user's click included (the whole app took about four minutes on
+  this connection, so this was the delta); Maramax quit, and 0.7.0 was
+  running 3.6 s later with its shortcut registered and its seal intact, the
+  previous version kept in `updates/previous`.
