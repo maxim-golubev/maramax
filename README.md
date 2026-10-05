@@ -65,7 +65,7 @@ The speech model was the easy part. Most of the work went into four problems:
   trimming, beam search, and collapsing repeated words were kept out: each made
   real transcripts worse.
 
-About 600 tests run without a microphone, a screen, or model weights: a fake
+About 680 tests run without a microphone, a screen, or model weights: a fake
 audio device drives the real helper process, and the native windows are built
 and measured off-screen.
 
