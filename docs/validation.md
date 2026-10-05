@@ -228,11 +228,10 @@ disabled: it loaded from the cache in 1.8 s and transcribed the 10.4 s sample in
 
 ## 0.5.1 independent audit and restructuring — October 1, 2026
 
-0.5.0 shipped after a single-author review. For 0.5.1 the code was audited by
-fresh code-review agents that had not seen the author's reasoning: four correctness
-audits (audio layer, controller, native UI, recognition/storage/packaging) and
-one review against the owner's Clean Code standard, then a second round by two
-fresh reviewers over the fixes. All 226 tests, Ruff, and mypy pass; the bundle
+0.5.0 shipped after a single review. For 0.5.1 the code was audited again, area
+by area: four correctness audits (audio layer, controller, native UI,
+recognition/storage/packaging) and one review against the Clean Code standard,
+then a second pass over the fixes. All 226 tests, Ruff, and mypy pass; the bundle
 builds and passes its check. As before, no microphone was opened and nothing was
 played: hardware behaviour is still verified only with a simulated audio device.
 
@@ -320,8 +319,7 @@ from 1,547 lines to 1,387.
 
 ### Second round
 
-Two fresh review agents re-audited the result. They confirmed the fixes above, with
-these exceptions, all since addressed: two controller calls no longer matched
+A second pass over the result confirmed the fixes above, with these exceptions, all since addressed: two controller calls no longer matched
 the bar's signature after a late change (would have raised on a failed
 microphone start); the helper-retry had a race the tests hit about once in 14
 runs (now 0 in 20); a draft stream was left running after a silent capture;
@@ -336,7 +334,7 @@ shifted the queue selection.
   on the current layout.)*
 - The reader side of the helper protocol still uses field names as plain
   strings.
-- `app.py` remains the largest module. The reviewers' advice, which matches the
+- `app.py` remains the largest module. The audit's conclusion, which matches the
   standard, was to stop at the phase model and the extracted decisions rather
   than split it into files that hide nothing.
 - With both "Copy the transcript to the clipboard" and "Paste into the active
@@ -406,15 +404,14 @@ keeps the old one, removes the download, opens the result, and puts the old app
 back if the new one cannot be placed. The hand-off waits until the app has been
 idle on two looks 3 s apart. The first live update (0.6.0 to 0.6.1) is recorded under 0.6.3 below.
 
-## 0.6.1 independent audit of 0.6.0 — October 2, 2026
+## 0.6.1 audit of 0.6.0 — October 2, 2026
 
-Two fresh code-review agents audited 0.6.0 without the author's reasoning: one the
-updater, one the transcription repair and the whole change against the Clean
-Code standard. All 302 tests, Ruff, and mypy pass after the fixes below.
+0.6.0 was audited in two parts: the updater, and the transcription repair with
+the whole change against the Clean Code standard. All 302 tests, Ruff, and mypy pass after the fixes below.
 
 ### Updates
 
-- **Trust (both reviewers).** 0.6.0 accepted any app that matched the release's
+- **Trust.** 0.6.0 accepted any app that matched the release's
   own SHA-256 and carried a valid signature, which an ad-hoc signature always
   is: whoever could publish a GitHub release could replace every installed
   copy. Releases are now signed with a self-signed certificate that exists only
@@ -423,8 +420,8 @@ Code standard. All 302 tests, Ruff, and mypy pass after the fixes below.
   0.6.1; from 0.6.1 on only the pinned certificate is accepted. The same stable
   identity lets macOS keep the microphone and Accessibility permissions across
   updates.
-- **A swap across volumes could leave a half-copied app** (reproduced by the
-  reviewer on a 4 MB disk image). The new app is now placed beside the
+- **A swap across volumes could leave a half-copied app** (reproduced on a
+  4 MB disk image). The new app is now placed beside the
   installed one before Maramax quits, so the swap is two renames in one
   folder; every step is checked and an app without an `Info.plist` is never
   opened.
@@ -481,9 +478,9 @@ stop-to-result timing does not include the final UI/clipboard insertion.
 
 ## 0.6.3 audit of deltas, the progress window, and the docs — October 2, 2026
 
-Two fresh code-review agents audited 0.6.2 (one the delta updates and the
-progress window, one the design, the documentation, and the README); a final
-review by the author followed their fixes. All 327 tests, Ruff, and mypy pass.
+0.6.2 was audited in two parts (the delta updates and the progress window; the
+design, the documentation, and the README), and the fixes were reviewed once
+more. All 327 tests, Ruff, and mypy pass.
 
 ### Updates
 
@@ -594,9 +591,9 @@ against exactly this sequence).
 
 ### Audit
 
-Four reviewers, one per area (audio, recognition and storage, updates and
-packaging, windows and the controller), read their modules in full and
-traced each finding end to end; a fifth reviewed the finished change set.
+The audit went area by area (audio, recognition and storage, updates and
+packaging, windows and the controller), reading each module in full and
+tracing each finding end to end, then over the finished change set.
 Nothing could install an unverified update or let a delta escape the bundle,
 and no race or hang was found in the recording pipeline. Fixed, each with a
 test that fails on the old code where one could be written:
@@ -765,17 +762,16 @@ one after another they would have read "end.Start".
 
 ### Audit
 
-A 131-agent review of the whole code base, each finding checked by an
-independent skeptic, confirmed 89 findings (none severe); all were fixed, in
-the controller and windows here and in five batches (audio, transcription,
-storage, updates, packaging), each in its own worktree with its own tests.
+A review of the whole code base, each finding checked again before it
+counted, confirmed 89 findings (none severe); all were fixed, in the
+controller and windows here and in five batches (audio, transcription,
+storage, updates, packaging), each with its own tests.
 The largest: the audio helper's log lines were discarded; archiving one
 capture could delete an earlier capture's only spill; a stale "draft stream
 stuck" flag could fail a healthy dictation; mlx was shipped twice (147 MB);
 a dropped download was reported as a checksum mismatch. The test suite grew
-from 477 to 616. A second audit of the changes (82 agents, each finding
-checked by three skeptics) confirmed 15 findings, a third, of those fixes alone, 11, and a
-convergence round of ten lenses 22; the real ones were fixed, among them a stale bundle check that
+from 477 to 616. Two more audits, of the changes and then of those fixes alone,
+confirmed 15 and 11 findings, and a last pass over the whole 22; the real ones were fixed, among them a stale bundle check that
 would have failed the next build and a filler rule that could backtrack exponentially. Not
 changed, as not worth their complexity: messages after a full disk defeats every way of keeping
 a spill, beyond saying where the audio is.
@@ -802,9 +798,10 @@ methods, not with a real mouse.
 
 ### Bug hunt
 
-Six reviewers, one per area, then four with other lenses (an adversarial
-review of these changes, performance, durability without updates, system
-events). Confirmed and fixed, among others:
+Each area was reviewed on its own, then the whole release again for
+regressions in these changes, performance, durability without updates, and
+system events (sleep, displays, permissions taken back). Confirmed and fixed,
+among others:
 
 - A spill a disk error cut short was taken for the whole capture: had the
   archive failed too, the rest of the dictation was lost while the status said
