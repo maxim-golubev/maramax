@@ -1,6 +1,6 @@
 import numpy as np
 
-from parakeet_dictation.capture import CaptureMeter
+from parakeet_dictation.capture import CaptureHealth, CaptureMeter
 
 
 def test_silent_frames_never_become_a_healthy_microphone():
@@ -199,3 +199,22 @@ def test_noise_floor_of_a_muted_microphone_is_faint_not_speech():
     meter.feed(np.array([15, -12] * 256, dtype="<i2").tobytes())
     assert meter.snapshot().faint
     assert meter.snapshot().health == "receiving"
+
+
+def test_a_route_sending_only_zeros_is_called_silent_whatever_input_replaced_it():
+    """The microphone not allowed sends zeros on every input the helper tries:
+    the wait for sound counts from the first open, not from each reopen."""
+    clock = [0.0]
+    meter = CaptureMeter(clock=lambda: clock[0])
+    meter.mark_open()
+    for _ in range(64):                                         # 6.4 s of zeros, then the helper reopens.
+        clock[0] += 0.1
+        meter.feed(b"\x00\x00" * 512)
+    meter.set_reconnecting(True)
+    clock[0] += 0.3
+    meter.set_reconnecting(False)
+    for _ in range(4):
+        clock[0] += 0.1
+        meter.feed(b"\x00\x00" * 512)
+    assert meter.snapshot().health == CaptureHealth.SILENT
+

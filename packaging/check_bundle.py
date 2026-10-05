@@ -11,6 +11,8 @@ import importlib
 import json
 import os
 from pathlib import Path
+import plistlib
+import re
 import resource
 import statistics
 import subprocess
@@ -104,7 +106,7 @@ def check(args: argparse.Namespace) -> dict:
         "parakeet_dictation.update_prompt", "parakeet_dictation.replacements_editor",
         "parakeet_dictation.welcome", "parakeet_dictation.shortcut_picker",
         "qwen3_asr_mlx", "pyaudio", "soundfile", "scipy", "numpy",
-        "tokenizers", "huggingface_hub", "httpx", "certifi", "AppKit",
+        "tokenizers", "huggingface_hub", "httpx", "certifi", "truststore", "AppKit",
     ]
     origins = {}
     for name in modules:
@@ -119,7 +121,9 @@ def check(args: argparse.Namespace) -> dict:
 
     ensure_runtime_path()
     ensure_ssl_certs()
-    ssl.create_default_context()
+    context = ssl.create_default_context()
+    if not type(context).__module__.startswith("truststore"):
+        raise RuntimeError(f"TLS is not verified by macOS's trust store: {type(context)}")
 
 
     # The spectrogram front end pulls in a filter-bank dependency that no
@@ -183,6 +187,32 @@ def check(args: argparse.Namespace) -> dict:
     return report
 
 
+_MACH_O = {b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe"}  # 64-bit, 32-bit, universal
+
+
+def check_minimum_macos(bundle: Path) -> None:
+    """Every binary in the bundle runs on the macOS its Info.plist promises:
+    a library from a newer build machine would otherwise stop the app (and
+    every copy that updated to it) from opening on an older Mac."""
+    promised = plistlib.loads((bundle / "Contents" / "Info.plist").read_bytes())["LSMinimumSystemVersion"]
+    floor = tuple(int(part) for part in promised.split("."))
+    too_new = []
+    for path in bundle.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        with path.open("rb") as file:
+            if file.read(4) not in _MACH_O:
+                continue
+        commands = subprocess.run(["/usr/bin/otool", "-l", str(path)], capture_output=True, text=True,
+                                  check=True).stdout
+        needed = re.findall(r"cmd LC_BUILD_VERSION\n\s+cmdsize \d+\n\s+platform \d+\n\s+minos (\S+)", commands)
+        needed += re.findall(r"cmd LC_VERSION_MIN_MACOSX\n\s+cmdsize \d+\n\s+version (\S+)", commands)
+        if any(tuple(int(part) for part in version.split(".")) > floor for version in needed):
+            too_new.append(f"{path.relative_to(bundle)} ({', '.join(needed)})")
+    if too_new:
+        raise RuntimeError(f"Built for a newer macOS than LSMinimumSystemVersion {promised}: {', '.join(too_new[:5])}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, default=Path("dist/Maramax.app"))
@@ -204,6 +234,7 @@ def main() -> None:
         print(text)
         return
 
+    check_minimum_macos(args.bundle)
     launcher = args.bundle / "Contents" / "MacOS" / "Maramax"
     # Two requests to one helper: it must stay alive between recordings (the
     # app keeps it on standby) and exit by itself when its input closes.

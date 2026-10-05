@@ -40,23 +40,26 @@ def bundle_identifier() -> str | None:
 
 
 def ensure_ssl_certs() -> None:
-    """Point OpenSSL at certifi's CA bundle when the default is unusable.
+    """Verify TLS connections (the update check, model downloads) against
+    macOS's own trust store, which macOS keeps current: a CA list frozen
+    into the bundle goes stale over the years one version runs unchanged.
 
-    The py2app bundle has no system cert path baked in, so
-    ssl.create_default_context() raises FileNotFoundError — which breaks
-    Hugging Face Hub lookups and model loading.
+    certifi's bundle stays as SSL_CERT_FILE for whatever reads that variable
+    itself: the py2app bundle has no system cert path baked in, so without
+    it ssl.create_default_context() raises FileNotFoundError.
     """
-    current = os.environ.get("SSL_CERT_FILE")
-    if current and Path(current).exists():
-        return
-    # Bundled and checked by the build: a missing certifi fails here, at
+    # Bundled and checked by the build: a missing package fails here, at
     # launch, not later as a TLS error in an update check or model download.
     import certifi
+    import truststore
 
-    cert_path = certifi.where()
-    if not Path(cert_path).exists():
-        raise RuntimeError(f"certifi's CA bundle is missing: {cert_path}")
-    os.environ["SSL_CERT_FILE"] = cert_path
+    current = os.environ.get("SSL_CERT_FILE")
+    if not (current and Path(current).exists()):
+        cert_path = certifi.where()
+        if not Path(cert_path).exists():
+            raise RuntimeError(f"certifi's CA bundle is missing: {cert_path}")
+        os.environ["SSL_CERT_FILE"] = cert_path
+    truststore.inject_into_ssl()
 
 
 def resource_path(*parts: str) -> Path:

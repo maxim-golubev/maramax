@@ -152,6 +152,7 @@ def test_failed_model_download_can_be_retried_without_duplicate_loads(monkeypatc
         return SimpleNamespace()
 
     monkeypatch.setattr(transcription, "from_pretrained", load)
+    monkeypatch.setattr(transcription, "model_folder", lambda model: model.repo)
     monkeypatch.setattr(transcription.ParakeetTranscriber, "_warm_model", lambda self: None)
     transcriber = transcription.ParakeetTranscriber()
     assert transcriber.ready_event.wait(timeout=2)
@@ -189,7 +190,7 @@ def fake_qwen_library(monkeypatch, load):
     """The high-accuracy model library, its from_pretrained replaced by `load`."""
     monkeypatch.setitem(sys.modules, "qwen3_asr_mlx", SimpleNamespace(
         Qwen3ASR=SimpleNamespace(from_pretrained=load)))
-    monkeypatch.setattr(transcription, "cached_model_source", lambda model_id: model_id)
+    monkeypatch.setattr(transcription, "model_folder", lambda model: model.repo)
 
 
 def wait_for(condition):
@@ -281,11 +282,12 @@ def test_a_failed_warm_up_is_logged_with_its_traceback_and_frees_the_cache(monke
         raise AttributeError("no attribute 'encoder'")
 
     monkeypatch.setattr(transcription, "from_pretrained", lambda _source: SimpleNamespace())
+    monkeypatch.setattr(transcription, "model_folder", lambda model: model.repo)
     monkeypatch.setattr(transcription.ParakeetTranscriber, "_warm_model", warm_up_fails)
     monkeypatch.setattr(transcription.logger, "exception", lambda message: calls.append(message))
     monkeypatch.setattr(transcription.gc, "collect", lambda: calls.append("collect"))
     monkeypatch.setattr(transcription.mx, "clear_cache", lambda: calls.append("clear"))
-    transcriber = transcription.ParakeetTranscriber("test/parakeet")
+    transcriber = transcription.ParakeetTranscriber(transcription.ModelFiles("test/parakeet", "0" * 40, ("config.json",)))
     assert transcriber.ready_event.wait(timeout=2)
     assert transcriber.model is None and isinstance(transcriber.load_error, AttributeError)
     assert calls == ["Could not load the Parakeet model test/parakeet", "collect", "clear"]
@@ -374,13 +376,33 @@ def test_a_converted_copy_that_cannot_be_deleted_is_reported_not_raised(tmp_path
     assert len(warned) == 1 and converted in warned[0] and "example.mp3" in warned[0]
 
 
-def test_complete_cached_model_is_loaded_as_a_local_directory(tmp_path, monkeypatch):
+TEST_MODEL = transcription.ModelFiles("test/model", "0123456789abcdef", ("config.json", "model.safetensors"))
+
+
+def downloads(monkeypatch, outcome=None):
+    """What model_folder() asks Hugging Face for; `outcome` is raised, if given."""
+    asked = []
+
+    def download(repo, revision, allow_patterns):
+        asked.append((repo, revision, allow_patterns))
+        if outcome is not None:
+            raise outcome
+        return "/downloaded"
+
+    monkeypatch.setattr(transcription, "snapshot_download", download)
+    return asked
+
+
+def test_complete_cached_model_is_loaded_as_a_local_directory_without_a_request(tmp_path, monkeypatch):
     (tmp_path / "config.json").write_text("{}")
     (tmp_path / "model.safetensors").write_bytes(b"synthetic weights")
-    monkeypatch.setattr(transcription, "try_to_load_from_cache", lambda _model, name: str(tmp_path / name))
-    assert transcription.cached_model_source("test/model") == str(tmp_path)
-    (tmp_path / "model.safetensors").unlink()
-    assert transcription.cached_model_source("test/model") == "test/model"
+    monkeypatch.setattr(transcription, "try_to_load_from_cache",
+                        lambda _repo, name, revision: str(tmp_path / name))
+    asked = downloads(monkeypatch)
+    assert transcription.model_folder(TEST_MODEL) == str(tmp_path) and asked == []
+    (tmp_path / "model.safetensors").unlink()                   # A download cut short: fetched again,
+    assert transcription.model_folder(TEST_MODEL) == "/downloaded"
+    assert asked == [("test/model", "0123456789abcdef", ["config.json", "model.safetensors"])]  # as tested.
 
 
 def test_cache_files_from_different_revisions_are_not_mixed(tmp_path, monkeypatch):
@@ -389,9 +411,32 @@ def test_cache_files_from_different_revisions_are_not_mixed(tmp_path, monkeypatc
     second.mkdir()
     (first / "config.json").write_text("{}")
     (second / "model.safetensors").write_bytes(b"synthetic weights")
-    monkeypatch.setattr(transcription, "try_to_load_from_cache", lambda _model, name:
+    monkeypatch.setattr(transcription, "try_to_load_from_cache", lambda _repo, name, revision:
                         str((first if name == "config.json" else second) / name))
-    assert transcription.cached_model_source("test/model") == "test/model"
+    downloads(monkeypatch)
+    assert transcription.model_folder(TEST_MODEL) == "/downloaded"
+
+
+def test_the_release_commit_is_found_in_the_cache_when_the_latest_is_not_complete(tmp_path, monkeypatch):
+    for name in TEST_MODEL.files:
+        (tmp_path / name).write_text("x")
+    monkeypatch.setattr(transcription, "try_to_load_from_cache", lambda _repo, name, revision:
+                        str(tmp_path / name) if revision == TEST_MODEL.revision else None)
+    assert transcription.model_folder(TEST_MODEL) == str(tmp_path) and downloads(monkeypatch) == []
+
+
+def test_a_model_hugging_face_no_longer_offers_is_named_as_such(monkeypatch):
+    from huggingface_hub.errors import RepositoryNotFoundError
+    monkeypatch.setattr(transcription, "try_to_load_from_cache", lambda *_args, **_kwargs: None)
+    downloads(monkeypatch, RepositoryNotFoundError("404 Client Error", response=SimpleNamespace(
+        headers={}, status_code=404, request=None)))
+    with pytest.raises(transcription.ModelWithdrawn, match="no longer offers test/model"):
+        transcription.model_folder(TEST_MODEL)
+
+
+def test_the_models_name_the_files_their_libraries_read():
+    assert set(transcription.QWEN.files) >= {"config.json", "model.safetensors", "vocab.json", "merges.txt"}
+    assert len(transcription.PARAKEET.revision) == len(transcription.QWEN.revision) == 40
 
 
 def recognized(*words, gap=0.5):

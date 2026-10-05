@@ -15,7 +15,7 @@ def paste_context(monkeypatch):
     target = SimpleNamespace(
         processIdentifier=lambda: 123,
         isTerminated=lambda: False,
-        activateWithOptions_=lambda _options: events.append("activate"),
+        activateFromApplication_options_=lambda _maramax, _options: events.append("activate"),
     )
     front = [target]
     workspace = SimpleNamespace(
@@ -34,7 +34,8 @@ def paste_context(monkeypatch):
     app._shutting_down = False
     app._compact_session = True
     app._previous_app = target
-    app._paste_target = autopaste.PasteTarget(workspace=workspace, own_pid=999)
+    app._paste_target = autopaste.PasteTarget(workspace=workspace, own_pid=999, application=SimpleNamespace(
+        yieldActivationToApplication_=lambda app: events.append("yield")))
     app._cancel_event = threading.Event()
     app.overlay_visible = False
     app.overlay_controller = SimpleNamespace(hide=lambda: events.append("hide"))
@@ -87,7 +88,7 @@ def test_full_window_restores_target_then_rechecks_focus(paste_context):
     app, _, events, scheduled, _ = paste_context
     app._compact_session = False
     app._paste_into_previous_app_on_main(1, "transcript")
-    assert events == ["hide", "activate"]
+    assert events == ["hide", "yield", "activate"]           # Maramax hands the keyboard over, as macOS 14+ asks.
     assert scheduled[0][0] == 0.3
     scheduled[0][1]()
     assert events[-1] == "paste"
@@ -336,3 +337,19 @@ def test_a_paste_skipped_after_the_window_went_is_said_on_the_bar(paste_context)
     scheduled[0][1]()
     assert events[-2:] == [("bar", [0.5, 0.5]), ("bar says", module.SWITCHED_APPS_STATUS)]
     assert statuses[-1] == module.SWITCHED_APPS_STATUS and app._compact_session
+
+
+def test_a_dictation_ended_with_a_maramax_window_in_front_says_so(paste_context):
+    app, front, _, _, statuses = paste_context
+    front[0] = SimpleNamespace(processIdentifier=lambda: 999)          # Maramax itself (own_pid 999).
+    app._paste_into_previous_app_on_main(1, "transcript")
+    assert statuses == [module.MARAMAX_IN_FRONT_STATUS]
+
+
+def test_accessibility_switched_off_just_before_the_keystroke_is_said(paste_context, monkeypatch):
+    app, _, events, scheduled, statuses = paste_context
+    app._paste_into_previous_app_on_main(1, "transcript")
+    monkeypatch.setattr(module, "accessibility_trusted", lambda: False)
+    scheduled[0][1]()
+    assert statuses == [module.NOT_PERMITTED_STATUS] and not any(str(event).startswith("paste") for event in events)
+

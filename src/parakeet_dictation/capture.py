@@ -54,14 +54,22 @@ class CaptureSnapshot:
     open_delay: float | None = None
     # Seconds since the helper began opening a replacement input, if it is.
     reconnecting_seconds: float | None = None
+    # Seconds from the capture request until the first device opened: the
+    # wait for sound counts from there, whatever input replaced it since.
+    first_open_delay: float | None = None
 
     @property
     def health(self) -> CaptureHealth:
         if self.reconnecting_seconds is not None and self.reconnecting_seconds < RECONNECT_LIMIT_SECONDS:
             return CaptureHealth.RECONNECTING
         # A slow driver open (Bluetooth can take seconds) is not time spent
-        # listening; the frame deadlines start once the stream exists.
+        # listening; the frame deadlines start once the stream exists. The
+        # no-buffer deadline restarts with a replacement input; the no-signal
+        # one does not, or a route sending only zeros (the microphone not
+        # allowed, say) would say "wait" through every reopen the helper tries.
         listening = self.elapsed - (self.open_delay or 0.0)
+        hearing = self.elapsed - (self.first_open_delay if self.first_open_delay is not None
+                                  else self.open_delay or 0.0)
         # Digital silence is evidence of a broken route, not proof that the
         # speaker is quiet. Once signal has arrived, ordinary pauses are fine.
         if self.last_frame_age is None:
@@ -69,7 +77,7 @@ class CaptureSnapshot:
         if self.last_frame_age > STALLED_SECONDS:
             return CaptureHealth.DISCONNECTED
         if self.nonzero_samples == 0:
-            return CaptureHealth.WAITING if listening < NO_SIGNAL_SECONDS else CaptureHealth.SILENT
+            return CaptureHealth.WAITING if hearing < NO_SIGNAL_SECONDS else CaptureHealth.SILENT
         if self.last_signal_age is not None and self.last_signal_age > QUIET_SECONDS:
             return CaptureHealth.QUIET
         return CaptureHealth.RECEIVING
@@ -109,6 +117,7 @@ class CaptureMeter:
         now = self._clock()
         self._started = now
         self._opened: float | None = now if opened else None
+        self._first_opened: float | None = self._opened
         self._samples = 0
         self._nonzero = 0
         self._callbacks = 0
@@ -130,6 +139,7 @@ class CaptureMeter:
         with self._lock:
             if self._opened is None:
                 self._opened = self._clock()
+                self._first_opened = self._opened
 
     def set_reconnecting(self, reconnecting: bool) -> None:
         """A replacement stream is being opened mid-recording. Clearing the
@@ -183,6 +193,7 @@ class CaptureMeter:
                 overflow_count=self._overflows,
                 device_name=self.device_name,
                 open_delay=None if self._opened is None else self._opened - self._started,
+                first_open_delay=None if self._first_opened is None else self._first_opened - self._started,
                 reconnecting_seconds=(None if self._reconnecting_since is None
                                       else now - self._reconnecting_since),
             )

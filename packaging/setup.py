@@ -31,6 +31,7 @@ OPTIONS = {
         "h11",
         "idna",
         "certifi",
+        "truststore",
         "hf_xet",
     ],
     "includes": [
@@ -64,6 +65,9 @@ OPTIONS = {
         "CFBundleShortVersionString": VERSION,
         "CFBundleVersion": VERSION,
         "LSUIElement": True,
+        # What the bundled libraries need (MLX, PortAudio); check_bundle.py holds every binary to it, and an
+        # installed copy refuses an update that asks for a newer macOS than it runs on.
+        "LSMinimumSystemVersion": "15.0",
         "NSHighResolutionCapable": True,
         "NSMicrophoneUsageDescription": "Maramax needs microphone access to transcribe your speech locally.",
     },

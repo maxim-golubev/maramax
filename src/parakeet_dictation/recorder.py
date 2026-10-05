@@ -63,6 +63,12 @@ def lid_closed() -> bool:
         return False
 
 
+def _english_builtin(name: str) -> bool:
+    """Whether `name` is the Mac's own microphone as an English macOS names it."""
+    lowered = name.lower()
+    return (("macbook" in lowered or "imac" in lowered) and "microphone" in lowered) or lowered == "built-in microphone"
+
+
 class _PropertyAddress(ctypes.Structure):
     """CoreAudio's AudioObjectPropertyAddress."""
     _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("element", ctypes.c_uint32)]
@@ -91,6 +97,67 @@ def default_input_device() -> int | None:
         # Unknown compares equal to unknown, so a kept-warm stream is then
         # reused as it was before the default was checked.
         logger.warning(f"Default input device unavailable: {exc}")
+        return None
+
+
+def _four_char_code(value: str) -> int:
+    return int.from_bytes(value.encode("ascii"), "big")
+
+
+def builtin_input_names() -> set[str] | None:
+    """The names of the Mac's own microphones as CoreAudio lists them (its
+    transport type is built-in), in whatever language macOS is set to; None
+    when CoreAudio cannot be read."""
+    try:
+        core_audio = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+        cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        size_of = core_audio.AudioObjectGetPropertyDataSize
+        size_of.restype = ctypes.c_int32
+        size_of.argtypes = [ctypes.c_uint32, ctypes.POINTER(_PropertyAddress), ctypes.c_uint32, ctypes.c_void_p,
+                            ctypes.POINTER(ctypes.c_uint32)]
+        get = core_audio.AudioObjectGetPropertyData
+        get.restype = ctypes.c_int32
+        get.argtypes = [ctypes.c_uint32, ctypes.POINTER(_PropertyAddress), ctypes.c_uint32, ctypes.c_void_p,
+                        ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        def address(selector: str, scope: str = "glob") -> _PropertyAddress:
+            return _PropertyAddress(_four_char_code(selector), _four_char_code(scope), 0)
+
+        def read(device: int, selector: str, value) -> None:
+            size = ctypes.c_uint32(ctypes.sizeof(value))
+            status = get(device, ctypes.byref(address(selector)), 0, None, ctypes.byref(size), ctypes.byref(value))
+            if status != 0:
+                raise OSError(f"AudioObjectGetPropertyData({selector!r}) returned {status}")
+
+        size = ctypes.c_uint32(0)
+        # kAudioHardwarePropertyDevices of kAudioObjectSystemObject (1).
+        status = size_of(1, ctypes.byref(address("dev#")), 0, None, ctypes.byref(size))
+        devices = (ctypes.c_uint32 * (size.value // 4))()
+        if status != 0 or get(1, ctypes.byref(address("dev#")), 0, None, ctypes.byref(size), devices) != 0:
+            raise OSError(f"the device list could not be read ({status})")
+        names = set()
+        for device in devices:
+            transport = ctypes.c_uint32(0)
+            read(device, "tran", transport)  # kAudioDevicePropertyTransportType
+            streams = ctypes.c_uint32(0)     # kAudioDevicePropertyStreams, input scope: bytes of stream ids
+            size_of(device, ctypes.byref(address("stm#", "inpt")), 0, None, ctypes.byref(streams))
+            if transport.value != _four_char_code("bltn") or not streams.value:
+                continue
+            name = ctypes.c_void_p()
+            read(device, "lnam", name)       # kAudioObjectPropertyName: a CFString this call hands over
+            try:
+                text = ctypes.create_string_buffer(1024)
+                if cf.CFStringGetCString(name, text, len(text), 0x08000100):  # UTF-8
+                    names.add(text.value.decode("utf-8"))
+            finally:
+                cf.CFRelease(name)
+        return names
+    except Exception as exc:
+        # The English names are looked for instead (_find_builtin_index).
+        logger.warning(f"Built-in microphones unavailable from CoreAudio: {exc}")
         return None
 
 
@@ -203,16 +270,14 @@ class AudioRecorder:
             # The built-in microphone is cut off in hardware; preferring it
             # would record silence. Fall through to the system default.
             return None
+        builtin = builtin_input_names()
         for i in range(self.audio.get_device_count()):
             try:
                 info = self.audio.get_device_info_by_index(i)
             except (IOError, OSError):
                 continue
-            name = str(info.get("name", "")).lower()
-            if info.get("maxInputChannels", 0) > 0 and (
-                (("macbook" in name or "imac" in name) and "microphone" in name)
-                or name == "built-in microphone"
-            ):
+            name = str(info.get("name", ""))
+            if info.get("maxInputChannels", 0) > 0 and (name in builtin if builtin is not None else _english_builtin(name)):
                 return i
         return None
 

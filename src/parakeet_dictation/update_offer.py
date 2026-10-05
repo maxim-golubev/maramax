@@ -6,6 +6,7 @@ import enum
 import os
 import shutil
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +26,12 @@ from .update_window import UpdateProgressWindow, download_size
 CHECK_TITLE = "Check for Updates…"
 # The first automatic check comes a minute after launch, out of its way.
 FIRST_CHECK_SECONDS = 60
+# Between automatic checks, by the clock on the wall: timers count only time
+# the Mac is awake, so the time since the last check is looked at this often.
 CHECK_INTERVAL_SECONDS = 24 * 60 * 60
+LOOK_SECONDS = 60 * 60
+# After a check that failed (the network not up yet after login, say).
+RETRY_SECONDS = 60 * 60
 # An install quits the app, so it waits until nothing has been running for
 # this long: a finished dictation still pastes. (The outcome it shows counts
 # as busy for as long as it is on screen.)
@@ -127,7 +133,8 @@ def ready_to_install(*, idle_now: bool, idle_before: bool) -> bool:
 class UpdateOffer:
     def __init__(self, *, menu_item, current_version: str, installed_app: Path | None, support_dir: Path,
                  config: AppConfig, save_settings: Callable[[], bool], is_busy: Callable[[], bool],
-                 quit_app: Callable[[], None], on_change: Callable[[], None]):
+                 quit_app: Callable[[], None], on_change: Callable[[], None],
+                 clock: Callable[[], float] = time.time):
         self._menu_item = menu_item
         self._current = current_version
         # None when running from source: there is no bundle to replace.
@@ -140,6 +147,8 @@ class UpdateOffer:
         self._quit_app = quit_app
         # Told whenever what status_text() says may have changed.
         self._on_change = on_change
+        self._clock = clock
+        self._next_check_at = 0.0  # Wall-clock time the next automatic check is due; the first is at once.
         self._step = Step.IDLE
         self._percent: int | None = None
         self._release: updater.Release | None = None
@@ -204,8 +213,8 @@ class UpdateOffer:
     # -- Checking --
 
     def _scheduled_check(self) -> None:
-        call_later(CHECK_INTERVAL_SECONDS, self._scheduled_check)
-        if self._config.check_for_updates:
+        call_later(LOOK_SECONDS, self._scheduled_check)
+        if self._config.check_for_updates and self._clock() >= self._next_check_at:
             self._check(asked=False)
 
     def _set_step(self, step: Step, percent: int | None = None) -> None:
@@ -244,6 +253,7 @@ class UpdateOffer:
     def _check_failed(self, problem: str, asked: bool) -> None:
         logger.warning(f"Update check failed: {problem}")
         self._last_check = CheckFailed(problem)
+        self._next_check_at = self._clock() + RETRY_SECONDS
         self._set_step(Step.IDLE)  # What was known before still stands.
         if asked:
             rumps.alert(title="Could not check for updates", message=problem)
@@ -251,6 +261,7 @@ class UpdateOffer:
     def _checked(self, release: updater.Release | None, asked: bool) -> None:
         self._release = release
         self._last_check = "succeeded"
+        self._next_check_at = self._clock() + CHECK_INTERVAL_SECONDS
         self._set_step(Step.IDLE)
         if release is None:
             logger.info(f"Update check: {self._current} is the newest release")

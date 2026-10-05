@@ -50,6 +50,8 @@ def recorder(monkeypatch):
     monkeypatch.setattr(FakeAudio, "opens", [])
     # The result must not depend on whether this Mac's lid happens to be shut.
     monkeypatch.setattr(module, "lid_closed", lambda: False)
+    # Nor on which microphones this Mac has.
+    monkeypatch.setattr(module, "builtin_input_names", lambda: {"MacBook Pro Microphone"})
     instance = module.AudioRecorder()
     yield instance
     instance.cleanup()
@@ -156,6 +158,18 @@ def test_reopen_refuses_to_replace_a_locked_microphone(recorder, monkeypatch):
     assert recorder.reopen() is False
     assert "disconnected" in str(recorder.last_error)
     assert recorder.stop() == b"\x01\x00" * 512
+
+
+def test_the_macs_own_microphone_is_found_whatever_language_names_it(recorder, monkeypatch):
+    monkeypatch.setattr(FakeAudio, "devices", ["AirPods", "MacBook Pro-Mikrofon"])
+    monkeypatch.setattr(module, "builtin_input_names", lambda: {"MacBook Pro-Mikrofon"})
+    assert recorder.start()
+    assert FakeAudio.opens[-1]["input_device_index"] == 1
+    recorder.stop()
+    monkeypatch.setattr(module, "builtin_input_names", lambda: None)   # CoreAudio unreadable: the English names.
+    monkeypatch.setattr(FakeAudio, "devices", ["AirPods", "MacBook Air Microphone"])
+    assert recorder.start()
+    assert FakeAudio.opens[-1]["input_device_index"] == 1
 
 
 def test_closed_lid_does_not_prefer_the_switched_off_builtin_microphone(recorder, monkeypatch):

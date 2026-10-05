@@ -393,12 +393,12 @@ assert answers == [Choice.INSTALL, Choice.LATER]
 window._waiting = True
 window.skipVersion_(None)
 assert answers[-1] is Choice.SKIP and not window.panel.isVisible()
-text = rendered_notes(note_blocks("## New\n- **Bold** and [a link](https://x.test)\n\nDone."))
+text = rendered_notes(note_blocks("## New\n- **Bold** and [a link](https://github.com/maxim-golubev/maramax/releases)\n\nDone."))
 assert str(text.string()) == "New\n\u2022\tBold and a link\nDone."
 link = text.attribute_atIndex_effectiveRange_("NSLink", str(text.string()).index("a link"), None)[0]
-assert str(link.absoluteString()) == "https://x.test"
+assert str(link.absoluteString()) == "https://github.com/maxim-golubev/maramax/releases"
 assert str(rendered_notes([]).string()) == NO_NOTES
-bad = rendered_notes(note_blocks("[bad](https://x.test/a|b)"))   # A URL macOS cannot parse: plain text.
+bad = rendered_notes(note_blocks("[bad](https://github.com/maxim-golubev/maramax/releases/a|b)"))   # A URL macOS cannot parse: plain text.
 assert str(bad.string()) == "bad" and bad.attribute_atIndex_effectiveRange_("NSLink", 0, None)[0] is None
 ''')
 

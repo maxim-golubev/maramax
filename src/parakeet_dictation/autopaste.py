@@ -8,7 +8,8 @@ import subprocess
 
 import objc
 from AppKit import (
-    NSApplicationActivateIgnoringOtherApps,
+    NSApplication,
+    NSRunningApplication,
     NSWorkspace,
     NSWorkspaceApplicationKey,
     NSWorkspaceDidActivateApplicationNotification,
@@ -236,8 +237,9 @@ class PasteTarget:
     enough: when a Maramax window is in front, that answer is Maramax, and
     whatever was remembered earlier may be an app the user left long ago."""
 
-    def __init__(self, workspace=None, own_pid: int | None = None):
+    def __init__(self, workspace=None, own_pid: int | None = None, application=None):
         self._workspace = workspace or NSWorkspace.sharedWorkspace()
+        self._application = application or NSApplication.sharedApplication()
         self._own_pid = os.getpid() if own_pid is None else own_pid
         self._last_other_app = None
         self._note(self._workspace.frontmostApplication())
@@ -260,9 +262,16 @@ class PasteTarget:
         front = self._workspace.frontmostApplication()
         return app is not None and front is not None and front.processIdentifier() == app.processIdentifier()
 
-    @staticmethod
-    def bring_forward(app) -> None:
-        app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+    def maramax_is_frontmost(self) -> bool:
+        front = self._workspace.frontmostApplication()
+        return front is not None and front.processIdentifier() == self._own_pid
+
+    def bring_forward(self, app) -> None:
+        """Hand the keyboard back to `app`. Since macOS 14 an app is activated
+        only with the consent of the one in front: Maramax yields to it first
+        (activating while ignoring other apps no longer does anything)."""
+        self._application.yieldActivationToApplication_(app)
+        app.activateFromApplication_options_(NSRunningApplication.currentApplication(), 0)
 
     def stop(self) -> None:
         if self._observer is not None:

@@ -20,6 +20,7 @@ from AppKit import (
 from Foundation import NSURL, NSObject
 
 from .layout import spacer, stack
+from .updater import REPOSITORY_URL
 
 MARGIN = 20
 ICON = 64
@@ -340,16 +341,23 @@ def rendered_notes(blocks: list[Block]):
         elif isinstance(block, NumberedItem):
             _append(text, f"\t{block.number}\t", base)
         for part in block.parts:
-            url = NSURL.URLWithString_(part.url) if isinstance(part, Link) else None
+            url = NSURL.URLWithString_(part.url) if isinstance(part, Link) and _ours(part.url) else None
             if url is not None:
                 _append(text, part.text, base | {NSLinkAttributeName: url})
             elif isinstance(part, Link):
-                _append(text, part.text, base)  # A URL macOS cannot parse would make a dead link.
+                # A URL macOS cannot parse would make a dead link; one elsewhere
+                # is not ours to offer, since the notes carry no signature.
+                _append(text, part.text, base)
             else:
                 _append(text, part.text, base | _EMPHASIS_FONTS[part.emphasis](size))
         if index < len(blocks) - 1:
             _append(text, "\n", base)
     return text
+
+
+def _ours(url: str) -> bool:
+    """Whether `url` is on Maramax's own GitHub pages, the only links release notes may make."""
+    return url == REPOSITORY_URL or url.startswith(REPOSITORY_URL + "/")
 
 
 def _tab(alignment, location):

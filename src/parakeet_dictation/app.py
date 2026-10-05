@@ -71,6 +71,8 @@ def empty_history_text(shortcut: str) -> str:
 NOT_COPIED_STATUS = "Transcript ready — kept in Maramax, not copied"
 NOT_PERMITTED_STATUS = "Copied, not pasted — allow Maramax to paste in Settings"
 SWITCHED_APPS_STATUS = "Copied, not pasted — you switched apps"
+# Settings, the welcome, or Recordings was in front when the dictation ended: no other app was there to paste into.
+MARAMAX_IN_FRONT_STATUS = "Copied, not pasted — a Maramax window was in front"
 INCOMPLETE_STATUS = "Microphone stopped — the transcript may be incomplete"
 CANCELLING_STATUS = "Cancelling…"
 ADOPTING_STATUS = "Moving recovered audio into Recordings — try again in a moment"
@@ -1277,7 +1279,8 @@ class DictationApp(rumps.App):
             self._push_status("Copied, not pasted — that app has quit", revert_after=8)
             return
         if compact and not self._paste_target.is_frontmost(target):
-            self._push_status(SWITCHED_APPS_STATUS, revert_after=8)
+            self._push_status(MARAMAX_IN_FRONT_STATUS if self._paste_target.maramax_is_frontmost()
+                              else SWITCHED_APPS_STATUS, revert_after=8)
             return
         self._hide_window()
         if not compact:
@@ -1303,6 +1306,9 @@ class DictationApp(rumps.App):
                 return
             if not contains_text(expected_text):
                 report("Not pasted — the clipboard changed; the transcript is in History")
+                return
+            if not accessibility_trusted():
+                report(NOT_PERMITTED_STATUS)  # Switched off since the dictation ended: the keys would go nowhere.
                 return
             try:
                 # A transcript pasted after a word or a sentence gets a space

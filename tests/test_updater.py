@@ -173,7 +173,7 @@ def codesign(monkeypatch):
     seen = []
 
     def run(command, what):
-        if command[0] == "codesign":
+        if command[0] == "/usr/bin/codesign":
             seen.append(command)
         else:
             real(command, what)
@@ -188,7 +188,7 @@ def test_a_verified_download_is_placed_beside_the_installed_app(tmp_path, codesi
                               lambda received, expected: progress.append(received / expected), lambda: False)
     assert staged == installed.parent / updater.STAGED_NAME and version_of(staged) == "0.5.2"
     assert progress[-1] == 1.0
-    assert codesign == [["codesign", "--verify", "--deep", "--strict",
+    assert codesign == [["/usr/bin/codesign", "--verify", "--deep", "--strict",
                          f"-R={updater.signer_requirement('com.maramax.dictation')}",
                          str(tmp_path / "staging" / "unpacked" / "Maramax-0.5.2" / "Maramax.app")]]
 
@@ -254,7 +254,7 @@ def test_a_signature_from_another_certificate_is_refused(tmp_path, monkeypatch):
     real = updater._run
 
     def unsigned(command, what):
-        if command[0] == "codesign":
+        if command[0] == "/usr/bin/codesign":
             raise updater.UpdateError(f"Could not {what}: test-requirement: code failed to satisfy")
         real(command, what)
     monkeypatch.setattr(updater, "_run", unsigned)
@@ -619,8 +619,11 @@ def test_an_unanswered_offer_is_taken_back_by_the_next_check(monkeypatch, tmp_pa
     monkeypatch.setattr(update_offer.threading, "Thread",
                         lambda **kwargs: SimpleNamespace(start=lambda: started.append(kwargs["args"])))
     monkeypatch.setattr(update_offer, "call_later", lambda *args: None)
+    now = [1000.0]
+    controller._clock = lambda: now[0]
     controller._checked(a_release(), asked=False)
     assert controller.can_check()                     # Settings' Check Now still works.
+    now[0] += update_offer.CHECK_INTERVAL_SECONDS     # A day later.
     controller._scheduled_check()
     assert FakePrompt.shown[-1][0] == "withdraw" and started == [(False,)]
     assert item.title == "Checking for Updates…"
@@ -989,7 +992,7 @@ def test_an_update_downloads_only_the_delta_when_one_is_published(tmp_path, code
     assert version_of(installed) == "0.5.1"    # The installed app was only copied.
     assert not (tmp_path / "staging").exists()
     # The rebuilt app, not the installed one, passed the pinned signature check.
-    assert codesign == [["codesign", "--verify", "--deep", "--strict",
+    assert codesign == [["/usr/bin/codesign", "--verify", "--deep", "--strict",
                          f"-R={updater.signer_requirement('com.maramax.dictation')}",
                          str(tmp_path / "staging" / "assembled" / "Maramax.app")]]
     attributes = subprocess.run(["xattr", "-r", str(staged)], capture_output=True, text=True, check=True).stdout
@@ -1119,7 +1122,7 @@ def test_a_rebuilt_app_that_fails_the_signature_check_falls_back_to_the_whole_ap
     verified = []
 
     def run(command, what):
-        if command[0] != "codesign":
+        if command[0] != "/usr/bin/codesign":
             return real(command, what)
         verified.append(command[-1])
         if "assembled" in command[-1]:
@@ -1361,3 +1364,63 @@ def test_release_note_headings_keep_their_own_hashes_and_never_take_long():
     started = time.monotonic()
     note_blocks("# a" + " " * 20000 + "b")
     assert time.monotonic() - started < 0.5
+
+
+def test_the_daily_check_follows_the_clock_on_the_wall_and_retries_a_failure_sooner(monkeypatch, tmp_path):
+    """Timers stop while the Mac sleeps: counted that way, a laptop awake a
+    few hours a day would check every few days."""
+    controller, *_ = offer(monkeypatch, tmp_path)
+    later, tick = run_timers(monkeypatch)
+    checks = []
+    controller._check = lambda asked: checks.append(asked)
+    now = [0.0]
+    controller._clock = lambda: now[0]
+    controller.start()
+    assert tick() == update_offer.LEFTOVER_REMOVAL_SECONDS
+    assert tick() == update_offer.FIRST_CHECK_SECONDS and checks == [False]
+    controller._check_failed("Could not reach GitHub", asked=False)   # No network yet.
+    now[0] += update_offer.RETRY_SECONDS
+    assert tick() == update_offer.LOOK_SECONDS and checks == [False, False]
+    controller._checked(None, asked=False)
+    now[0] += update_offer.CHECK_INTERVAL_SECONDS - 1                 # Asleep or awake, not a day yet.
+    tick()
+    assert checks == [False, False]
+    now[0] += 1
+    tick()
+    assert checks == [False, False, False]
+
+
+def test_release_notes_link_only_to_maramaxs_own_pages():
+    from AppKit import NSLinkAttributeName
+
+    from parakeet_dictation.update_prompt import note_blocks, rendered_notes
+    text = rendered_notes(note_blocks(f"[Guide]({updater.REPOSITORY_URL}/blob/main/docs/guide.md) and "
+                                      "[prize](https://evil.test) and "
+                                      f"[lookalike]({updater.REPOSITORY_URL}-evil)"))
+    links = {str(text.string())[place:place + length]: value
+             for place, length, value in _attributes(text, NSLinkAttributeName)}
+    assert list(links) == ["Guide"] and str(text.string()) == "Guide and prize and lookalike"
+
+
+def _attributes(text, name):
+    found, place = [], 0
+    while place < text.length():
+        value, span = text.attribute_atIndex_effectiveRange_(name, place, None)
+        if value is not None:
+            found.append((span.location, span.length, value))
+        place = span.location + span.length
+    return found
+
+
+def test_an_update_for_a_newer_macos_is_refused_before_anything_is_installed(tmp_path, monkeypatch, codesign):
+    installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
+    new = fake_bundle(tmp_path / "new", version="0.5.2")
+    info = plistlib.loads((new / "Contents" / "Info.plist").read_bytes()) | {"LSMinimumSystemVersion": "27.0"}
+    (new / "Contents" / "Info.plist").write_bytes(plistlib.dumps(info))
+    monkeypatch.setattr(updater, "running_macos", lambda: "15.7.9")
+    with pytest.raises(updater.UpdateError, match="needs macOS 27.0 or later; this Mac has macOS 15.7.9"):
+        updater._verify(new, installed, "0.5.2")
+    monkeypatch.setattr(updater, "running_macos", lambda: "27.0.1")
+    updater._verify(new, installed, "0.5.2")                       # On that macOS: on to the signature.
+    assert codesign
+

@@ -24,6 +24,7 @@ import http.client
 import json
 import math
 import os
+import platform
 import plistlib
 import re
 import shlex
@@ -39,7 +40,9 @@ from pathlib import Path
 from . import bundle_delta
 from .logger_config import logger
 
-LATEST_RELEASE_URL = "https://api.github.com/repos/maxim-golubev/maramax/releases/latest"
+REPOSITORY = "maxim-golubev/maramax"
+REPOSITORY_URL = f"https://github.com/{REPOSITORY}"
+LATEST_RELEASE_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 # The release certificate (packaging/create_signing_identity.sh). An update
 # signed with anything else is refused.
 SIGNER_CERTIFICATE_SHA1 = "0A34D1F446D97A8DCD0E104D4D1528168AD83B4C"
@@ -326,7 +329,7 @@ def _from_archive(release: Release, current_version: str, installed_app: Path, s
     archive = staging / "update.zip"
     _fetch(release.archive, current_version, archive, progress, cancelled)
     unpacked = staging / "unpacked"
-    _run(["ditto", "-x", "-k", str(archive), str(unpacked)], f"unpack Maramax {release.version}")
+    _run(["/usr/bin/ditto", "-x", "-k", str(archive), str(unpacked)], f"unpack Maramax {release.version}")
     archive.unlink()
     apps = [*unpacked.glob("*/*.app"), *unpacked.glob("*.app")]
     if len(apps) != 1:
@@ -343,20 +346,20 @@ def _from_delta(release: Release, delta: Asset, current_version: str, installed_
     archive = staging / "delta.zip"
     _fetch(delta, current_version, archive, progress, cancelled)
     unpacked = staging / "delta"
-    _run(["ditto", "-x", "-k", str(archive), str(unpacked)], f"unpack the Maramax {release.version} delta")
+    _run(["/usr/bin/ditto", "-x", "-k", str(archive), str(unpacked)], f"unpack the Maramax {release.version} delta")
     archive.unlink()
     new_app = staging / "assembled" / installed_app.name
     new_app.parent.mkdir()
     try:
         # A clone on APFS: instant, and no extra space until files differ.
-        _run(["cp", "-cR", str(installed_app), str(new_app)], f"clone {installed_app}")
+        _run(["/bin/cp", "-cR", str(installed_app), str(new_app)], f"clone {installed_app}")
     except UpdateError as exc:
         logger.info(f"{exc}; copying it instead")
         shutil.rmtree(new_app, ignore_errors=True)
-        _run(["ditto", str(installed_app), str(new_app)], f"copy {installed_app} to rebuild it")
+        _run(["/usr/bin/ditto", str(installed_app), str(new_app)], f"copy {installed_app} to rebuild it")
     # A copy installed from a browser download carries quarantine; the
     # update must not, or Gatekeeper would stop it at the relaunch.
-    _run(["xattr", "-cr", str(new_app)], "clear the rebuilt app's extended attributes")
+    _run(["/usr/bin/xattr", "-cr", str(new_app)], "clear the rebuilt app's extended attributes")
     try:
         bundle_delta.apply(unpacked, new_app)
     except bundle_delta.DeltaError as exc:
@@ -365,15 +368,24 @@ def _from_delta(release: Release, delta: Asset, current_version: str, installed_
     return new_app
 
 
+def running_macos() -> str:
+    """The macOS version this Mac runs, such as '15.7.9'."""
+    return platform.mac_ver()[0]
+
+
 def _verify(new_app: Path, installed_app: Path, version: str) -> None:
     info, installed = _bundle_info(new_app), _bundle_info(installed_app)
+    needed = info.get("LSMinimumSystemVersion")
+    if isinstance(needed, str) and version_key(needed) > version_key(running_macos()):
+        # Installed, it would not even open: this copy stays as it is.
+        raise UpdateError(f"Maramax {version} needs macOS {needed} or later; this Mac has macOS {running_macos()}")
     identifier = installed.get("CFBundleIdentifier")
     if not isinstance(identifier, str) or info.get("CFBundleIdentifier") != identifier:
         raise UpdateError(f"The downloaded app is {info.get('CFBundleIdentifier')!r}, not {identifier!r}")
     if version_key(str(info.get("CFBundleShortVersionString", ""))) != version_key(version):
         raise UpdateError(f"The downloaded app says it is version {info.get('CFBundleShortVersionString')}, "
                           f"but the release is {version}")
-    _run(["codesign", "--verify", "--deep", "--strict", f"-R={signer_requirement(identifier)}", str(new_app)],
+    _run(["/usr/bin/codesign", "--verify", "--deep", "--strict", f"-R={signer_requirement(identifier)}", str(new_app)],
          f"confirm that Maramax {version} was signed by Maramax's release certificate")
 
 
@@ -382,8 +394,8 @@ def _restrict_permissions(app: Path) -> None:
     lists, which come from the release's ZIP (ditto restores both) or the
     installed copy a delta rebuilds: nothing installed may be writable by
     other users or run as another. (chmod -R does not follow symlinks.)"""
-    _run(["chmod", "-R", "-N", str(app)], f"remove the access control lists of {app}")
-    _run(["chmod", "-R", "go-w,ug-s", str(app)], f"set the permissions of {app}")
+    _run(["/bin/chmod", "-R", "-N", str(app)], f"remove the access control lists of {app}")
+    _run(["/bin/chmod", "-R", "go-w,ug-s", str(app)], f"set the permissions of {app}")
 
 
 def staged_app(installed_app: Path) -> Path:
@@ -400,11 +412,14 @@ def _place_beside(new_app: Path, installed_app: Path) -> Path:
     if new_app.stat().st_dev == installed_app.parent.stat().st_dev:
         new_app.rename(staged)
     else:
-        _run(["ditto", str(new_app), str(staged)], f"copy the new Maramax next to {installed_app}")
+        _run(["/usr/bin/ditto", str(new_app), str(staged)], f"copy the new Maramax next to {installed_app}")
     return staged
 
 
 def _run(command: list[str], what: str) -> None:
+    """Run one of macOS's own tools, named by its full path: a PATH that
+    puts Homebrew first could otherwise put another tool of the same name
+    in the middle of an update."""
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=300)
     except (OSError, subprocess.TimeoutExpired) as exc:

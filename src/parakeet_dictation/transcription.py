@@ -13,6 +13,7 @@ import time
 import wave
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
@@ -29,7 +30,8 @@ from parakeet_mlx.alignment import (
 )
 from parakeet_mlx.audio import get_logmel
 from parakeet_mlx.parakeet import DecodingConfig
-from huggingface_hub import try_to_load_from_cache
+from huggingface_hub import snapshot_download, try_to_load_from_cache
+from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError, RevisionNotFoundError
 
 from .audio_format import FULL_SCALE, SAMPLE_RATE, SAMPLE_WIDTH, whole_samples
 from .logger_config import logger
@@ -75,6 +77,28 @@ class TranscriptionError(RuntimeError):
 
 class TranscriptionCancelled(TranscriptionError):
     """The user cancelled: raised from a progress callback to stop recognition."""
+
+
+class ModelWithdrawn(TranscriptionError):
+    """Hugging Face no longer offers the model: no retry can download it."""
+
+
+@dataclass(frozen=True)
+class ModelFiles:
+    """A model on Hugging Face, as Maramax loads it."""
+    repo: str
+    # The commit this release was tested with: what is downloaded when no
+    # complete copy is cached, whatever the repository holds by then.
+    revision: str
+    # What a complete copy holds; one missing any of them (a download cut
+    # short) is never loaded.
+    files: tuple[str, ...]
+
+
+PARAKEET = ModelFiles("mlx-community/parakeet-tdt-0.6b-v2", "8ae155301e23d820d82aa60d24817c900e69e487",
+                      ("config.json", "model.safetensors"))
+QWEN = ModelFiles("mlx-community/Qwen3-ASR-1.7B-bf16", "e1f6c266914abc5a46e8756e02580f834a6cf8a7",
+                  ("config.json", "model.safetensors", "vocab.json", "merges.txt"))
 
 
 def _bare(text: str) -> str:
@@ -189,20 +213,32 @@ def repaired(tokens: list[AlignedToken], candidate: list[AlignedToken], span: tu
     return [token for word in [*original[:before + 1], *redone[low + 1:high], *original[after:]] for token in word]
 
 
-def cached_model_source(model_id: str) -> str:
-    """Use a complete existing snapshot without any HTTP freshness checks."""
-    if Path(model_id).is_dir():
-        return model_id
+def model_folder(model: ModelFiles) -> str:
+    """A local folder holding the whole of `model`: a complete copy already
+    in the Hugging Face cache, used without a single request (the cache's
+    latest, or this release's commit); otherwise this release's commit,
+    downloaded. Raises ModelWithdrawn when Hugging Face no longer has it."""
+    for revision in (None, model.revision):
+        folder = _complete_snapshot(model, revision)
+        if folder is not None:
+            return folder
     try:
-        config = try_to_load_from_cache(model_id, "config.json")
-        weights = try_to_load_from_cache(model_id, "model.safetensors")
-        if isinstance(config, str) and isinstance(weights, str):
-            config_path, weights_path = Path(config), Path(weights)
-            if config_path.is_file() and weights_path.is_file() and config_path.parent == weights_path.parent:
-                return str(config_path.parent)
+        return snapshot_download(model.repo, revision=model.revision, allow_patterns=list(model.files))
+    except (RepositoryNotFoundError, RevisionNotFoundError, GatedRepoError) as exc:
+        raise ModelWithdrawn(f"Hugging Face no longer offers {model.repo} at {model.revision[:7]}: {exc}") from exc
+
+
+def _complete_snapshot(model: ModelFiles, revision: str | None) -> str | None:
+    """The cached snapshot of `revision` (None: the cache's latest) when it holds every file."""
+    try:
+        found = [try_to_load_from_cache(model.repo, name, revision=revision) for name in model.files]
     except (OSError, ValueError):
-        pass  # An unreadable cache is the same as no cache: load by id.
-    return model_id
+        return None  # An unreadable cache is the same as no cache.
+    paths = [Path(path) for path in found if isinstance(path, str)]
+    if len(paths) != len(model.files) or not all(path.is_file() for path in paths):
+        return None
+    folders = {path.parent for path in paths}
+    return str(folders.pop()) if len(folders) == 1 else None
 
 
 def _samples(pcm_bytes: bytes) -> np.ndarray:
@@ -215,8 +251,9 @@ class ParakeetTranscriber:
     pass produces garbage, so this class owns the stream and refuses an
     offline pass until the stream has let go."""
 
-    def __init__(self, model_id: str = "mlx-community/parakeet-tdt-0.6b-v2"):
-        self.model_id = model_id
+    def __init__(self, model: ModelFiles = PARAKEET):
+        self.model_files = model
+        self.model_id = model.repo
         self.model = None
         self.load_error: Exception | None = None
         self.ready_event = threading.Event()
@@ -240,7 +277,7 @@ class ParakeetTranscriber:
 
     def _load_model(self) -> None:
         try:
-            self.model = from_pretrained(cached_model_source(self.model_id))
+            self.model = from_pretrained(model_folder(self.model_files))
             self._warm_model()
             logger.info("Parakeet model loaded successfully")
         except Exception as exc:
@@ -269,6 +306,8 @@ class ParakeetTranscriber:
     def status_message(self) -> str:
         if self.is_ready():
             return "Speech model ready"
+        if isinstance(self.load_error, ModelWithdrawn):
+            return "Speech model unavailable — Hugging Face no longer offers it"
         if self.load_error is not None:
             return "Speech model unavailable — check your connection, then try again"
         return "Preparing the speech model — the first launch downloads it"
@@ -503,7 +542,7 @@ class QwenTranscriber:
     cancellation — used for final passes, with Parakeet as fallback.
     """
 
-    MODEL_ID = "mlx-community/Qwen3-ASR-1.7B-bf16"
+    MODEL_ID = QWEN.repo
 
     def __init__(self, on_load_failed: Callable[[str], None] | None = None,
                  on_loaded: Callable[[], None] | None = None):
@@ -539,7 +578,7 @@ class QwenTranscriber:
         try:
             from qwen3_asr_mlx import Qwen3ASR
 
-            model = Qwen3ASR.from_pretrained(cached_model_source(self.MODEL_ID))
+            model = Qwen3ASR.from_pretrained(model_folder(QWEN))
             model.warm_up()
             gc.collect()
             mx.clear_cache()

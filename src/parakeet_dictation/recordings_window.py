@@ -117,9 +117,12 @@ class RecordingsController(NSObject):
         self.note.setStringValue_(retention_note(self.store.limit))  # The limit is chosen in Settings.
         self.records = self.store.list_recordings()
         self.picker.removeAllItems()
+        this_year = datetime.now().year
         for record in self.records:
             try:
-                when = datetime.fromisoformat(record.created_at).astimezone().strftime("%b %d, %H:%M:%S")
+                created = datetime.fromisoformat(record.created_at).astimezone()
+                # The year only when it is not this one: a recording kept a year is not one from last week.
+                when = created.strftime("%b %d, %H:%M:%S" if created.year == this_year else "%b %d %Y, %H:%M:%S")
             except ValueError:
                 when = record.created_at
             seconds = int(record.duration)

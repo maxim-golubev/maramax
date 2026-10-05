@@ -109,6 +109,12 @@ _DROP_FEEDBACK = {DropTarget.TRANSCRIBE: "Drop to transcribe", DropTarget.QUEUE:
 _SEGMENTS = (Mode.RESULT, Mode.HISTORY, Mode.QUEUE)
 
 
+def _content_types(extensions):
+    """The file types a file panel offers, by filename extension."""
+    content_type = objc.lookUpClass("UTType")
+    return [content_type.typeWithFilenameExtension_(extension) for extension in extensions]
+
+
 def _is_media(path: str) -> bool:
     return "." in path and path.rsplit(".", 1)[-1].lower() in MEDIA_EXTENSIONS
 
@@ -706,7 +712,7 @@ class OverlayController(NSObject):
 
         else:
             panel = NSSavePanel.savePanel()
-            panel.setAllowedFileTypes_(["txt"])
+            panel.setAllowedContentTypes_(_content_types(["txt"]))
             panel.setNameFieldStringValue_("transcript.txt")
             if not panel.runModal():
                 return None
@@ -718,7 +724,7 @@ class OverlayController(NSObject):
         panel.setCanChooseDirectories_(False)
         panel.setCanChooseFiles_(True)
         panel.setAllowsMultipleSelection_(True)
-        panel.setAllowedFileTypes_(MEDIA_EXTENSIONS)
+        panel.setAllowedContentTypes_(_content_types(MEDIA_EXTENSIONS))
         return [url.path() for url in panel.URLs()] if panel.runModal() else []
 
     # -- Showing and hiding --
@@ -727,6 +733,7 @@ class OverlayController(NSObject):
     def focus(self):
         # Activation must not depend on the app that is in front agreeing to
         # give way: the hotkey can arrive while any app is active.
+        self._place_on_a_screen()  # Not on a display that has since been unplugged.
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         self.panel.makeKeyAndOrderFront_(None)
         self.panel.makeMainWindow()

@@ -9,13 +9,13 @@ from enum import StrEnum
 
 import objc
 from AppKit import (
-    NSBackingStoreBuffered, NSBezierPath, NSButton, NSColor, NSEvent, NSFont, NSFontWeightSemibold,
+    NSApplicationDidChangeScreenParametersNotification, NSBackingStoreBuffered, NSBezierPath, NSButton, NSColor, NSEvent, NSFont, NSFontWeightSemibold,
     NSLineBreakByTruncatingTail, NSLineCapStyleRound, NSMakeRect, NSPanel, NSScreen, NSStatusWindowLevel, NSTextField, NSView,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSWindowStyleMaskBorderless, NSWindowStyleMaskNonactivatingPanel,
 )
-from Foundation import NSObject
+from Foundation import NSNotificationCenter, NSObject
 
 from .capture import CaptureHealth
 from .hotkeys import STOP
@@ -335,6 +335,8 @@ class DictationIndicator(NSObject):
         content = IndicatorBackground.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, HEIGHT))
         content.refresh_background()
         content.on_drop = self._dropped
+        self._background = content  # Also once take_view() has moved it out of the panel.
+        self._placement = None
         self.panel.setContentView_(content)
 
         # One row, everything centred on the bar's horizontal axis.
@@ -354,6 +356,8 @@ class DictationIndicator(NSObject):
         self._layout_text(True)
         for view in (self.meter, self.title, self.detail, self.stop_button, self.expand_button):
             content.addSubview_(view)
+        NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+            self, "screensChanged:", NSApplicationDidChangeScreenParametersNotification, None)
         return self
 
     @objc.python_method
@@ -407,9 +411,18 @@ class DictationIndicator(NSObject):
     @objc.python_method
     def place(self, placement):
         """Move the bar to `placement` on the screen in use."""
+        self._placement = placement
         screen = NSScreen.mainScreen()
         if screen is not None:
             self.panel.setFrameOrigin_(bar_origin(screen.visibleFrame(), placement))
+
+    def screensChanged_(self, notification):
+        """A display was unplugged or rearranged: a bar on screen that is now
+        on none is put back where it belongs. AppKit leaves a borderless panel
+        where it was."""
+        del notification
+        if self.panel.isVisible() and self.panel.screen() is None:
+            self.place(self._placement)
 
     @objc.python_method
     def _dropped(self):
@@ -428,7 +441,7 @@ class DictationIndicator(NSObject):
     def take_view(self):
         """The bar's view, to show a bar inside another window (the welcome's
         demonstration). This bar's own panel is then never shown."""
-        view = self.panel.contentView()
+        view = self._background
         self.panel.setContentView_(NSView.alloc().initWithFrame_(view.frame()))
         return view
 
@@ -488,7 +501,7 @@ class DictationIndicator(NSObject):
     def _hide_if_current(self, token):
         if token != self._token or not self._finished:
             return
-        if self.panel.contentView().is_dragged():
+        if self._background.is_dragged():
             # Not from under the pointer: the drop still has to be remembered.
             call_later(UPDATE_SECONDS, self._hide_if_current, token)
             return
