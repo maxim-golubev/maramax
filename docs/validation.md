@@ -779,3 +779,89 @@ convergence round of ten lenses 22; the real ones were fixed, among them a stale
 would have failed the next build and a filler rule that could backtrack exponentially. Not
 changed, as not worth their complexity: messages after a full disk defeats every way of keeping
 a spill, beyond saying where the audio is.
+
+## 1.0.0 the bar, the welcome, and a version meant to last — October 5, 2026
+
+Measured from source on this Mac (M3 Pro, macOS 15.7.9).
+
+### Dictation always on the bar
+
+The settings that put dictation in the full window are gone (Use the compact
+dictation bar, Start dictating as soon as the shortcut is pressed); settings
+files keep them for an older version. The bar is dragged by anything but its
+buttons and opens where it was left, as a share of the screen's room, so it
+opens whole on any display; a drop within 12 pt of its default place, or
+Settings → General → Reset Position, puts it back. The welcome's last step plays
+a dictation on a bar of its own, from the same frames the README's animation is
+now rendered from, and says when the speech model is still downloading. The
+shortcut works from launch on, the welcome never gates it: its last step asks
+for a real dictation. Rendered off-screen in Light and Dark and looked at: the
+welcome's last step (model ready and still downloading), Settings → General,
+and the animation's frames. Dragging was exercised through the bar's own drag
+methods, not with a real mouse.
+
+### Bug hunt
+
+Six reviewers, one per area, then four with other lenses (an adversarial
+review of these changes, performance, durability without updates, system
+events). Confirmed and fixed, among others:
+
+- A spill a disk error cut short was taken for the whole capture: had the
+  archive failed too, the rest of the dictation was lost while the status said
+  "audio kept". Now the whole capture is written from memory.
+- Audio adopted after a crash whose note could not be written was archived
+  again at every launch; a stream failover had reopened was kept warm for the
+  device it replaced; a history limit lowered before a relaunch deleted the
+  transcripts beyond it even when raised again.
+- "um, uh" in a row left "I think,." behind; a one-letter list item and numbers
+  with signs lost the list's comma. The 20 archived recordings, recognized
+  again, and the last 100 transcripts come out byte-identical to before.
+- A queue line with a line break in its error made a click choose another file;
+  a late Esc left "Cancelling…" for good; a failed final pass left the live
+  draft to be copied; a paste skipped after the window went was said nowhere.
+- A route sending only zeros (a microphone macOS has not allowed) said "Don't
+  speak yet" for about 20 s, through each reopen, instead of 7 s.
+- The daily update check counted only time awake (a laptop checked every few
+  days), and a failed one waited a day.
+- An update could keep an access control list from its download; an unreadable
+  last-install result stopped every launch; release-note headings could stall
+  the main thread for seconds.
+
+### For the years without updates
+
+- `LSMinimumSystemVersion` is 15.0: of the bundle's 281 binaries, PortAudio and
+  MLX are built for 15.0. The bundle check holds every binary to it, and an
+  installed copy refuses an update asking for a newer macOS than it runs on.
+- TLS is verified by macOS's trust store (`truststore`), which macOS keeps
+  current, instead of the bundled CA list: a GitHub and a Hugging Face
+  handshake verified through it.
+- Models are downloaded at the commit this release was tested with; a snapshot
+  missing a file the model reads (Qwen's tokenizer) is not loaded; a model
+  Hugging Face withdrew is said as such.
+- Automatic finds the built-in microphone by CoreAudio's transport type, so a
+  Mac set to another language than English still prefers it.
+- The previous app is activated as macOS 14 asks (yield, then activate).
+
+### Performance
+
+50 dictations through the fake audio helper left threads, file handles, and
+helper processes where they started. Idle CPU 0 %, recording about 1.2 %
+(helper and app together). Live preview now takes 2 s steps: the GPU is busy
+about a fifth of the time instead of two fifths, and the drafts agree better
+with the final pass (0.995 against 0.987 on a two-minute sample). Listing 100
+recordings takes 2 ms; the app imports in 0.36 s.
+
+### Known and left as is
+
+Word boundaries for scripts written without spaces (Chinese, Japanese) when
+the high-accuracy model hears them; a history entry a future version writes in
+another shape is dropped at the next save; a letter shortcut keeps the name its
+key had when it was chosen after the keyboard layout changes; two copies
+launched at the same instant can both decline; `updates/previous` keeps the
+replaced version until the next update.
+
+### Still to verify on real hardware
+
+Dragging the bar with the mouse, the welcome's demonstration on screen, and a
+dictation on macOS 26 and 27.
+

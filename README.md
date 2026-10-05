@@ -76,7 +76,7 @@ and measured off-screen.
 
 ## Install
 
-Requires an Apple Silicon Mac; tested on macOS 15.
+Requires an Apple Silicon Mac with macOS 15 or later.
 
 1. Download `Maramax-<version>.zip` from
    [Releases](https://github.com/maxim-golubev/maramax/releases/latest), unzip

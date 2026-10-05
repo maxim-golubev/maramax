@@ -2,12 +2,15 @@
 
 ## First launch
 
+Maramax needs an Apple Silicon Mac with macOS 15 or later.
+
 1. Move `Maramax.app` (beside this guide) into **Applications** and open it.
 2. The first time, macOS blocks it: Maramax is signed with its own release
    certificate but not notarized by Apple. Open **System Settings → Privacy &
    Security** and choose **Open Anyway**. The app then appears in the menu bar.
 3. A short welcome asks which shortcut you want (Option+Space is recommended)
-   and whether Maramax should paste the text for you or only copy it. Meanwhile
+   and whether Maramax should paste the text for you or only copy it, then
+   shows what a dictation looks like on the bar. Meanwhile
    the first launch downloads the speech model (about 2.5 GB); after that it
    loads from the local cache in a few seconds, with no network request.
 4. Press your shortcut and speak; press it again, or **Cmd+R**, to finish. The
