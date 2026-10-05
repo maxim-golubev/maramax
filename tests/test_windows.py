@@ -575,3 +575,29 @@ dragged = SimpleNamespace(draggingPasteboard=lambda: board)
 assert window.content_view._dragged_media(dragged) == ["/tmp/real.wav"]
 board.releaseGlobally()
 ''')
+
+
+def test_a_drag_whose_button_was_released_unheard_ends_and_lets_the_bar_go():
+    run(r'''
+from AppKit import NSPoint
+from parakeet_dictation import indicator
+from parakeet_dictation.indicator import DictationIndicator
+moves = []
+bar = DictationIndicator.alloc().initWithDelegate_(SimpleNamespace(bar_moved=moves.append))
+timers = []
+indicator.call_later = lambda delay, function, *args: timers.append((function, args))
+bar.begin("Option+Space")
+bar.place(None)
+bar.finish("Copied transcript to clipboard", 2)
+view = bar.panel.contentView()
+view.begin_drag(NSPoint(100, 100))
+view.drag_to(NSPoint(150, 300))
+indicator.NSEvent = SimpleNamespace(pressedMouseButtons=lambda: 1)       # Still held: not hidden from under it.
+function, args = timers.pop()
+function(*args)
+assert len(timers) == 1 and view.is_dragged()
+indicator.NSEvent = SimpleNamespace(pressedMouseButtons=lambda: 0)       # Released, the mouse-up never arrived.
+function, args = timers.pop()
+function(*args)
+assert not view.is_dragged() and len(moves) == 1 and timers == []        # The drop is remembered; it hides.
+''')

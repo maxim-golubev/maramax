@@ -112,3 +112,10 @@ def test_written_applies_both_and_changes_nothing_else():
     for plain in ("Parakeet already writes $10, 100% and 0.4% as digits.",
                   "Open the .env file in .NET, then type :wq."):
         assert written(plain) == plain
+
+
+def test_a_long_run_without_spaces_takes_no_time():
+    import time
+    started = time.monotonic()
+    written("a," * 25000 + " um, done.")
+    assert time.monotonic() - started < 0.5

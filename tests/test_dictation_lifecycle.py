@@ -764,3 +764,16 @@ def test_recovered_audio_being_moved_in_is_neither_recovered_nor_cleared_meanwhi
     app._refresh_recordings_window = lambda: calls.append("recordings refreshed")
     app._adopted()
     assert not app._adopting and calls[-1] == "recordings refreshed"
+
+
+def test_a_second_esc_after_the_outcome_still_leaves_the_outcome_said(monkeypatch):
+    app, _ = controller(monkeypatch)
+    shown = []
+    app._show_status = lambda message, revert_after=0: shown.append((message, revert_after)) or setattr(
+        app, "_last_status", message)
+    app._phase = Phase.TRANSCRIBING
+    app._last_status, app._last_revert = module.COPIED_STATUS, 5
+    app.dismiss_requested()
+    app.dismiss_requested()                                          # Esc twice, or the X clicked twice.
+    app._complete_operation_on_main(0)
+    assert shown[-1] == (module.COPIED_STATUS, 5)

@@ -41,8 +41,9 @@ def _malformed(heard: str, replacement: str) -> str | None:
 
 def rule_key(heard: str) -> str:
     """What makes two rules one rule: the same words heard, however spaced or
-    capitalized. Lower case, as re.IGNORECASE compares letters: casefold()
-    would also take "STRASSE" for "Straße", which matching never does."""
+    capitalized. Lower case rather than casefold(), which would also take
+    "STRASSE" for "Straße", which matching never does. (Matching, unlike
+    lower(), also takes a handful of archaic letters such as ſ for s.)"""
     return _cleaned(heard, "")[0].lower()
 
 

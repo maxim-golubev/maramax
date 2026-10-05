@@ -465,8 +465,10 @@ class DictationApp(rumps.App):
             self._queue_cancel_event.set()
             self._hide_window_when_done = True
             # What was said before: the work may have finished already, its
-            # outcome said, and then nothing more comes to replace this.
-            self._before_cancelling = (self._last_status, self._last_revert)
+            # outcome said, and then nothing more comes to replace this. (A
+            # second Esc must not take "Cancelling…" itself for that outcome.)
+            if self._last_status != CANCELLING_STATUS:
+                self._before_cancelling = (self._last_status, self._last_revert)
             self._show_status(CANCELLING_STATUS)
         else:
             self._hide_window()

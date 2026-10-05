@@ -1424,3 +1424,15 @@ def test_an_update_for_a_newer_macos_is_refused_before_anything_is_installed(tmp
     updater._verify(new, installed, "0.5.2")                       # On that macOS: on to the signature.
     assert codesign
 
+
+def test_access_control_lists_are_removed_without_following_a_link(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not part of the app")
+    subprocess.run(["chmod", "+a", "everyone allow write", str(outside)], check=True)
+    app = tmp_path / "Maramax.app"
+    (app / "Contents").mkdir(parents=True)
+    (app / "Contents" / "out").symlink_to(outside)
+    (app / "Contents" / "nowhere").symlink_to(tmp_path / "missing")      # A link that leads nowhere.
+    updater._restrict_permissions(app)                                   # Does not fail on it,
+    listing = subprocess.run(["ls", "-le", str(outside)], capture_output=True, text=True, check=True).stdout
+    assert "everyone" in listing                                        # nor reach past the bundle.

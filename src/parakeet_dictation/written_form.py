@@ -15,7 +15,7 @@ _FILLERS = rf"{_FILLER}(?:,?\s+{_FILLER})*"
 # of a list or two numbers one stays, "eggs, um, milk, and bread" reads "eggs,
 # milk, and bread". A list's tail is short items to the end of the sentence.
 # The words either side are read whole, so "$5, um, $6" counts as two numbers.
-_BETWEEN_COMMAS = re.compile(rf"(\S*),\s+{_FILLERS},\s+(?=(\S*)([^.?!]*))")
+_BETWEEN_COMMAS = re.compile(rf"(?<!\S)(\S*),\s+{_FILLERS},\s+(?=(\S*)([^.?!]*))")
 _ITEM = r"\w+(?:\s\w+)?"
 # The connector is possessive: read as an item's first word too, "and" would
 # give each item two readings, and a long non-list sentence exponential work.

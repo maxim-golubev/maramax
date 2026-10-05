@@ -451,7 +451,7 @@ class ParakeetTranscriber:
 
     def start_drafts(self, frames_provider: Callable[[], list[bytes]], on_draft: Callable[[str], None]) -> bool:
         """Emit draft text while a recording is in progress, about once per
-        second of new audio. Drafts use limited context and are less accurate
+        two seconds of new audio. Drafts use limited context and are less accurate
         than the offline pass, which must replace them. False when an earlier
         stream never let go of the encoder: a second one must not start."""
         if self._drafts is not None and self._drafts.is_alive():
@@ -489,7 +489,10 @@ class ParakeetTranscriber:
         try:
             self.wait_until_ready()
             assert self.model is not None
-            min_chunk_bytes = SAMPLE_RATE * SAMPLE_WIDTH  # ~1 s
+            # Each step encodes the stream's whole context window (about 20 s)
+            # again: at 2 s steps the GPU is busy a fifth of the time, not two
+            # fifths, and the drafts agree better with the final pass.
+            min_chunk_bytes = 2 * SAMPLE_RATE * SAMPLE_WIDTH
             consumed = 0
             with self.model.transcribe_stream(context_size=(256, 256)) as stream:
                 while not stop.is_set():

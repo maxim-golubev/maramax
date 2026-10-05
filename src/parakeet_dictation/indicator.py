@@ -502,9 +502,12 @@ class DictationIndicator(NSObject):
         if token != self._token or not self._finished:
             return
         if self._background.is_dragged():
-            # Not from under the pointer: the drop still has to be remembered.
-            call_later(UPDATE_SECONDS, self._hide_if_current, token)
-            return
+            if NSEvent.pressedMouseButtons() & 1:
+                # Not from under the pointer: the drop still has to be remembered.
+                call_later(UPDATE_SECONDS, self._hide_if_current, token)
+                return
+            # The button is up but the bar never heard: the drag ended there.
+            self._background.end_drag()
         self.hide()
 
     @objc.python_method

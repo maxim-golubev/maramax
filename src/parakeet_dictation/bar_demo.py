@@ -94,11 +94,25 @@ class _Stage(NSView):
         NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(self.bounds(), 10, 10).fill()
 
 
+class _Shown:
+    """The demonstration bar's delegate. The mouse never reaches its buttons,
+    but VoiceOver can press them: nothing happens."""
+
+    def dismiss_requested(self) -> None:
+        pass
+
+    def open_transcript_window(self) -> None:
+        pass
+
+    def bar_moved(self, placement) -> None:
+        del placement
+
+
 class Demonstration:
     """`view` shows a bar of its own playing dictation() over and over while started."""
 
     def __init__(self) -> None:
-        self._bar = DictationIndicator.alloc().initWithDelegate_(None)
+        self._bar = DictationIndicator.alloc().initWithDelegate_(_Shown())
         bar_view = self._bar.take_view()
         bar_view.setFrameOrigin_((STAGE_PADDING, STAGE_PADDING))
         layer = bar_view.layer()

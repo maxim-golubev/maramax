@@ -534,7 +534,7 @@ def test_offline_pass_waits_for_the_draft_stream_and_refuses_if_it_is_stuck(monk
 
     transcriber.model.transcribe_stream = lambda context_size: Stream()
     drafts = []
-    assert transcriber.start_drafts(lambda: [b"\x01\x00" * 16000], drafts.append)
+    assert transcriber.start_drafts(lambda: [b"\x01\x00" * 32000], drafts.append)
     deadline = time.monotonic() + 2
     while not drafts and time.monotonic() < deadline:
         time.sleep(0.01)

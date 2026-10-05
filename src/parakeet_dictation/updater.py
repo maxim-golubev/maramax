@@ -394,7 +394,10 @@ def _restrict_permissions(app: Path) -> None:
     lists, which come from the release's ZIP (ditto restores both) or the
     installed copy a delta rebuilds: nothing installed may be writable by
     other users or run as another. (chmod -R does not follow symlinks.)"""
-    _run(["/bin/chmod", "-R", "-N", str(app)], f"remove the access control lists of {app}")
+    # chmod -N follows symbolic links even with -R, and fails on one that
+    # leads nowhere: every entry but the links, by find.
+    _run(["/usr/bin/find", str(app), "!", "-type", "l", "-exec", "/bin/chmod", "-N", "{}", "+"],
+         f"remove the access control lists of {app}")
     _run(["/bin/chmod", "-R", "go-w,ug-s", str(app)], f"set the permissions of {app}")
 
 
