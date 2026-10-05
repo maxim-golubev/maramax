@@ -223,9 +223,15 @@ def model_folder(model: ModelFiles) -> str:
         if folder is not None:
             return folder
     try:
-        return snapshot_download(model.repo, revision=model.revision, allow_patterns=list(model.files))
+        try:
+            return snapshot_download(model.repo, revision=model.revision, allow_patterns=list(model.files))
+        except RevisionNotFoundError:
+            # That commit is gone from a repository that is still there: its
+            # latest is the best there is, and loading it says whether it fits.
+            logger.warning(f"{model.repo} no longer has {model.revision[:7]}; downloading its latest")
+            return snapshot_download(model.repo, allow_patterns=list(model.files))
     except (RepositoryNotFoundError, RevisionNotFoundError, GatedRepoError) as exc:
-        raise ModelWithdrawn(f"Hugging Face no longer offers {model.repo} at {model.revision[:7]}: {exc}") from exc
+        raise ModelWithdrawn(f"Hugging Face no longer offers {model.repo}: {exc}") from exc
 
 
 def _complete_snapshot(model: ModelFiles, revision: str | None) -> str | None:

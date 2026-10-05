@@ -141,13 +141,17 @@ def builtin_input_names() -> set[str] | None:
         names = set()
         for device in devices:
             transport = ctypes.c_uint32(0)
-            read(device, "tran", transport)  # kAudioDevicePropertyTransportType
             streams = ctypes.c_uint32(0)     # kAudioDevicePropertyStreams, input scope: bytes of stream ids
-            size_of(device, ctypes.byref(address("stm#", "inpt")), 0, None, ctypes.byref(streams))
-            if transport.value != _four_char_code("bltn") or not streams.value:
-                continue
             name = ctypes.c_void_p()
-            read(device, "lnam", name)       # kAudioObjectPropertyName: a CFString this call hands over
+            try:
+                read(device, "tran", transport)  # kAudioDevicePropertyTransportType
+                size_of(device, ctypes.byref(address("stm#", "inpt")), 0, None, ctypes.byref(streams))
+                if transport.value != _four_char_code("bltn") or not streams.value:
+                    continue
+                read(device, "lnam", name)       # kAudioObjectPropertyName: a CFString this call hands over
+            except OSError as exc:
+                logger.debug(f"Skipped audio device {device}: {exc}")  # Gone meanwhile, or not a device at all.
+                continue
             try:
                 text = ctypes.create_string_buffer(1024)
                 if cf.CFStringGetCString(name, text, len(text), 0x08000100):  # UTF-8

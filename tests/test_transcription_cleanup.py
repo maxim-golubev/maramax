@@ -383,7 +383,7 @@ def downloads(monkeypatch, outcome=None):
     """What model_folder() asks Hugging Face for; `outcome` is raised, if given."""
     asked = []
 
-    def download(repo, revision, allow_patterns):
+    def download(repo, allow_patterns, revision=None):
         asked.append((repo, revision, allow_patterns))
         if outcome is not None:
             raise outcome
@@ -889,3 +889,19 @@ def test_audio_shorter_than_half_an_fft_is_not_recognized(monkeypatch):
     assert transcriber.transcribe_pcm(b"\x01\x00" * 256) == ""
     assert calls == []
     assert transcriber.transcribe_pcm(b"\x01\x00" * 257) and calls
+
+
+def test_a_release_commit_gone_from_a_repository_still_there_falls_back_to_its_latest(monkeypatch):
+    from huggingface_hub.errors import RevisionNotFoundError
+    monkeypatch.setattr(transcription, "try_to_load_from_cache", lambda *_args, **_kwargs: None)
+    asked = []
+
+    def download(repo, allow_patterns, revision=None):
+        asked.append(revision)
+        if revision is not None:
+            raise RevisionNotFoundError("404", response=SimpleNamespace(headers={}, status_code=404, request=None))
+        return "/latest"
+
+    monkeypatch.setattr(transcription, "snapshot_download", download)
+    assert transcription.model_folder(TEST_MODEL) == "/latest" and asked == [TEST_MODEL.revision, None]
+

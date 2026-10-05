@@ -375,10 +375,11 @@ def running_macos() -> str:
 
 def _verify(new_app: Path, installed_app: Path, version: str) -> None:
     info, installed = _bundle_info(new_app), _bundle_info(installed_app)
-    needed = info.get("LSMinimumSystemVersion")
-    if isinstance(needed, str) and version_key(needed) > version_key(running_macos()):
+    needed, running = info.get("LSMinimumSystemVersion"), running_macos()
+    # An unreadable running version is no reason to refuse: the signature still decides.
+    if isinstance(needed, str) and running and version_key(needed) > version_key(running):
         # Installed, it would not even open: this copy stays as it is.
-        raise UpdateError(f"Maramax {version} needs macOS {needed} or later; this Mac has macOS {running_macos()}")
+        raise UpdateError(f"Maramax {version} needs macOS {needed} or later; this Mac has macOS {running}")
     identifier = installed.get("CFBundleIdentifier")
     if not isinstance(identifier, str) or info.get("CFBundleIdentifier") != identifier:
         raise UpdateError(f"The downloaded app is {info.get('CFBundleIdentifier')!r}, not {identifier!r}")
