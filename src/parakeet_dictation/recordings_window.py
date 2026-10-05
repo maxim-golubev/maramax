@@ -203,6 +203,7 @@ class RecordingsController(NSObject):
             return
         self.sound = NSSound.alloc().initWithContentsOfFile_byReference_(str(self.store.audio_path(record.id)), True)
         if self.sound is None or not self.sound.play():
+            self.sound = None  # Nothing is playing: Play must not read as Stop.
             self.note.setStringValue_("Could not play recording. Try Save Audio instead.")
             return
         self.play.setTitle_("Stop")

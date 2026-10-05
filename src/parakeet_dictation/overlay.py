@@ -96,11 +96,11 @@ class DropTarget(StrEnum):
     QUEUE = "queue"
 
 
-def drop_target(mode: Mode, count: int, transcribing: bool) -> DropTarget:
+def drop_target(mode: Mode, count: int, busy: bool) -> DropTarget:
     """What dropping `count` media files does. One file dropped outside the
-    Queue tab is transcribed at once, unless something is being transcribed:
-    then it waits in the queue like several would."""
-    return DropTarget.TRANSCRIBE if mode != Mode.QUEUE and count == 1 and not transcribing else DropTarget.QUEUE
+    Queue tab is transcribed at once, unless a recording or a transcription
+    is under way: then it waits in the queue like several would."""
+    return DropTarget.TRANSCRIBE if mode != Mode.QUEUE and count == 1 and not busy else DropTarget.QUEUE
 
 
 _DROP_FEEDBACK = {DropTarget.TRANSCRIBE: "Drop to transcribe", DropTarget.QUEUE: "Drop to add to the queue"}
@@ -199,7 +199,8 @@ class OverlayDropView(NSView):
     @objc.python_method
     def _dragged_media(self, sender):
         urls = sender.draggingPasteboard().readObjectsForClasses_options_([objc.lookUpClass("NSURL")], None) or []
-        return [url.path() for url in urls if url.path() and _is_media(url.path())]
+        # A web address dragged along has a path too, of a file that is not here.
+        return [url.path() for url in urls if url.isFileURL() and url.path() and _is_media(url.path())]
 
     def draggingEntered_(self, sender):
         # A drop starts or queues work and opens the Queue tab, over Stop
@@ -603,7 +604,8 @@ class OverlayController(NSObject):
                 status = f"{status}: {queued.error}"  # Why, in full: often what to do about it.
             marker = f"  [{status}]" if status else ""
             prefix = "▶ " if queued.status == QueueStatus.PROCESSING else "  "
-            lines.append(f"{prefix}{number:>{digits}}. {queued.filename}{marker}")
+            # One file, one line: a click finds its file by counting lines.
+            lines.append(" ".join(f"{prefix}{number:>{digits}}. {queued.filename}{marker}".splitlines()))
         return lines
 
     @objc.python_method
@@ -866,7 +868,7 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def drop_target(self, count: int) -> DropTarget:
-        return drop_target(self.mode, count, self.is_transcribing)
+        return drop_target(self.mode, count, self.is_transcribing or self.is_recording)
 
     @objc.python_method
     def set_drop_state(self, target: DropTarget | None):

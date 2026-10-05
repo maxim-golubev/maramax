@@ -8,11 +8,14 @@ import re
 # and never an all-capitals "UM", which is a name. Parakeet v2 is
 # English-only, so these are not words of another language here.
 _FILLER = r"(?:[Uu]m+|[Uu]h+(?!\s+(?:[Oo]h|[Hh]uh)\b)|[Uu]hm|[Ee]rm)(?![\w-])"
+# One or several in a row: "um, uh" is as common as "um".
+_FILLERS = rf"{_FILLER}(?:,?\s+{_FILLER})*"
 # Set off by commas inside a sentence. In an aside the commas go with it, "I
 # was, um, thinking, and then" reads "I was thinking, and then"; between items
 # of a list or two numbers one stays, "eggs, um, milk, and bread" reads "eggs,
 # milk, and bread". A list's tail is short items to the end of the sentence.
-_BETWEEN_COMMAS = re.compile(rf"(\S?),\s+{_FILLER},\s+(?=(\S?)([^.?!]*))")
+# The words either side are read whole, so "$5, um, $6" counts as two numbers.
+_BETWEEN_COMMAS = re.compile(rf"(\S*),\s+{_FILLERS},\s+(?=(\S*)([^.?!]*))")
 _ITEM = r"\w+(?:\s\w+)?"
 # The connector is possessive: read as an item's first word too, "and" would
 # give each item two readings, and a long non-list sentence exponential work.
@@ -22,7 +25,7 @@ _LIST_TAIL = re.compile(rf"{_ITEM}(?:,\s*(?:(?:and|or)\s+)?+{_ITEM}|\s(?:and|or)
 _INTRODUCTORY = re.compile(r"(?:^|[.?!]\s+)(?:yeah|yes|no|okay|ok|well|right|sure|so|sorry|actually|anyway|oh|"
                            r"thanks|(?:hi|hey|hello|dear)(?:\s+\w+)?)$", re.IGNORECASE)
 # Ending a clause: the comma before it goes too, "I think, um." reads "I think."
-_CLOSING = re.compile(rf",\s*{_FILLER}(?=\s*(?:[.?!;:…]|$))")
+_CLOSING = re.compile(rf",\s*{_FILLERS}(?=\s*(?:[.?!;:…]|$))")
 # A filler sentence that ends the text goes with its own punctuation: "That is all. Um." reads "That is all."
 _TRAILING = re.compile(rf"(?<=[.?!…])(?:\s+{_FILLER}(?:\.\.\.|[,.?!;:…])?)+\s*$")
 # Opening a sentence: its capital goes to the next word, "Um, so" reads "So",
@@ -32,10 +35,14 @@ _ANYWHERE = re.compile(rf"\s*(?<![\w-]){_FILLER}[,]?")
 _ALONE = re.compile(rf"^(?:{_FILLER}(?:\.\.\.|[,.?!;:…])?\s*)+$")
 
 
+def _numeral(word: str) -> bool:
+    return any(character.isdigit() for character in word)
+
+
 def _between_commas(match: re.Match) -> str:
     before, after, rest = match.group(1), match.group(2), match.group(3)
     opening = _INTRODUCTORY.search(match.string[:match.start(1) + len(before)]) is not None
-    separates = (before.isdigit() and after.isdigit()) or _LIST_TAIL.fullmatch(rest) is not None
+    separates = (_numeral(before) and _numeral(after)) or _LIST_TAIL.fullmatch(after + rest) is not None
     return f"{before}, " if opening or separates else f"{before} "
 
 

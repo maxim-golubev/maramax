@@ -111,3 +111,18 @@ def test_an_unsaved_recording_is_dated_when_its_capture_ended(tmp_path):
     os.utime(recovery.in_progress_path(tmp_path), (ended.timestamp(), ended.timestamp()))
     recovery.promote_in_progress(tmp_path)  # Keeping it is a rename: the date survives.
     assert recovery.captured_at(recovery.unsaved_recordings(tmp_path)[0]) == ended
+
+
+def test_clearing_unsaved_recordings_also_clears_an_interrupted_one(tmp_path):
+    recovery.keep_unsaved(tmp_path, b"\x01\x00" * 16000)
+    (tmp_path / f"{recovery.UNSAVED_PREFIX}2{recovery.UNSAVED_SUFFIX}.tmp").write_bytes(b"\x02\x00" * 16000)
+    recovery.discard_every_unsaved(tmp_path)
+    assert list(tmp_path.iterdir()) == []                        # No private audio left behind.
+
+
+def test_keeping_a_capture_in_a_folder_that_cannot_be_listed_says_it_was_not_kept(tmp_path, monkeypatch):
+    def unreadable(_base_dir):
+        raise PermissionError("Operation not permitted")
+
+    monkeypatch.setattr(recovery, "_kept_files", unreadable)
+    assert recovery.keep_unsaved(tmp_path, b"\x01\x00" * 16000) is False

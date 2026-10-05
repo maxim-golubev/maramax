@@ -27,7 +27,7 @@ def paste_context(monkeypatch):
     monkeypatch.setattr(module, "accessibility_trusted", lambda: True)
     monkeypatch.setattr(module, "contains_text", lambda text: text == "transcript")
     monkeypatch.setattr(module, "send_paste_keystroke", lambda lead: events.append("paste" + lead))
-    monkeypatch.setattr(module, "character_before_cursor", lambda: None)   # An app that does not say.
+    monkeypatch.setattr(module, "text_before_cursor", lambda: None)   # An app that does not say.
     monkeypatch.setattr(module, "call_later", lambda delay, fn: scheduled.append((delay, fn)))
     app = object.__new__(module.DictationApp)
     app._session = 1
@@ -119,7 +119,7 @@ def test_missing_permission_never_posts_events_or_opens_a_window(paste_context, 
 def test_a_transcript_pasted_after_text_is_spaced_from_it(paste_context, monkeypatch, before, pasted):
     """Two dictations in a row read "end. Start", not "end.Start"; the clipboard is not touched."""
     app, _, events, scheduled, _ = paste_context
-    monkeypatch.setattr(module, "character_before_cursor", lambda: before)
+    monkeypatch.setattr(module, "text_before_cursor", lambda: before)
     app._paste_into_previous_app_on_main(1, "transcript")
     scheduled[0][1]()
     assert events[-1] == pasted
@@ -180,7 +180,9 @@ def test_a_leading_space_is_typed_before_cmd_v_and_every_event_exists_before_any
 
 @pytest.mark.parametrize("previous, spaced", [(None, False), ("", False), (" ", False), ("\n", False), ("(", False),
                                               ("“", False), ("a", True), (".", True), (",", True), ("7", True),
-                                              (")", True)])
+                                              (")", True), ("d ", False), ("d.", True), ("x(", False),
+                                              ('"', False), ('s"', True), ('."', True), (' "', False), ('("', False),
+                                              ("'", False), ("s'", True), ("\n'", False), ("😀", True)])
 def test_a_space_goes_in_only_after_a_word_or_punctuation(previous, spaced):
     assert autopaste.space_before(previous) is spaced
 
@@ -319,3 +321,18 @@ def test_asking_again_while_already_allowed_never_resets_the_grant(monkeypatch):
     monkeypatch.setattr(module, "request_accessibility", lambda bundle: events.append("reset and ask"))
     app.request_paste_permission()
     assert events == ["views"]
+
+
+def test_a_paste_skipped_after_the_window_went_is_said_on_the_bar(paste_context):
+    """With the window gone, the menu's status line alone would go unseen."""
+    app, front, events, scheduled, statuses = paste_context
+    app._compact_session = False
+    app._dictate = SimpleNamespace(label="Option+Space")
+    app.config = SimpleNamespace(bar_position=[0.5, 0.5])
+    app.indicator = SimpleNamespace(show=lambda label, placement: events.append(("bar", placement)),
+                                    finish=lambda message, seconds: events.append(("bar says", message)))
+    app._paste_into_previous_app_on_main(1, "transcript")
+    front[0] = SimpleNamespace(processIdentifier=lambda: 456)          # The user went elsewhere meanwhile.
+    scheduled[0][1]()
+    assert events[-2:] == [("bar", [0.5, 0.5]), ("bar says", module.SWITCHED_APPS_STATUS)]
+    assert statuses[-1] == module.SWITCHED_APPS_STATUS and app._compact_session

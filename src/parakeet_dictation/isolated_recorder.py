@@ -60,6 +60,9 @@ class IsolatedAudioRecorder:
         # an earlier capture that could not be set aside, that file is the
         # earlier capture's only copy and must outlive this one.
         self._spill_is_ours = False
+        # Whether every buffer of this capture reached the spill: a write
+        # error stops spilling, leaving only the first part on disk.
+        self._spill_is_whole = False
         self._closed = False
         self._closed_because = "Maramax is shutting down"
         self._overflows = 0
@@ -356,6 +359,7 @@ class IsolatedAudioRecorder:
     def _open_spill(self):
         self._spill = None
         self._spill_is_ours = False
+        self._spill_is_whole = False
         if recovery.unkept_in_progress(self._recovery_dir):
             # An earlier capture could not be set aside as an unsaved
             # recording; opening the spill would truncate the only copy.
@@ -365,6 +369,7 @@ class IsolatedAudioRecorder:
             self._recovery_dir.mkdir(parents=True, exist_ok=True)
             self._spill = recovery.in_progress_path(self._recovery_dir).open("wb")
             self._spill_is_ours = True
+            self._spill_is_whole = True
         except OSError as exc:
             # Memory capture and the final archive can still succeed.
             logger.warning(f"Recording will not be spilled to disk as it arrives: {exc}")
@@ -453,6 +458,7 @@ class IsolatedAudioRecorder:
                     # A full disk must not end the recording: the audio is
                     # still in memory and the archive may yet succeed.
                     logger.warning(f"Stopped spilling the recording to disk: {exc}")
+                    self._spill_is_whole = False
                     spill, self._spill = self._spill, None
                     try:
                         spill.close()
@@ -513,9 +519,10 @@ class IsolatedAudioRecorder:
 
     @property
     def spill_holds_capture(self) -> bool:
-        """Whether the recovery file holds this capture: False when it went
-        without one because an earlier capture still occupied the file."""
-        return self._spill_is_ours
+        """Whether the recovery file holds the whole of this capture: False
+        when it went without one because an earlier capture still occupied
+        the file, or when a write error cut its spill short."""
+        return self._spill_is_ours and self._spill_is_whole
 
     def preserve_recovery(self) -> bool:
         """Keep what was spilled as an unsaved recording of its own."""

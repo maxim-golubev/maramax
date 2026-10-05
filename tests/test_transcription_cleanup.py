@@ -834,3 +834,13 @@ def test_the_high_accuracy_model_says_it_waits_until_it_is_asked_to_load():
     """It loads only once the standard model is ready; until then it is not "loading"."""
     qwen = transcription.QwenTranscriber()
     assert qwen.status_message() == "The high-accuracy model loads once the standard model is ready"
+
+
+def test_audio_shorter_than_half_an_fft_is_not_recognized(monkeypatch):
+    """The library pads less than half an FFT by less, and its last frame would read past the buffer."""
+    calls = []
+    transcriber = recognizer(calls)
+    monkeypatch.setattr(transcription, "get_logmel", lambda audio, config: audio)
+    assert transcriber.transcribe_pcm(b"\x01\x00" * 256) == ""
+    assert calls == []
+    assert transcriber.transcribe_pcm(b"\x01\x00" * 257) and calls

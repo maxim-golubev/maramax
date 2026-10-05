@@ -1308,3 +1308,56 @@ assert window.bar.doubleValue() == 1.0 and not window.bar.isIndeterminate()
 '''
     result = subprocess.run([sys.executable, "-c", body], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr[-1500:]
+
+
+def test_a_result_file_that_cannot_be_read_never_stops_the_launch(tmp_path):
+    path = tmp_path / "last-install"
+    path.write_bytes(b"\xff\xfeinstalled")
+    with pytest.raises(updater.UpdateError):
+        updater.take_install_result(path)
+    assert not path.exists()                                         # Read once: the next launch is clean.
+    path.mkdir()
+    with pytest.raises(updater.UpdateError, match="cannot be read"):
+        updater.take_install_result(path)
+
+
+def test_an_update_keeps_no_access_control_list_from_the_download(tmp_path):
+    app = tmp_path / "Maramax.app"
+    (app / "Contents").mkdir(parents=True)
+    source = app / "Contents" / "module.py"
+    source.write_text("pass")
+    subprocess.run(["chmod", "+a", "everyone allow write,append", str(source)], check=True)
+    updater._restrict_permissions(app)
+    listing = subprocess.run(["ls", "-le", str(source)], capture_output=True, text=True, check=True).stdout
+    assert "everyone" not in listing
+
+
+def test_a_delta_with_nothing_to_carry_is_still_written(tmp_path):
+    old, new = tmp_path / "old.app", tmp_path / "new.app"
+    for app in (old, new):
+        (app / "Contents").mkdir(parents=True)
+        (app / "Contents" / "Info.plist").write_text("same")
+    (old / "Contents" / "gone.txt").write_text("removed in the new version")
+    assert bundle_delta.make(old, new, tmp_path / "delta" / "inner") == (0, 1)
+
+
+def test_the_copy_that_is_running_is_never_removed_as_a_leftover(monkeypatch, tmp_path):
+    controller, *_ = offer(monkeypatch, tmp_path)
+    discarded = []
+    monkeypatch.setattr(update_offer.UpdateOffer, "_discard", staticmethod(discarded.append))
+    running = fake_bundle(tmp_path / "Applications").rename(tmp_path / "Applications" / updater.STAGED_NAME)
+    controller._installed_app = running
+    controller._remove_leftover()
+    assert discarded == []
+
+
+def test_release_note_headings_keep_their_own_hashes_and_never_take_long():
+    import time
+
+    from parakeet_dictation.update_prompt import Emphasis, Heading, Run, note_blocks
+    assert note_blocks("### Fixes in C#") == [Heading((Run("Fixes in C#", Emphasis.PLAIN),))]
+    assert note_blocks("## Fixes ##") == [Heading((Run("Fixes", Emphasis.PLAIN),))]
+    assert note_blocks("snake__case__name")[0].parts == (Run("snake__case__name", Emphasis.PLAIN),)  # Inside a word.
+    started = time.monotonic()
+    note_blocks("# a" + " " * 20000 + "b")
+    assert time.monotonic() - started < 0.5

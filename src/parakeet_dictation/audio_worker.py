@@ -246,7 +246,9 @@ class AudioHelper:
             # Everything captured is delivered before the device is closed:
             # the app can start recognition while the driver winds down.
             send(Event.DONE)
-            if keep_warm > 0 and healthy:
+            # A stream failover moved to another input is not the one `key`
+            # names: kept warm, it would answer a request for the original.
+            if keep_warm > 0 and healthy and reopens == 0:
                 self._warm_key = key
                 self._warm_until = time.monotonic() + keep_warm
                 send(Event.WARM)

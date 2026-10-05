@@ -40,8 +40,10 @@ def _malformed(heard: str, replacement: str) -> str | None:
 
 
 def rule_key(heard: str) -> str:
-    """What makes two rules one rule: the same words heard, however spaced or capitalized."""
-    return _cleaned(heard, "")[0].casefold()
+    """What makes two rules one rule: the same words heard, however spaced or
+    capitalized. Lower case, as re.IGNORECASE compares letters: casefold()
+    would also take "STRASSE" for "Straße", which matching never does."""
+    return _cleaned(heard, "")[0].lower()
 
 
 def normalize_rules(value: object) -> list[dict[str, str]]:

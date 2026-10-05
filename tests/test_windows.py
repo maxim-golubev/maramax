@@ -129,10 +129,10 @@ window.set_drop_state(window.drop_target(3))               # Several files are q
 assert str(window.status_label.stringValue()) == "Drop to add to the queue"
 window.set_drop_state(None)
 # What a drop does: one rule for the feedback and for the drop itself.
-assert drop_target(Mode.RESULT, 1, transcribing=False) is DropTarget.TRANSCRIBE
-assert drop_target(Mode.RESULT, 2, transcribing=False) is DropTarget.QUEUE
-assert drop_target(Mode.RESULT, 1, transcribing=True) is DropTarget.QUEUE      # Busy: it waits in the queue.
-assert drop_target(Mode.QUEUE, 1, transcribing=False) is DropTarget.QUEUE
+assert drop_target(Mode.RESULT, 1, busy=False) is DropTarget.TRANSCRIBE
+assert drop_target(Mode.RESULT, 2, busy=False) is DropTarget.QUEUE
+assert drop_target(Mode.RESULT, 1, busy=True) is DropTarget.QUEUE      # Recording or transcribing: it waits in the queue.
+assert drop_target(Mode.QUEUE, 1, busy=False) is DropTarget.QUEUE
 assert "several to add them to the queue" in DROP_HINT
 window.hide()
 assert str(window.status_label.stringValue()) == long_status  # Reopening shows the status, not a blank.
@@ -541,4 +541,37 @@ demonstration.stop()
 function, args = scheduled.pop(0)[1:]
 function(*args)
 assert scheduled == []                                                  # Stopped: no more frames.
+''')
+
+
+def test_a_queue_line_is_one_line_whatever_its_error_or_name_says():
+    run(r'''
+from parakeet_dictation.file_queue import QueuedFile, QueueStatus
+from parakeet_dictation.overlay import Mode, OverlayController
+window = OverlayController.alloc().initWithDelegate_(delegate)
+window._set_mode(Mode.QUEUE)
+window.set_queue_files([
+    QueuedFile("a", "/a.wav", "a.wav", QueueStatus.FAILED, error="Unexpected error\nsecond line"),
+    QueuedFile("b", "/b\nc.wav", "b\nc.wav"), QueuedFile("c", "/c.wav", "c.wav")])
+lines = str(window.queue_text_view.string()).split("\n")
+assert len(lines) == 3, lines
+start = len(lines[0]) + 1 + len(lines[1]) + 1                 # A click on the third line.
+window.queue_text_view.setSelectedRange_(NSMakeRange(start + 2, 0))
+window.textViewDidChangeSelection_(SimpleNamespace(object=lambda: window.queue_text_view))
+window.queueRemove_(None)
+assert calls[-1] == ("remove", "c"), calls
+''')
+
+
+def test_a_web_address_dragged_along_with_a_file_is_not_queued():
+    run(r'''
+from AppKit import NSPasteboard, NSURL
+from parakeet_dictation.overlay import OverlayController
+window = OverlayController.alloc().initWithDelegate_(delegate)
+board = NSPasteboard.pasteboardWithUniqueName()
+board.clearContents()
+board.writeObjects_([NSURL.fileURLWithPath_("/tmp/real.wav"), NSURL.URLWithString_("https://host/podcast/episode.mp3")])
+dragged = SimpleNamespace(draggingPasteboard=lambda: board)
+assert window.content_view._dragged_media(dragged) == ["/tmp/real.wav"]
+board.releaseGlobally()
 ''')

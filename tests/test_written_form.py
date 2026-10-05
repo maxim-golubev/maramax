@@ -38,6 +38,12 @@ from parakeet_dictation.written_form import with_clock_times, without_fillers, w
     ("Is that right? Um.", "Is that right?"),
     ("Bye. Uh...", "Bye."),
     ("Okay, um, let us start.", "Okay, let us start."),                        # An opening word keeps its comma.
+    ("I think, um, uh.", "I think."),                                          # Several in a row, as one.
+    ("We, um, uh, went home.", "We went home."),
+    ("Is it, uh, um? Yes.", "Is it? Yes."),
+    ("Pick A, um, B, or C.", "Pick A, B, or C."),                              # A one-letter item is an item.
+    ("It costs $5, um, $6.", "It costs $5, $6."),                              # Numbers with signs are numbers.
+    ("Between 5%, um, 10%.", "Between 5%, 10%."),
     ("Hey John, uh, quick question.", "Hey John, quick question."),
 ])
 def test_fillers_are_removed_and_the_sentence_still_reads(heard, wanted):

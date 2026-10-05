@@ -81,19 +81,33 @@ _TCCUTIL_SECONDS = 5
 # cursor: the read runs on the main thread, just before Cmd+V.
 _CURSOR_READ_SECONDS = 0.25
 # After one of these a transcript follows on without a space.
-_OPENERS = "([{<\"'“‘«/\\-@#"
+_OPENERS = "([{<“‘«/\\-@#"
+# Straight quotes open and close alike: one after a word closes ("yes"), one
+# at the start or after a space opens.
+_STRAIGHT_QUOTES = "\"'"
 
 
 class _CFRange(ctypes.Structure):
     _fields_ = [("location", ctypes.c_long), ("length", ctypes.c_long)]
 
 
-def space_before(previous: str | None) -> bool:
-    """Whether a transcript pasted after `previous`, the character before the
-    cursor, needs a space first: after a word or a sentence it does; at the
-    start of a field ("") or a line, after a space or an opening bracket or
-    quote, it does not. None, an app that does not say, leaves it as it is."""
-    return previous is not None and previous != "" and not previous.isspace() and previous not in _OPENERS
+def _separates(character: str) -> bool:
+    """Whether text after `character` is a new word: it ends one, or a sentence."""
+    return not character.isspace() and character not in _OPENERS
+
+
+def space_before(before: str | None) -> bool:
+    """Whether a transcript pasted after `before`, the (up to) two characters
+    before the cursor, needs a space first: after a word or a sentence it
+    does; at the start of a field ("") or a line, after a space or an opening
+    bracket or quote, it does not. None, an app that does not say, leaves it
+    as it is."""
+    if not before:
+        return False
+    last = before[-1]
+    if last in _STRAIGHT_QUOTES:
+        return len(before) == 2 and _separates(before[0]) and before[0] not in _STRAIGHT_QUOTES
+    return _separates(last)
 
 
 def accessibility_trusted() -> bool:
@@ -124,11 +138,11 @@ def request_accessibility(bundle_identifier: str | None) -> None:
     _app_services.AXIsProcessTrustedWithOptions(objc.pyobjc_id(options))
 
 
-def character_before_cursor() -> str | None:
-    """The character just before the insertion point in the focused text
-    field of the frontmost app, "" at the start of a field, or None when the
-    app does not say (terminals and some Electron apps) or takes longer than
-    a quarter of a second to."""
+def text_before_cursor() -> str | None:
+    """The two characters just before the insertion point in the focused
+    text field of the frontmost app (one right after the start of a field, ""
+    at its start), or None when the app does not say (terminals and some
+    Electron apps) or takes longer than a quarter of a second to."""
     owned = []
     try:
         system = _app_services.AXUIElementCreateSystemWide()
@@ -143,7 +157,8 @@ def character_before_cursor() -> str | None:
             return None
         if cursor.location <= 0:
             return "" if cursor.location == 0 else None
-        before = _CFRange(cursor.location - 1, 1)
+        length = min(2, cursor.location)
+        before = _CFRange(cursor.location - length, length)
         span = _app_services.AXValueCreate(_AX_VALUE_CF_RANGE, ctypes.byref(before))
         if not span:
             return None
@@ -154,7 +169,7 @@ def character_before_cursor() -> str | None:
             return None
         owned.append(value.value)
         text = str(objc.objc_object(c_void_p=value.value))  # The proxy keeps its own reference.
-        return text if len(text) == 1 else None
+        return text if 1 <= len(text) <= 2 else None  # Two UTF-16 units can be one character.
     finally:
         for reference in owned:
             _core_foundation.CFRelease(reference)

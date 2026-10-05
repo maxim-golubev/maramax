@@ -332,3 +332,69 @@ def test_a_capture_without_a_spill_is_kept_when_its_archive_fails_too(tmp_path, 
 def test_keeping_a_capture_too_short_to_recover_says_it_was_not_kept(tmp_path):
     assert not recovery.keep_unsaved(tmp_path, b"\x01\x00" * 100)
     assert recovery.unsaved_recordings(tmp_path) == []
+
+
+def test_a_spill_a_disk_error_cut_short_is_not_kept_in_place_of_the_whole_capture(tmp_path, monkeypatch):
+    """Spilling stopped part way (the disk filled), and the archive fails too:
+    the whole capture is kept from memory, not the first part from disk."""
+    pcm = b"\x01\x02" * 16000 * 3
+    controller, statuses, _, _ = pipeline(tmp_path, monkeypatch, b"")
+    recorder = controller.recorder
+    recorder._open_spill()
+    recorder._keep(pcm[:32000], {})
+    recorder._spill.close()
+
+    class FullDisk:
+        def write(self, _data):
+            raise OSError(28, "No space left on device")
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    recorder._spill = FullDisk()
+    recorder._keep(pcm[32000:], {})
+    assert not recorder.spill_holds_capture
+    recorder.stop = lambda: pcm
+
+    def fail(*_args):
+        raise OSError("Disk full")
+
+    monkeypatch.setattr(controller.recordings, "save", fail)
+    controller._transcribe_recording_worker(1)
+    assert [recovery.load_unsaved(path) for path in recovery.unsaved_recordings(tmp_path)] == [pcm]
+    assert spill_files(tmp_path) == ["unsaved-recording-1.pcm"]     # The partial spill is gone.
+    assert "audio kept; it moves to Recordings at the next launch" in statuses[-1]
+
+
+def test_audio_adopted_without_its_note_is_archived_once(tmp_path, monkeypatch):
+    pcm = b"\x01\x02" * 16000
+    controller, _, _, ui = pipeline(tmp_path, monkeypatch, b"")
+    controller._refresh_recordings_window = lambda: None
+    recovery.keep_unsaved(tmp_path, pcm)
+
+    def no_room(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(controller.recordings, "update", no_room)
+    controller._adopt_recovered_audio()
+    controller._adopt_recovered_audio()                              # The next launch.
+    assert [controller.recordings.load_pcm(record.id) for record in controller.recordings.list_recordings()] == [pcm]
+    assert recovery.unsaved_recordings(tmp_path) == []
+    assert ui[-1] == (controller._adopted, ())                       # Recover and Clear are allowed again.
+
+
+def test_a_failed_final_pass_does_not_leave_the_live_draft_to_be_copied(tmp_path, monkeypatch):
+    pcm = b"\x01\x02" * 16000
+    controller, _, _, _ = pipeline(tmp_path, monkeypatch, pcm)
+    shown = []
+    controller._set_current_text_on_main = lambda text, session: shown.append(text)
+
+    def stalled(_pcm):
+        raise module.TranscriptionError(module.ENGINE_STALLED)
+
+    controller._final_transcribe_pcm = stalled
+    controller._transcribe_recording_worker(1)
+    assert shown == [""]

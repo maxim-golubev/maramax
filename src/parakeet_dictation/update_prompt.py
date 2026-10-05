@@ -91,11 +91,11 @@ Block = Heading | Bullet | NumberedItem | Paragraph
 _INLINE = re.compile(
     # Only web links: the notes are not covered by the release's signature.
     r"\[(?P<label>[^\]]+)\]\((?P<url>https?://[^)\s]+)\)"
-    r"|\*\*(?P<strong>.+?)\*\*|__(?P<strong2>.+?)__"
+    r"|\*\*(?P<strong>.+?)\*\*|(?<!\w)__(?P<strong2>.+?)__(?!\w)"
     r"|`(?P<code>[^`]+)`"
     r"|(?<!\w)\*(?P<italic>[^*\s][^*]*?)\*|(?<!\w)_(?P<italic2>[^_\s][^_]*?)_(?!\w)"
 )
-_HEADING = re.compile(r"#{1,6}\s+(.*?)\s*#*\s*")
+_HEADING = re.compile(r"#{1,6}\s+(.*)")
 _BULLET = re.compile(r"\s*[-*+]\s+(.*)")
 _NUMBERED = re.compile(r"\s*(\d{1,9}[.)])\s+(.*)")
 
@@ -121,6 +121,15 @@ def inline_parts(text: str) -> Parts:
     return tuple(parts)
 
 
+def _heading_text(text: str) -> str:
+    """A heading's text without the closing #s Markdown allows, which follow
+    a space ("## Fixes ##"); "C#" keeps its #. Done by hand: a pattern that
+    does it backtracks for seconds over a long run of spaces."""
+    text = text.rstrip()
+    bare = text.rstrip("#")
+    return bare.rstrip() if bare != text and (not bare or bare[-1].isspace()) else text
+
+
 def note_blocks(markdown: str) -> list[Block]:
     """Release notes (GitHub Markdown) as headings, bullets, numbered items,
     and paragraphs. A line that continues an item or paragraph joins it, as
@@ -134,7 +143,7 @@ def note_blocks(markdown: str) -> list[Block]:
         if not line.strip():
             open_block = False
         elif heading:
-            blocks.append((Heading, heading.group(1)))
+            blocks.append((Heading, _heading_text(heading.group(1))))
             open_block = False
         elif bullet:
             blocks.append((Bullet, bullet.group(1).strip()))

@@ -162,7 +162,7 @@ class UpdateOffer:
         if self._installed_app is None or self._step is not Step.IDLE:
             return
         leftover = updater.staged_app(self._installed_app)
-        if leftover.exists():
+        if leftover.exists() and leftover != self._installed_app:  # Never the copy that is running.
             logger.info(f"Removing an update that was never installed: {leftover}")
             self._discard(leftover)
 

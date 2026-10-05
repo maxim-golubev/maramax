@@ -153,6 +153,10 @@ class IndicatorBackground(NSView):
         self.end_drag()
 
     @objc.python_method
+    def is_dragged(self):
+        return self._grab is not None
+
+    @objc.python_method
     def begin_drag(self, mouse):
         origin = self.window().frame().origin
         self._grab = ((mouse.x, mouse.y), (origin.x, origin.y))
@@ -482,8 +486,13 @@ class DictationIndicator(NSObject):
 
     @objc.python_method
     def _hide_if_current(self, token):
-        if token == self._token and self._finished:
-            self.hide()
+        if token != self._token or not self._finished:
+            return
+        if self.panel.contentView().is_dragged():
+            # Not from under the pointer: the drop still has to be remembered.
+            call_later(UPDATE_SECONDS, self._hide_if_current, token)
+            return
+        self.hide()
 
     @objc.python_method
     def hide(self):

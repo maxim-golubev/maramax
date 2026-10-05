@@ -378,9 +378,11 @@ def _verify(new_app: Path, installed_app: Path, version: str) -> None:
 
 
 def _restrict_permissions(app: Path) -> None:
-    """The signature seals contents, not permission bits, which come from the
-    release's ZIP or the delta's manifest: nothing installed may be writable
-    by other users or run as another. (chmod -R does not follow symlinks.)"""
+    """The signature seals contents, not permission bits or access control
+    lists, which come from the release's ZIP (ditto restores both) or the
+    installed copy a delta rebuilds: nothing installed may be writable by
+    other users or run as another. (chmod -R does not follow symlinks.)"""
+    _run(["chmod", "-R", "-N", str(app)], f"remove the access control lists of {app}")
     _run(["chmod", "-R", "go-w,ug-s", str(app)], f"set the permissions of {app}")
 
 
@@ -498,10 +500,17 @@ def install_after_exit(*, staged_app: Path, installed_app: Path, previous_app: P
 def take_install_result(result_path: Path) -> InstallResult | None:
     """The outcome the last swap left behind, once: the file is removed."""
     try:
-        text = result_path.read_text().strip()
+        raw = result_path.read_bytes()
     except FileNotFoundError:
         return None
-    result_path.unlink(missing_ok=True)
+    except OSError as exc:
+        raise UpdateError(f"The last update's result in {result_path} cannot be read: {exc}") from exc
+    try:
+        result_path.unlink(missing_ok=True)
+    except OSError as exc:
+        # Read once all the same: the next launch reports it again at worst.
+        logger.warning(f"Could not remove {result_path}: {exc}")
+    text = raw.decode("utf-8", "replace").strip()
     try:
         return InstallResult(text)
     except ValueError as exc:

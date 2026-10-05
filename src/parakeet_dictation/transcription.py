@@ -301,9 +301,11 @@ class ParakeetTranscriber:
     def _transcribe_samples(self, samples: np.ndarray, progress_callback: Callable | None = None) -> str:
         assert self.model is not None
         config = self.model.preprocessor_config
-        # Empty audio crashes the encoder with a Metal allocation error, and
-        # less than one analysis hop cannot form a spectrogram frame.
-        if len(samples) < config.hop_length:
+        # Empty audio crashes the encoder with a Metal allocation error. Under
+        # half an FFT (16 ms, nothing anyone said) the library's reflect
+        # padding is shorter than _recognize() counts on, so its last frame
+        # would read past the buffer.
+        if len(samples) <= config.n_fft // 2:
             return ""
         tokens = audio = None
         try:

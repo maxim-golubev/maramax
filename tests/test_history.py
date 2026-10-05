@@ -195,3 +195,28 @@ def test_unreadable_history_takes_its_original_texts_aside_with_it(tmp_path):
     store = HistoryStore(base_dir=tmp_path, history_limit=LIMIT)
     store.add_entry("microphone", "Next", "Maramax", raw_text="mara max")
     assert (tmp_path / "history-originals.json.corrupt").read_text() == '{"a": "mara max"}'
+
+
+def test_a_lower_limit_across_a_relaunch_loses_nothing_until_the_next_save(tmp_path):
+    store = HistoryStore(history_limit=4, base_dir=tmp_path)
+    for label in ("First", "Second", "Third", "Fourth"):
+        store.add_entry("microphone", label, "words")
+    relaunched = HistoryStore(history_limit=2, base_dir=tmp_path)    # Lowered, then the app restarted.
+    assert [entry.source_label for entry in relaunched.list_entries()] == ["Fourth", "Third"]
+    relaunched.history_limit = 4                                     # Raised again before a dictation.
+    relaunched.add_entry("microphone", "Fifth", "words")
+    assert [entry.source_label for entry in HistoryStore(history_limit=10, base_dir=tmp_path).list_entries()] == [
+        "Fifth", "Fourth", "Third", "Second"]
+
+
+def test_history_set_aside_as_unreadable_does_not_bring_back_the_legacy_one(tmp_path):
+    support = tmp_path / "Maramax"
+    legacy = tmp_path / "ParakeetDictation" / "history.json"
+    legacy.parent.mkdir()
+    legacy.write_text(json.dumps([{"id": "old", "created_at": "2026-01-01T00:00:00+00:00",
+                                   "source_kind": "microphone", "source_label": "Old", "text": "old"}]))
+    support.mkdir()
+    (support / "history.json").write_text("{not json")
+    HistoryStore(base_dir=support, history_limit=LIMIT)              # Sets the unreadable file aside.
+    adopt_legacy_history(support)                                    # The next launch.
+    assert not (support / "history.json").exists()

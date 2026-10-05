@@ -99,10 +99,11 @@ def keep_unsaved(base_dir: Path, pcm: bytes) -> bool:
     kept; False when it is too short to recover or cannot be written."""
     if len(pcm) < MIN_RECOVERABLE_BYTES:
         return False
-    kept = _kept_files(base_dir)
-    path = base_dir / f"{UNSAVED_PREFIX}{kept[-1][0] + 1 if kept else 1}{UNSAVED_SUFFIX}"
-    temp = path.with_name(path.name + ".tmp")
+    temp = None
     try:
+        kept = _kept_files(base_dir)  # Listing the folder can fail too: then nothing is kept.
+        path = base_dir / f"{UNSAVED_PREFIX}{kept[-1][0] + 1 if kept else 1}{UNSAVED_SUFFIX}"
+        temp = path.with_name(path.name + ".tmp")
         with temp.open("wb") as handle:
             handle.write(pcm)
             handle.flush()
@@ -110,8 +111,9 @@ def keep_unsaved(base_dir: Path, pcm: bytes) -> bool:
         temp.replace(path)  # A crash leaves no partial recording under the name the next launch reads.
         return True
     except OSError as exc:
-        temp.unlink(missing_ok=True)
-        logger.error(f"Could not keep a capture of {len(pcm)} bytes as {path.name}: {exc}")
+        if temp is not None:
+            temp.unlink(missing_ok=True)
+        logger.error(f"Could not keep a capture of {len(pcm)} bytes as an unsaved recording in {base_dir}: {exc}")
         return False
 
 
@@ -165,5 +167,8 @@ def discard_unsaved(path: Path) -> None:
 
 
 def discard_every_unsaved(base_dir: Path) -> None:
+    """Every unsaved recording, and what an interrupted keep_unsaved() left."""
     for _, path in _kept_files(base_dir):
         discard_unsaved(path)
+    for path in base_dir.glob(f"{UNSAVED_PREFIX}*{UNSAVED_SUFFIX}.tmp"):
+        _discard(path, f"interrupted unsaved recording {path.name}")

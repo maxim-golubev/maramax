@@ -14,8 +14,8 @@ from PyObjCTools import AppHelper
 from . import __version__, recovery
 from .audio_format import seconds as pcm_seconds
 from .audio_format import whole_samples
-from .autopaste import (PasteError, PasteTarget, accessibility_trusted, character_before_cursor, request_accessibility,
-                        send_paste_keystroke, space_before)
+from .autopaste import (PasteError, PasteTarget, accessibility_trusted, request_accessibility, send_paste_keystroke,
+                        space_before, text_before_cursor)
 from .capture import CaptureHealth, CaptureSnapshot
 from .clipboard import ClipboardError, contains_text, copy_text
 from .config import AppConfig, Delivery
@@ -72,6 +72,8 @@ NOT_COPIED_STATUS = "Transcript ready — kept in Maramax, not copied"
 NOT_PERMITTED_STATUS = "Copied, not pasted — allow Maramax to paste in Settings"
 SWITCHED_APPS_STATUS = "Copied, not pasted — you switched apps"
 INCOMPLETE_STATUS = "Microphone stopped — the transcript may be incomplete"
+CANCELLING_STATUS = "Cancelling…"
+ADOPTING_STATUS = "Moving recovered audio into Recordings — try again in a moment"
 
 
 class Phase(enum.Enum):
@@ -175,6 +177,9 @@ class DictationApp(rumps.App):
         # A leftover in-progress capture means a previous session crashed or
         # hung mid-recording — keep it recoverable.
         self._leftover_found = self.recorder.preserve_recovery() or bool(recovery.unsaved_recordings(self._support_dir))
+        # While audio left by a crash is moved into Recordings, nothing else may
+        # take or delete it (Recover Last Recording, Clear History). Main thread.
+        self._adopting = self._leftover_found
         if self._leftover_found:
             logger.info("Found unsaved recording from a previous session")
             threading.Thread(target=self._adopt_recovered_audio, daemon=True).start()
@@ -203,6 +208,9 @@ class DictationApp(rumps.App):
         self._status_token = 0
         self._resting_status = self.transcriber.status_message()
         self._last_status = self._resting_status
+        self._last_revert: float = 0
+        # What the status said when a cancel was asked for (see _complete_operation_on_main).
+        self._before_cancelling: tuple[str, float] = (self._resting_status, 0)
         self._capture_health: CaptureHealth | None = None
         self._capture_warning = ""
         self._capture_device = ""
@@ -338,6 +346,16 @@ class DictationApp(rumps.App):
         """Move captures left behind by a crash or a failed archive into
         Recordings, oldest first, where they can be played, exported, and
         transcribed like any other."""
+        try:
+            self._adopt_each_unsaved()
+        finally:
+            AppHelper.callAfter(self._adopted)
+
+    def _adopted(self) -> None:
+        self._adopting = False
+        self._refresh_recordings_window()
+
+    def _adopt_each_unsaved(self) -> None:
         for unsaved in recovery.unsaved_recordings(self._support_dir):
             try:
                 pcm = recovery.load_unsaved(unsaved)
@@ -347,11 +365,16 @@ class DictationApp(rumps.App):
                                                created_at=recovery.captured_at(unsaved))
                 if record is None:
                     continue
-                self.recordings.update(record.id, message="Recovered after an interrupted session")
-                recovery.discard_unsaved(unsaved)
             except Exception as exc:
                 # The file stays, so Recover Last Recording still works.
                 logger.error(f"Could not move recovered audio {unsaved.name} into Recordings: {exc}")
+                continue
+            # In the archive now: kept, it would be moved in again at the next launch.
+            recovery.discard_unsaved(unsaved)
+            try:
+                self.recordings.update(record.id, message="Recovered after an interrupted session")
+            except OSError as exc:
+                logger.error(f"Recovered audio {record.id} was archived without its note: {exc}")
 
     def _start_model_watchdog(self) -> None:
         threading.Thread(target=self._wait_for_model_readiness, daemon=True).start()
@@ -439,7 +462,10 @@ class DictationApp(rumps.App):
             self._cancel_event.set()
             self._queue_cancel_event.set()
             self._hide_window_when_done = True
-            self._show_status("Cancelling…")
+            # What was said before: the work may have finished already, its
+            # outcome said, and then nothing more comes to replace this.
+            self._before_cancelling = (self._last_status, self._last_revert)
+            self._show_status(CANCELLING_STATUS)
         else:
             self._hide_window()
 
@@ -747,13 +773,22 @@ class DictationApp(rumps.App):
         if record is not None:
             self.recorder.discard_recovery()
             return AudioPlace.ARCHIVED
-        kept = self.recorder.preserve_recovery()  # Also sets aside an earlier capture still in the file.
-        if spilled and kept:
+        if spilled and self.recorder.preserve_recovery():
+            return AudioPlace.UNSAVED  # Kept by a rename.
+        # Written from memory: there was no whole spill of it (none of its
+        # own, or one a disk error cut short), or it could not be set aside,
+        # in which case, if it is set aside at the next start after all, the
+        # capture is kept twice, which beats once lost.
+        if recovery.keep_unsaved(self._support_dir, pcm_bytes):
+            if not spilled:
+                # Its partial spill adds nothing; an earlier capture still in
+                # the recovery file is that capture's only copy: set aside.
+                self.recorder.discard_recovery()
             return AudioPlace.UNSAVED
-        # Not on disk yet: no spill of its own, or one that could not be set
-        # aside. Written from memory; if that spill is set aside at the next
-        # start after all, the capture is kept twice, which beats once lost.
-        return AudioPlace.UNSAVED if recovery.keep_unsaved(self._support_dir, pcm_bytes) else AudioPlace.LOST
+        # Not even that: whatever the recovery file holds, part of this
+        # capture or an earlier one, is all there is now.
+        self.recorder.preserve_recovery()
+        return AudioPlace.LOST
 
     def _transcribe_recording_worker(self, session: int) -> None:
         record = None
@@ -801,9 +836,6 @@ class DictationApp(rumps.App):
                 text = ""
 
             if not text:
-                # Clear any leftover live draft: it is display-only and must
-                # not outlive a final pass that found no speech.
-                self._set_current_text_on_main("", session)
                 outcome, result_message = empty_capture_outcome(
                     has_audio=bool(pcm_bytes), has_signal=has_signal,
                     faint=snapshot.faint and snapshot.audio_seconds > 0,
@@ -842,6 +874,10 @@ class DictationApp(rumps.App):
             result_message = failure_text("Transcription failed", place)
             self._push_status(result_message, revert_after=8)
         finally:
+            if not result_text:
+                # A live draft is display-only: without a transcript to replace
+                # it (no speech, a failure, a cancel), it must not be copied as one.
+                self._set_current_text_on_main("", session)
             diagnostics["stop_to_result_seconds"] = time.monotonic() - stop_started
             if inference_started is not None:
                 diagnostics["recognition_seconds"] = time.monotonic() - inference_started
@@ -865,6 +901,9 @@ class DictationApp(rumps.App):
         self.overlay_controller.set_transcribing(False)
         self.overlay_controller.set_queue_processing(False)
         self._resting_status = self._idle_status()
+        if self._last_status == CANCELLING_STATUS:
+            # The cancel came after the outcome: it stands, said again.
+            self._show_status(*self._before_cancelling)
         if self._hide_window_when_done:
             self._hide_window_when_done = False
             self._hide_window()
@@ -940,6 +979,9 @@ class DictationApp(rumps.App):
         reached the recognizer, else the newest without a transcript, else
         the newest unsaved recording that could not be moved into the
         archive, else simply the newest recording."""
+        if self._adopting:
+            self._push_status(ADOPTING_STATUS, revert_after=5)
+            return
         records = self.recordings.list_recordings()
         candidate = recovery_candidate(records)
         unsaved = recovery.unsaved_recordings(self._support_dir)
@@ -1241,6 +1283,15 @@ class DictationApp(rumps.App):
         if not compact:
             self._paste_target.bring_forward(target)
 
+        def report(problem: str) -> None:
+            if not compact:
+                # The window that showed this dictation is gone by now: the
+                # bar says what became of it, where an outcome is read.
+                self._compact_session = True
+                self.indicator.show(self._dictate.label, self.config.bar_position)
+                self.indicator.finish(problem, BAR_SECONDS_AFTER_PROBLEM)
+            self._push_status(problem, revert_after=8)
+
         def _send_after_focus_returns():
             if session != self._session or self._shutting_down or self._cancel_event.is_set():
                 return
@@ -1248,18 +1299,18 @@ class DictationApp(rumps.App):
             # actually ended up frontmost (the user may have switched away).
             if not self._paste_target.is_frontmost(target):
                 logger.warning("Paste skipped: the frontmost app changed")
-                self._push_status(SWITCHED_APPS_STATUS, revert_after=8)
+                report(SWITCHED_APPS_STATUS)
                 return
             if not contains_text(expected_text):
-                self._push_status("Not pasted — the clipboard changed; the transcript is in History", revert_after=8)
+                report("Not pasted — the clipboard changed; the transcript is in History")
                 return
             try:
                 # A transcript pasted after a word or a sentence gets a space
                 # first, so two dictations in a row do not run together.
-                send_paste_keystroke(" " if space_before(character_before_cursor()) else "")
+                send_paste_keystroke(" " if space_before(text_before_cursor()) else "")
             except PasteError as exc:
                 logger.error(f"Paste failed: {exc}")
-                self._push_status("Copied, not pasted — press Cmd+V to paste it", revert_after=8)
+                report("Copied, not pasted — press Cmd+V to paste it")
 
         # Keep the last session/focus checks and dispatch on the UI thread.
         # A delayed callback avoids a sleeping worker per dictation and lets
@@ -1479,6 +1530,9 @@ class DictationApp(rumps.App):
         if self.is_busy:
             self._push_status("Finish the current operation before clearing history", revert_after=5)
             return
+        if self._adopting:
+            self._push_status(ADOPTING_STATUS, revert_after=5)
+            return
         confirmed = rumps.alert(
             title="Clear History and Recordings?",
             message="This deletes saved transcripts and recording audio from this Mac.",
@@ -1486,7 +1540,7 @@ class DictationApp(rumps.App):
         ) == 1
         # The alert runs a nested event loop in which the hotkey still
         # works: a dictation started behind it must not have its audio
-        # deleted from under it.
+        # deleted from under it. (Adoption only ever ends meanwhile.)
         if not confirmed or self.is_busy:
             if confirmed:
                 self._push_status("Nothing was cleared: a dictation is in progress", revert_after=8)
@@ -1562,6 +1616,7 @@ class DictationApp(rumps.App):
     def _show_status(self, message: str, revert_after: float = 0) -> None:
         """Main thread only."""
         self._last_status = message
+        self._last_revert = revert_after
         self._status_token += 1
         if revert_after == 0:
             self._resting_status = message

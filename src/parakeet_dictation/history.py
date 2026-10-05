@@ -49,7 +49,9 @@ def adopt_legacy_history(support_dir: Path) -> None:
     """Copy the transcript history of the app's earlier name, once."""
     legacy = _legacy_history(support_dir)
     current = support_dir / "history.json"
-    if current.exists() or not legacy.exists():
+    # A history set aside as unreadable is still this app's history: the old
+    # one is not brought back in its place.
+    if current.exists() or any(support_dir.glob(f"{current.name}.corrupt*")) or not legacy.exists():
         return
     support_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(legacy, current)
@@ -104,7 +106,9 @@ class HistoryStore:
             if isinstance(original, str):
                 entry.raw_text = original
             entries.append(entry)
-        return entries[: self.history_limit]
+        # All of them: a lower limit drops the oldest only at the next save,
+        # so raising it again after a relaunch still finds them.
+        return entries
 
     def _save(self) -> None:
         entries = self._entries[: self.history_limit]

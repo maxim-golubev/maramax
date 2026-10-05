@@ -48,6 +48,9 @@ def controller(monkeypatch):
     app._capture_warning = ""
     app._resting_status = "Ready"
     app._last_status = ""
+    app._last_revert = 0
+    app._before_cancelling = (app._last_status, 0)
+    app._adopting = False
     app._paste_target = SimpleNamespace(current=lambda: "the app in front")
     app._show_status = lambda message, revert_after=0: calls.append(message)
     app._push_status = lambda message, revert_after=0: calls.append(message)
@@ -735,3 +738,29 @@ def test_a_confirmed_clear_deletes_every_recording_and_kept_capture(monkeypatch,
     assert app.recordings.list_recordings() == [] and recovery.unsaved_recordings(tmp_path) == []
     assert not recovery.in_progress_path(tmp_path).exists()
     assert calls[-1] == "History and recordings cleared"
+
+
+def test_a_cancel_that_came_after_the_outcome_leaves_the_outcome_said(monkeypatch):
+    app, calls = controller(monkeypatch)
+    shown = []
+    app._show_status = lambda message, revert_after=0: shown.append((message, revert_after)) or setattr(
+        app, "_last_status", message)
+    app._phase = Phase.TRANSCRIBING
+    app._last_status, app._last_revert = module.COPIED_STATUS, 5    # Said, then Esc before completion.
+    app.dismiss_requested()
+    app._complete_operation_on_main(0)
+    assert shown == [(module.CANCELLING_STATUS, 0), (module.COPIED_STATUS, 5)]
+
+
+def test_recovered_audio_being_moved_in_is_neither_recovered_nor_cleared_meanwhile(monkeypatch):
+    app, calls = controller(monkeypatch)
+    app._adopting = True
+    app.recordings = SimpleNamespace(list_recordings=lambda: calls.append("listed") or [])
+    alerts = []
+    monkeypatch.setattr(module.rumps, "alert", lambda **kwargs: alerts.append(kwargs) or 1)
+    app.recover_last_recording()
+    app.clear_history_requested()
+    assert calls[-2:] == [module.ADOPTING_STATUS, module.ADOPTING_STATUS] and alerts == []
+    app._refresh_recordings_window = lambda: calls.append("recordings refreshed")
+    app._adopted()
+    assert not app._adopting and calls[-1] == "recordings refreshed"

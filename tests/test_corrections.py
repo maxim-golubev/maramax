@@ -3,7 +3,7 @@ import threading
 
 from parakeet_dictation import app as module
 from parakeet_dictation.config import AppConfig
-from parakeet_dictation.corrections import apply_replacements, normalize_rules
+from parakeet_dictation.corrections import RuleRefused, apply_replacements, edited_rules, normalize_rules
 from parakeet_dictation.history import HistoryStore
 
 
@@ -156,3 +156,11 @@ def test_while_pasting_every_transcript_is_copied_as_settings_shows(tmp_path, mo
     app._cancel_event.set()
     app._publish_transcript("cancelled late", module.Source.MICROPHONE, "Dictation", 2)
     assert copied == ["from a file", "cancelled late"]
+
+
+def test_rules_that_matching_tells_apart_can_both_be_kept():
+    rules = edited_rules([{"heard": "Straße", "replacement": "Street"}], "STRASSE", "Road", at=None)
+    assert not isinstance(rules, RuleRefused)                      # Matching never takes one for the other,
+    assert apply_replacements("STRASSE and Straße", rules) == "Road and Street"
+    refused = edited_rules(rules, "STRAßE", "Lane", at=None)       # but the same letters in capitals are one rule.
+    assert isinstance(refused, RuleRefused)

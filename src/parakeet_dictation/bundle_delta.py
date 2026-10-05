@@ -69,6 +69,7 @@ def make(old_app: Path, new_app: Path, delta_dir: Path) -> tuple[int, int]:
                      if entry[0] != "dir" and old.get(path, ("",))[:2] != entry[:2])
     changed = sum(old.get(path) != entry for path, entry in new.items())
     deleted = sorted(path for path in old if path not in new)
+    delta_dir.mkdir(parents=True, exist_ok=True)  # Also when nothing is carried.
     for relative in carried:
         source, target = new_app / relative, delta_dir / _FILES / relative
         target.parent.mkdir(parents=True, exist_ok=True)

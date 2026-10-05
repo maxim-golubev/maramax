@@ -647,3 +647,16 @@ def test_a_busy_listing_is_an_error_not_an_empty_list(monkeypatch):
     lister._warm_key = None
     lister._list({"prefer_builtin": True})
     assert sent == [(audio_worker.Event.ERROR, {"message": "the audio session was busy"})]
+
+
+def test_a_stream_failover_reopened_is_not_kept_warm_for_the_device_it_replaced(tmp_path):
+    recorder = recorder_for(tmp_path, helper(mute_first=True), prefer_builtin=False)
+    recorder.keep_warm_seconds = 5
+    assert recorder.start()
+    assert wait_for(lambda: recorder.capture_snapshot().audio_seconds > 0.2, timeout=8)  # On a reopened stream.
+    recorder.stop()
+    assert wait_for(recorder._accepting.is_set)
+    assert recorder.start()
+    assert not recorder.warm_start              # Opened afresh for what the request names.
+    recorder.stop()
+    recorder.cleanup()
