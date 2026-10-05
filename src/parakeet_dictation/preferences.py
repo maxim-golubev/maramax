@@ -12,7 +12,6 @@ from Foundation import NSObject
 
 from . import __version__
 from .config import Delivery
-from .hotkeys import STOP
 from .layout import Notice, aligned_width, show_notice, small_text, spacer, stack
 from .recordings import MAX_ARCHIVE_BYTES
 from .replacements_editor import ReplacementsEditor
@@ -24,19 +23,15 @@ CONTENT_WIDTH = 512
 CHECKBOX_INDENT = 20
 
 SETTING_LABELS = {
-    "compact_dictation": "Use the compact dictation bar",
-    "auto_start_recording": "Start dictating as soon as the shortcut is pressed",
-    "live_preview": "Show a live preview in the full window",
+    "live_preview": "Show a live preview in the Maramax window",
     "high_accuracy": "Use the high-accuracy model",
     "prefer_builtin_mic": "Prefer the Mac’s own microphone in Automatic",
     "use_corrections": "Apply my word replacements",
     "check_for_updates": "Check for updates automatically",
 }
 _HELP = {
-    "compact_dictation": "A small bar at the bottom of the screen, so the app you are typing in keeps focus. "
-                         "Turn it off to dictate in the Maramax window.",
-    "auto_start_recording": f"When off, the shortcut opens the Maramax window and {STOP.label} starts.",
-    "live_preview": "Draft text while you speak. The final transcript replaces it.",
+    "live_preview": "Draft text while you speak, when the Maramax window is open (the bar’s arrow opens it). "
+                    "The final transcript replaces it.",
     "high_accuracy": "Qwen3-ASR 1.7B, which also reads your word replacements as vocabulary while they are on. "
                      "Several times slower, uses about 6 GB of memory, and downloads 4.1 GB the first time.",
     "prefer_builtin_mic": "Records with the Mac, so AirPods keep their high-quality playback. Skipped while "
@@ -257,9 +252,17 @@ class PreferencesController(NSObject):
             [about],
             [shortcut_row],
             [self._header("When you finish dictating"), *self._delivery_choices()],
-            [self._header("Dictation"), self._option("compact_dictation"), self._option("auto_start_recording"),
-             self._option("live_preview")],
+            [self._header("Dictation"), self._option("live_preview"), self._bar_row()],
         ])
+
+    @objc.python_method
+    def _bar_row(self):
+        """Where the dictation bar opens, and the way back to its default place."""
+        self.bar_reset = self._button("Reset Position", "resetBarPosition:")
+        width = CONTENT_WIDTH - aligned_width(self.bar_reset) - ROW_GAP
+        note = self._help("Drag the dictation bar anywhere on the screen: it opens where you leave it.", width)
+        note.widthAnchor().constraintEqualToConstant_(width).setActive_(True)  # So Reset ends at the page's edge.
+        return stack([note, self.bar_reset], horizontal=True, spacing=ROW_GAP)
 
     @objc.python_method
     def _delivery_choices(self):
@@ -356,6 +359,7 @@ class PreferencesController(NSObject):
         for name, button in self.options.items():
             button.setState_(int(getattr(config, name)))
         self._show_delivery()
+        self.bar_reset.setEnabled_(config.bar_position is not None)
         self.model_status.setStringValue_(self._model_message())
         self.model_retry.setHidden_(not self.delegate.models_failed())
         if not self.shortcut_picker.is_recording():
@@ -510,6 +514,10 @@ class PreferencesController(NSObject):
             if button is sender:
                 self.delegate.choose_delivery(delivery)
                 return
+
+    def resetBarPosition_(self, sender):
+        del sender
+        self.delegate.reset_bar_position()
 
     def requestPastePermission_(self, sender):
         del sender

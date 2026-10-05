@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 import json
+import math
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
@@ -25,14 +26,12 @@ class Delivery(enum.Enum):
 
 @dataclass
 class AppConfig:
-    auto_start_recording: bool = True
     auto_copy_to_clipboard: bool = True
     paste_to_active_app: bool = False
     live_preview: bool = True
     high_accuracy: bool = False
     history_limit: int = 100
     recordings_limit: int = DEFAULT_RECORDINGS
-    compact_dictation: bool = True
     prefer_builtin_mic: bool = True
     input_device: str | None = None
     # 0 releases the microphone the moment a dictation ends.
@@ -43,6 +42,9 @@ class AppConfig:
     # [virtual key code, Carbon modifier bits]; see hotkeys.shortcut_problem().
     dictation_shortcut: list[int] = field(
         default_factory=lambda: [DEFAULT_DICTATE.key_code, DEFAULT_DICTATE.modifiers])
+    # Where the dictation bar opens: None for its default place, else where the
+    # user dragged it, as indicator.bar_origin() reads it ([across, up], each 0–1).
+    bar_position: list[float] | None = None
     # The welcome window has been through once (Settings → General → Welcome Guide… reopens it).
     onboarded: bool = False
     # A release the user chose "Skip This Version" for; automatic checks do not offer it again.
@@ -90,6 +92,12 @@ class AppConfig:
                         and all(isinstance(part, int) and not isinstance(part, bool) for part in value)
                         and shortcut_problem(*value) is None):
                     config.dictation_shortcut = value
+                continue
+            if name == "bar_position":
+                if value is None or (isinstance(value, list) and len(value) == 2 and all(
+                        isinstance(part, (int, float)) and not isinstance(part, bool)
+                        and math.isfinite(part) and 0 <= part <= 1 for part in value)):
+                    config.bar_position = None if value is None else [float(part) for part in value]
                 continue
             if name == "keep_mic_ready_seconds":
                 if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= MAX_KEEP_MIC_READY_SECONDS:

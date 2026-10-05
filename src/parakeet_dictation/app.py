@@ -27,7 +27,8 @@ from .hotkeys import (
     STOP, GlobalHotKeyManager, HotKeyError, HotKeySpec, dictation_shortcut, layout_key_names, macos_problem,
     macos_shortcuts, menu_key_equivalent, shortcut_problem,
 )
-from .indicator import DictationIndicator
+from .indicator import (BAR_SECONDS_AFTER_PROBLEM, BAR_SECONDS_AFTER_SUCCESS, COPIED_STATUS, HEALTH_STATUS,
+                        UPDATE_SECONDS, WAIT_TO_SPEAK_STATUS, DictationIndicator)
 from .isolated_recorder import IsolatedAudioRecorder
 from .logger_config import logger
 from .main_thread import call_later
@@ -58,37 +59,15 @@ def unregistered_status(shortcut: str) -> str:
 
 
 def intro_text(shortcut: str, config: AppConfig) -> str:
-    """What the empty window says; it is open when there is nothing to show yet.
-    Without auto_start_recording the shortcut brings this window up, where
-    Cmd+R or Dictate starts a dictation."""
-    start = (f"Press {shortcut} to dictate. Press it again, or {STOP.label}, to finish."
-             if config.auto_start_recording else
-             f"Press {STOP.label} or Dictate to start, and again to finish. {shortcut} brings this window "
-             "back from any app.")
-    return f"{start}\n\n{_DELIVERY_TEXT[config.delivery()]} Saved audio and retries are in Recordings."
+    """What the empty window says; it is open when there is nothing to show yet."""
+    return (f"Press {shortcut} to dictate. Press it again, or {STOP.label}, to finish.\n\n"
+            f"{_DELIVERY_TEXT[config.delivery()]} Saved audio and retries are in Recordings.")
 
 
 def empty_history_text(shortcut: str) -> str:
     return f"No transcriptions yet.\n\nUse {shortcut} to dictate, or drop audio and video files into this window."
 
 
-# Nothing said before the microphone delivers sound is recorded: Bluetooth
-# headsets send 1.5–2.5 s of silence while they connect. Said the same way
-# from the shortcut press until sound arrives (the bar shows it in orange).
-WAIT_TO_SPEAK_STATUS = "Don’t speak yet — connecting…"
-_HEALTH_STATUS = {
-    CaptureHealth.WAITING: WAIT_TO_SPEAK_STATUS,
-    CaptureHealth.RECEIVING: "Recording…",
-    CaptureHealth.RECONNECTING: "Microphone lost — switching input…",
-    CaptureHealth.SILENT: "No microphone signal — check your input",
-    CaptureHealth.QUIET: "Microphone is silent — check your input",
-    CaptureHealth.MISSING: "Microphone is not delivering audio",
-    CaptureHealth.DISCONNECTED: "Microphone stopped delivering audio",
-}
-# How long the compact bar stays up after a dictation ends.
-BAR_SECONDS_AFTER_SUCCESS = 2.0
-BAR_SECONDS_AFTER_PROBLEM = 8.0
-COPIED_STATUS = "Copied transcript to clipboard"
 NOT_COPIED_STATUS = "Transcript ready — kept in Maramax, not copied"
 NOT_PERMITTED_STATUS = "Copied, not pasted — allow Maramax to paste in Settings"
 SWITCHED_APPS_STATUS = "Copied, not pasted — you switched apps"
@@ -424,13 +403,11 @@ class DictationApp(rumps.App):
         if self.recording_active:
             # The hotkey is a toggle: press again to finish dictating.
             self.stop_recording_requested(hide_after=True)
-        elif self.overlay_visible and (self.is_transcribing or not self.config.auto_start_recording):
-            # Busy, or set to start from the window: bring the window forward.
+        elif self.overlay_visible and self.is_transcribing:
+            # The window is showing what keeps a dictation from starting.
             self.overlay_controller.focus()
-        elif self.config.auto_start_recording:
-            self.start_recording()
         else:
-            self.open_transcript_window()
+            self.start_recording()
 
     def open_transcript_window(self, mode: Mode = Mode.RESULT) -> None:
         # Keep the last transcript visible and copyable; only a new
@@ -528,12 +505,11 @@ class DictationApp(rumps.App):
                 # Pressing the shortcut again after the connection is back is the retry.
                 self.retry_speech_model()
             message = self.transcriber.status_message()
-            if self.config.compact_dictation and not self.overlay_visible:
+            if not self.overlay_visible:
+                # Where this press would have dictated: the bar says why it did not.
                 self._compact_session = True
-                self.indicator.show(self._dictate.label)
+                self.indicator.show(self._dictate.label, self.config.bar_position)
                 self.indicator.finish(message, BAR_SECONDS_AFTER_PROBLEM)
-            elif not self.overlay_visible:
-                self.open_transcript_window()  # Where this press would have dictated: it says why it did not.
             self._push_status(message)
             return False
 
@@ -552,7 +528,8 @@ class DictationApp(rumps.App):
         self._capture_health = None
         self._capture_at_stop = None
         self._stop_when_connected = False
-        self._compact_session = self.config.compact_dictation and not self.overlay_visible
+        # The bar, unless the window is already open: then the dictation is shown there.
+        self._compact_session = not self.overlay_visible
         session = self._session
         # The microphone opens first: every millisecond of window drawing
         # ahead of it is speech that would not be captured. The cancel
@@ -567,7 +544,7 @@ class DictationApp(rumps.App):
             self._recordings_window.stop_playback()
         self.overlay_controller.prepare_for_recording()
         if self._compact_session:
-            self.indicator.show(self._dictate.label)
+            self.indicator.show(self._dictate.label, self.config.bar_position)
             self._set_recording_shortcut(True)
         else:
             self.overlay_visible = True
@@ -662,12 +639,12 @@ class DictationApp(rumps.App):
             self._capture_warning = f"Microphone changed — now using {snapshot.device_name}"
         if health != self._capture_health:
             self._capture_health = health
-            self._show_status(_HEALTH_STATUS[health])
+            self._show_status(HEALTH_STATUS[health])
         if health in (CaptureHealth.MISSING, CaptureHealth.DISCONNECTED):
             self._capture_warning = INCOMPLETE_STATUS
             self.stop_recording_requested()
             return
-        call_later(0.15, self._monitor_capture, session)
+        call_later(UPDATE_SECONDS, self._monitor_capture, session)
 
     def stop_recording_requested(self, hide_after: bool = False) -> None:
         if not self.recording_active:
@@ -1331,6 +1308,19 @@ class DictationApp(rumps.App):
         self._save_settings()
         self.history_store.history_limit = count
         self._refresh_history_on_main()
+
+    def bar_moved(self, placement: tuple[float, float] | None) -> None:
+        """The bar was dragged: it opens there from now on (None: its default place)."""
+        self.config.bar_position = None if placement is None else list(placement)
+        self._save_settings()
+        self._refresh_preferences()
+
+    def reset_bar_position(self) -> None:
+        """Settings' Reset Position: the bar opens in its default place again, and moves there if it is up."""
+        self.config.bar_position = None
+        self._save_settings()
+        self.indicator.place(None)
+        self._refresh_preferences()
 
     def set_recordings_limit(self, count: int) -> None:
         self.config.recordings_limit = count

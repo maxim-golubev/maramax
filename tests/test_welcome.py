@@ -9,9 +9,9 @@ from parakeet_dictation.config import AppConfig, Delivery
 from parakeet_dictation.hotkeys import (
     DEFAULT_DICTATE, KEY_NAMES, HotKeyError, cmdKey, controlKey, dictation_shortcut, optionKey,
 )
-from parakeet_dictation.indicator import split_status
+from parakeet_dictation.indicator import WAIT_TO_SPEAK_STATUS, split_status
 from parakeet_dictation.preferences import DELIVERY_LABELS
-from parakeet_dictation.welcome import recording_note, shortcut_page_text, try_it_text
+from parakeet_dictation.welcome import BAR_NOTE, SHORTCUT_TEXT, try_it_text
 
 D, E, SPACE = 0x02, 0x0E, 0x31
 
@@ -146,8 +146,6 @@ def test_changing_a_setting_rewrites_what_the_window_and_the_welcome_say(monkeyp
 def test_the_window_intro_follows_the_settings():
     assert "Press Option+Space to dictate" in module.intro_text("Option+Space", AppConfig())
     assert "copied, ready to paste" in module.intro_text("Option+Space", AppConfig())
-    manual = module.intro_text("Option+Space", AppConfig(auto_start_recording=False))
-    assert manual.startswith("Press Cmd+R or Dictate to start") and "Option+Space brings this window back" in manual
     kept = module.intro_text("Option+Space", AppConfig(auto_copy_to_clipboard=False))
     assert "is not copied" in kept and f"“{DELIVERY_LABELS[Delivery.COPIED]}”" in kept
 
@@ -158,15 +156,9 @@ def test_try_it_describes_what_these_settings_do():
     assert "pasted where you are typing" in try_it_text("Option+Space", AppConfig(paste_to_active_app=True))
     kept = try_it_text("Option+Space", AppConfig(auto_copy_to_clipboard=False))
     assert "copied" not in kept and "Open Transcript" in kept
-    manual = try_it_text("Option+Space", AppConfig(auto_start_recording=False))
-    assert "to open Maramax, then Cmd+R to start" in manual
-    assert "Press it to start dictating" in shortcut_page_text(AppConfig())
-    assert "Press it to open Maramax, then Cmd+R" in shortcut_page_text(AppConfig(auto_start_recording=False))
-    assert "small bar" in recording_note(AppConfig())
-    for config in (AppConfig(compact_dictation=False), AppConfig(auto_start_recording=False)):
-        assert "small bar" not in recording_note(config) and "Maramax window" in recording_note(config)
+    assert "Press it to start dictating" in SHORTCUT_TEXT
     # The welcome names the warning the bar shows while the microphone connects.
-    assert f"“{split_status(module.WAIT_TO_SPEAK_STATUS)[0]}”" in recording_note(AppConfig())
+    assert f"“{split_status(WAIT_TO_SPEAK_STATUS)[0]}”" in BAR_NOTE
 
 
 def test_a_shortcut_edited_by_hand_into_something_unusable_falls_back(tmp_path):
@@ -202,7 +194,7 @@ owner = SimpleNamespace(
     config=AppConfig(), current_shortcut=lambda: state["shortcut"], choose_shortcut=choose,
     problem_with_shortcut=problem,
     pause_shortcut=lambda: calls.append("pause"), resume_shortcut=lambda: calls.append("resume"),
-    transcriber=SimpleNamespace(status_message=lambda: "Speech model ready"),
+    transcriber=SimpleNamespace(status_message=lambda: "Speech model ready", is_ready=lambda: True),
     paste_permitted=lambda: False, request_paste_permission=lambda: calls.append("ask permission"),
     finish_welcome=lambda: calls.append("finished"),
 )
@@ -288,7 +280,7 @@ assert calls[-1] == "resume"                                 # Never left paused
 
 def test_the_welcome_walks_four_steps_and_never_leaves_the_shortcut_paused():
     run(r'''
-from parakeet_dictation.welcome import STEPS, WelcomeController, recording_note, try_it_text
+from parakeet_dictation.welcome import STEPS, WelcomeController, try_it_text
 welcome = WelcomeController.alloc().initWithDelegate_(owner)
 assert not welcome.panel.isVisible()
 assert str(welcome.counter.stringValue()) == "1 of 4" and welcome.back.isHidden()
@@ -315,7 +307,7 @@ assert calls[-1] == "ask permission"
 welcome.goForward_(None)
 assert str(welcome.forward.title()) == "Done" and STEPS == 4
 assert str(welcome.try_text.stringValue()) == try_it_text("Option+Space", owner.config)
-assert str(welcome.recording_note.stringValue()) == recording_note(owner.config)
+assert welcome.try_model_status.isHidden()                   # The model is ready: nothing to wait for.
 welcome.picker.start_recording()
 welcome.windowWillClose_(None)                               # Closing early still restores the shortcut.
 assert calls[-2:] == ["resume", "finished"], calls

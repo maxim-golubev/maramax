@@ -147,9 +147,9 @@ bar = DictationIndicator.alloc().initWithDelegate_(delegate)
 stop, expand = bar.stop_button.frame(), bar.expand_button.frame()
 assert stop.size.width == stop.size.height == expand.size.width == expand.size.height
 assert stop.origin.y == expand.origin.y == (HEIGHT - stop.size.height) / 2
-from parakeet_dictation.app import _HEALTH_STATUS
+from parakeet_dictation.indicator import HEALTH_STATUS
 bar._layout_text(True)
-for status in _HEALTH_STATUS.values():     # Said beside the meter while recording: never cut short.
+for status in HEALTH_STATUS.values():     # Said beside the meter while recording: never cut short.
     bar.title.setStringValue_(status)
     assert bar.title.fittingSize().width <= bar.title.frame().size.width, status
 assert split_status("Copied transcript to clipboard") == ("Copied transcript to clipboard", FINISHED_HINT)
@@ -425,11 +425,11 @@ meter.mark_open()
 bar = DictationIndicator.alloc().initWithDelegate_(delegate)
 window = OverlayController.alloc().initWithDelegate_(delegate)
 orange = NSColor.systemOrangeColor()
-bar.show("Option+Space")                                   # The microphone is not open yet.
+bar.show("Option+Space", None)                                   # The microphone is not open yet.
 window.prepare_for_recording()
 assert bar.title.textColor() == orange and window.status_label.textColor() == orange
 assert bar.meter.wave is not None                          # The meter is the waiting wave, not levels.
-from parakeet_dictation.app import WAIT_TO_SPEAK_STATUS
+from parakeet_dictation.indicator import WAIT_TO_SPEAK_STATUS
 bar.set_status(WAIT_TO_SPEAK_STATUS)                       # Read in full, never cut short.
 assert bar.title.cell().cellSize().width <= bar.title.frame().size.width, bar.title.cell().cellSize()
 for _ in range(3):                                         # AirPods send exact zeros while they connect.
@@ -449,13 +449,96 @@ bar.set_capture(meter.snapshot())
 window.set_capture(meter.snapshot())
 assert bar.meter.wave is None and bar.title.textColor() == NSColor.labelColor()
 assert window.status_label.textColor() == NSColor.labelColor()
-bar.show("Option+Space")
+bar.show("Option+Space", None)
 bar.set_transcribing()
 assert bar.title.textColor() == NSColor.labelColor()       # The colour never carries over.
-bar.show("Option+Space")
+bar.show("Option+Space", None)
 bar.finish("Done", 2)
 assert bar.title.textColor() == NSColor.labelColor()
 levels = wave_levels(0.0)
 assert len(levels) == METER_BARS and all(0.25 <= level <= 0.55 for level in levels)
 assert levels != wave_levels(0.9)
+''')
+
+
+def test_the_bar_opens_where_it_was_left_and_whole_on_any_screen():
+    from AppKit import NSMakeRect
+
+    from parakeet_dictation.indicator import DEFAULT_BOTTOM, HEIGHT, SNAP_DISTANCE, WIDTH, bar_origin, placement_at
+
+    screen = NSMakeRect(100, 50, 1440, 875)
+    default = bar_origin(screen, None)
+    assert default == (100 + (1440 - WIDTH) / 2, 50 + DEFAULT_BOTTOM)          # Centred near the bottom.
+    assert placement_at(screen, (default[0] + SNAP_DISTANCE - 1, default[1])) is None  # Dropped beside it: back.
+    left_top = placement_at(screen, (100, 50 + 875 - HEIGHT))
+    assert left_top == (0.0, 1.0) and bar_origin(screen, left_top) == (100, 50 + 875 - HEIGHT)
+    assert placement_at(screen, (-500, 5000)) == (0.0, 1.0)                    # Off the screen: kept on it.
+    middle = placement_at(screen, (400, 300))
+    assert bar_origin(screen, middle) == (400, 300)                            # Read back where it was left.
+    small = NSMakeRect(0, 0, 1024, 600)                                        # Another display: still whole.
+    x, y = bar_origin(small, (1.0, 1.0))
+    assert x + WIDTH == 1024 and y + HEIGHT == 600
+
+
+def test_the_bar_is_dragged_by_anything_but_its_buttons():
+    run(r'''
+from AppKit import NSPoint, NSScreen
+from parakeet_dictation.indicator import DictationIndicator, bar_origin
+moves = []
+delegate = SimpleNamespace(bar_moved=moves.append, dismiss_requested=lambda: None)
+bar = DictationIndicator.alloc().initWithDelegate_(delegate)
+bar.begin("Option+Space")
+bar.place(None)
+visible = NSScreen.mainScreen().visibleFrame()
+start = bar.panel.frame().origin
+assert (start.x, start.y) == bar_origin(visible, None)
+view = bar.panel.contentView()
+centre = lambda control: NSPoint(control.frame().origin.x + 5, control.frame().origin.y + 5)
+assert view.hitTest_(centre(bar.title)) is view and view.hitTest_(centre(bar.meter)) is view
+assert view.hitTest_(centre(bar.stop_button)) is bar.stop_button
+view.begin_drag(NSPoint(500, 100))
+view.end_drag()                                            # A click that does not move: nothing to remember.
+assert moves == []
+view.begin_drag(NSPoint(500, 100))
+view.drag_to(NSPoint(400, 300))
+moved = bar.panel.frame().origin
+assert (moved.x, moved.y) == (start.x - 100, start.y + 200)
+view.end_drag()
+assert len(moves) == 1 and moves[0] is not None
+landed = bar.panel.frame().origin
+assert (landed.x, landed.y) == bar_origin(visible, moves[0])
+view.begin_drag(NSPoint(0, 0))                             # Back beside its default place: it snaps there.
+view.drag_to(NSPoint(start.x - landed.x + 3, start.y - landed.y - 2))
+view.end_drag()
+assert moves[-1] is None and (bar.panel.frame().origin.x, bar.panel.frame().origin.y) == (start.x, start.y)
+''')
+
+
+def test_the_welcome_demonstration_plays_a_whole_dictation_on_a_bar_that_takes_no_clicks():
+    run(r'''
+from AppKit import NSPoint
+from parakeet_dictation import bar_demo
+from parakeet_dictation.indicator import COPIED_STATUS, HEALTH_STATUS, UPDATE_SECONDS, WAIT_TO_SPEAK_STATUS
+from parakeet_dictation.capture import CaptureHealth
+scheduled = []
+bar_demo.call_later = lambda delay, function, *args: scheduled.append((delay, function, args))
+demonstration = bar_demo.Demonstration()
+bar = demonstration._bar
+assert not bar.panel.isVisible() and demonstration.view.hitTest_(NSPoint(40, 40)) is None
+frames = bar_demo.dictation("Control+Shift+Space")
+seen = []
+demonstration.start("Control+Shift+Space")
+for _ in range(len(frames)):
+    seen.append(str(bar.title.stringValue()))
+    delay, function, args = scheduled.pop(0)
+    assert delay == UPDATE_SECONDS
+    function(*args)
+assert seen[0] == WAIT_TO_SPEAK_STATUS and HEALTH_STATUS[CaptureHealth.RECEIVING] in seen
+assert "Transcribing…" in seen and seen[-1] == COPIED_STATUS.split(" — ")[0]
+assert str(bar.title.stringValue()) == WAIT_TO_SPEAK_STATUS            # Then it starts over.
+assert "Control+Shift+Space" in str(bar.detail.stringValue())
+demonstration.stop()
+function, args = scheduled.pop(0)[1:]
+function(*args)
+assert scheduled == []                                                  # Stopped: no more frames.
 ''')

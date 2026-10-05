@@ -378,6 +378,18 @@ result_text = result.convertRect_toView_(result.cell().drawingRectForBounds_(res
 assert abs(result_text.origin.x - text_rect(editor.trial).origin.x) < 0.5     # Under the typed sentence.
 editor.trial.setStringValue_("")
 editor.controlTextDidChange_(SimpleNamespace(object=lambda: editor.trial))
+# The bar's Reset Position is there only while it has been moved, and ends where the page does.
+panel.show_tab(0)
+content.layoutSubtreeIfNeeded()
+assert not panel.bar_reset.isEnabled()
+assert abs(visible(panel.bar_reset).origin.x + visible(panel.bar_reset).size.width - (MARGIN + CONTENT_WIDTH)) < 0.5
+config.bar_position = [0.2, 0.8]
+panel.refresh()
+assert panel.bar_reset.isEnabled()
+delegate.reset_bar_position = lambda: calls.append("bar reset")
+panel.resetBarPosition_(None)
+assert calls[-1] == "bar reset"
+config.bar_position = None
 # On the Microphone tab the picker and Refresh end where the page's text does.
 panel.show_tab(1)
 content.layoutSubtreeIfNeeded()

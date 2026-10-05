@@ -9,8 +9,10 @@ from AppKit import (
 )
 from Foundation import NSObject
 
+from .bar_demo import Demonstration
 from .config import AppConfig, Delivery
 from .hotkeys import STOP
+from .indicator import WAIT_TO_SPEAK_STATUS, split_status
 from .layout import Notice, aligned_width, show_notice, small_text, spacer, stack
 from .main_thread import call_later
 from .preferences import CHECKBOX_INDENT, DELIVERY_LABELS
@@ -36,31 +38,17 @@ _CHOICE_HELP = {
 }
 
 
+SHORTCUT_TEXT = (f"Press it to start dictating, and again to finish. While you dictate, {STOP.label} finishes "
+                 "too. You can change it later in Settings.")
+# Under the demonstration of a dictation on the bar.
+BAR_NOTE = (f"While the bar says “{split_status(WAIT_TO_SPEAK_STATUS)[0]}” in orange, wait: Bluetooth headphones "
+            "take two or three seconds to connect. Drag the bar anywhere you like; it stays there. macOS asks "
+            "for the microphone the first time.")
+
+
 def try_it_text(shortcut: str, config: AppConfig) -> str:
-    outcome = _OUTCOMES[config.delivery()]
-    if config.auto_start_recording:
-        return (f"Click into any text field, press {shortcut}, and say a sentence. Press {shortcut} again "
-                f"(or {STOP.label}): in a moment the text is {outcome}.")
-    return (f"Click into any text field and press {shortcut} to open Maramax, then {STOP.label} to start. Say a "
-            f"sentence and press {STOP.label} again: in a moment the text is {outcome}.")
-
-
-def shortcut_page_text(config: AppConfig) -> str:
-    if config.auto_start_recording:
-        return (f"Press it to start dictating, and again to finish. While you dictate, {STOP.label} finishes too. "
-                "You can change it later in Settings.")
-    return (f"Press it to open Maramax, then {STOP.label} to start dictating and again to finish. You can change "
-            "it later in Settings.")
-
-
-def recording_note(config: AppConfig) -> str:
-    """What shows while the first dictation records."""
-    # The shortcut opens the full window instead when it does not start recording.
-    shown = ("A small bar at the bottom of the screen shows the microphone and the time."
-             if config.compact_dictation and config.auto_start_recording else
-             "The Maramax window shows the microphone while you speak.")
-    return (f"{shown} While it says “Don’t speak yet” in orange, wait: Bluetooth headphones take two or three "
-            "seconds to connect. macOS asks for the microphone the first time.")
+    return (f"Click into any text field, press {shortcut}, and say a sentence. Press {shortcut} again "
+            f"(or {STOP.label}): in a moment the text is {_OUTCOMES[config.delivery()]}.")
 
 
 class WelcomeController(NSObject):
@@ -139,7 +127,7 @@ class WelcomeController(NSObject):
 
     @objc.python_method
     def _shortcut_page(self):
-        self.shortcut_text = self._body("")
+        self.shortcut_text = self._body(SHORTCUT_TEXT)
         return stack([
             self._title("Choose your shortcut"),
             self.shortcut_text,
@@ -177,11 +165,15 @@ class WelcomeController(NSObject):
     @objc.python_method
     def _try_page(self):
         self.try_text = self._body("")
-        self.recording_note = small_text("", CONTENT_WIDTH)
+        self.demonstration = Demonstration()
+        # Only while the speech model is not ready yet: the shortcut waits for it.
+        self.try_model_status = small_text("", CONTENT_WIDTH)
         return stack([
             self._title("Try it"),
             self.try_text,
-            self.recording_note,
+            self.demonstration.view,
+            small_text(BAR_NOTE, CONTENT_WIDTH),
+            self.try_model_status,
             small_text("Settings and Recordings are in the menu bar icon. This guide is in Settings → General.",
                        CONTENT_WIDTH),
         ], spacing=12)
@@ -203,6 +195,10 @@ class WelcomeController(NSObject):
         self.step = step
         if step != 1:
             self.picker.stop_recording()
+        if step == STEPS - 1:
+            self.demonstration.start(self.delegate.current_shortcut().label)
+        else:
+            self.demonstration.stop()
         for index, page in enumerate(self.pages):
             page.setHidden_(index != step)
         self.refresh()
@@ -213,9 +209,8 @@ class WelcomeController(NSObject):
     @objc.python_method
     def refresh(self):
         config = self.delegate.config
-        self.model_status.setStringValue_(self.delegate.transcriber.status_message() + ".")
+        self._show_model_status()
         self.picker.refresh()
-        self.shortcut_text.setStringValue_(shortcut_page_text(config))
         delivery = config.delivery()
         # With "Keep in Maramax only" chosen in Settings, neither choice here is what happens now.
         for choice, button in self.choices.items():
@@ -228,7 +223,6 @@ class WelcomeController(NSObject):
         else:
             show_notice(self.permission_note, Notice.WARNING, "Not allowed yet.")
         self.try_text.setStringValue_(try_it_text(self.delegate.current_shortcut().label, config))
-        self.recording_note.setStringValue_(recording_note(config))
         self._fit_window()  # Allow… comes and goes with the permission, wherever the refresh came from.
 
     @objc.python_method
@@ -249,10 +243,22 @@ class WelcomeController(NSObject):
     def _watch_model(self, generation):
         # The first step says whether the speech model is still downloading.
         if generation == self._watch_generation and self.panel.isVisible():
-            self.model_status.setStringValue_(self.delegate.transcriber.status_message() + ".")
             if self.step == 2:
                 self.refresh()  # Accessibility may have been granted meanwhile.
+            else:
+                self._show_model_status()
             call_later(STATUS_SECONDS, self._watch_model, generation)
+
+    @objc.python_method
+    def _show_model_status(self):
+        transcriber = self.delegate.transcriber
+        status = transcriber.status_message() + "."
+        self.model_status.setStringValue_(status)
+        self.try_model_status.setStringValue_(status)
+        ready = transcriber.is_ready()
+        if self.try_model_status.isHidden() != ready:
+            self.try_model_status.setHidden_(ready)
+            self._fit_window()  # The line under the last step comes and goes with the model.
 
     # -- Actions --
 
@@ -280,4 +286,5 @@ class WelcomeController(NSObject):
     def windowWillClose_(self, notification):
         del notification
         self.picker.stop_recording()  # Never leave the global shortcut paused.
+        self.demonstration.stop()
         self.delegate.finish_welcome()

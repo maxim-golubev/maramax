@@ -52,7 +52,8 @@ for updates automatically**.
 
 - **The bar** stays out of the way and leaves the app you are typing in
   focused. Its meter shows incoming audio and its timer the captured length.
-  The red button finishes; the arrow opens the full window.
+  The red button finishes; the arrow opens the full window. Drag the bar
+  anywhere you like: it opens where you leave it.
 - **Open Transcript** shows the transcript, history, and a queue for
   transcribing audio and video files.
 - **Settings…** has where the transcript goes (paste, copy, or keep), live

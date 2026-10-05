@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections.abc import Sequence
 from enum import StrEnum
 
 import objc
 from AppKit import (
-    NSBackingStoreBuffered, NSBezierPath, NSButton, NSColor, NSFont, NSFontWeightSemibold,
+    NSBackingStoreBuffered, NSBezierPath, NSButton, NSColor, NSEvent, NSFont, NSFontWeightSemibold,
     NSLineBreakByTruncatingTail, NSLineCapStyleRound, NSMakeRect, NSPanel, NSScreen, NSStatusWindowLevel, NSTextField, NSView,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
@@ -23,6 +24,12 @@ from .main_thread import call_later
 WIDTH = 440
 HEIGHT = 64
 MARGIN = 18
+# Where the bar opens until the user drags it elsewhere: centred, this far
+# above the bottom of the screen's usable area.
+DEFAULT_BOTTOM = 24
+# A bar dropped this close to its default place goes back to it, so the
+# default can be found again by hand.
+SNAP_DISTANCE = 12
 BUTTON = 30
 BUTTON_GAP = 8
 METER_BARS = 7
@@ -36,6 +43,55 @@ WAVE_SPREAD = 0.9
 # ink are each off centre by under half a point, in opposite directions.
 EXPAND_OPTICAL_SHIFT = 0.10
 FINISHED_HINT = "Open Maramax for the transcript and recordings"
+# How often the controller updates the bar while recording; the wave moves one step per update.
+UPDATE_SECONDS = 0.15
+
+# What the bar says while a dictation records, by the capture's health.
+# Nothing said before the microphone delivers sound is recorded: Bluetooth
+# headsets send 1.5–2.5 s of silence while they connect. Said the same way
+# from the shortcut press until sound arrives (the title is orange then).
+WAIT_TO_SPEAK_STATUS = "Don’t speak yet — connecting…"
+HEALTH_STATUS = {
+    CaptureHealth.WAITING: WAIT_TO_SPEAK_STATUS,
+    CaptureHealth.RECEIVING: "Recording…",
+    CaptureHealth.RECONNECTING: "Microphone lost — switching input…",
+    CaptureHealth.SILENT: "No microphone signal — check your input",
+    CaptureHealth.QUIET: "Microphone is silent — check your input",
+    CaptureHealth.MISSING: "Microphone is not delivering audio",
+    CaptureHealth.DISCONNECTED: "Microphone stopped delivering audio",
+}
+COPIED_STATUS = "Copied transcript to clipboard"
+# How long the bar stays up after a dictation ends: briefly while it says the
+# transcript was copied, long enough to read anything else.
+BAR_SECONDS_AFTER_SUCCESS = 2.0
+BAR_SECONDS_AFTER_PROBLEM = 8.0
+
+
+def bar_origin(visible, placement: Sequence[float] | None) -> tuple[float, float]:
+    """Where the bar's lower-left corner goes on a screen whose usable area is
+    `visible`. `placement` is None for the default place, or where the user
+    left it: the share of the room the screen leaves the bar across and up
+    (0 to 1 each), so it opens whole on any display."""
+    room_across, room_up = visible.size.width - WIDTH, visible.size.height - HEIGHT
+    if placement is None:
+        return visible.origin.x + room_across / 2, visible.origin.y + DEFAULT_BOTTOM
+    across, up = placement
+    return visible.origin.x + room_across * across, visible.origin.y + room_up * up
+
+
+def placement_at(visible, origin: tuple[float, float]) -> tuple[float, float] | None:
+    """The placement of a bar dropped with its lower-left corner at `origin`,
+    as bar_origin() reads it: kept on the screen, and None (the default)
+    when it was dropped beside its default place."""
+    default_x, default_y = bar_origin(visible, None)
+    if math.hypot(origin[0] - default_x, origin[1] - default_y) <= SNAP_DISTANCE:
+        return None
+
+    def share(offset: float, room: float) -> float:
+        return min(1.0, max(0.0, offset / room)) if room > 0 else 0.5
+
+    return (share(origin[0] - visible.origin.x, visible.size.width - WIDTH),
+            share(origin[1] - visible.origin.y, visible.size.height - HEIGHT))
 
 
 def split_status(message: str) -> tuple[str, str]:
@@ -65,8 +121,56 @@ class PassivePanel(NSPanel):
 
 
 class IndicatorBackground(NSView):
+    """The bar's background, which is also where it is dragged from: anywhere
+    but its two buttons. `on_drop` is told when a drag that moved it ends."""
+
+    def initWithFrame_(self, frame):
+        self = objc.super(IndicatorBackground, self).initWithFrame_(frame)
+        if self is not None:
+            self.on_drop = None
+            self._grab = None  # (mouse, window origin) where the drag began
+            self._moved = False
+        return self
+
     def viewDidChangeEffectiveAppearance(self):
         self.refresh_background()
+
+    def hitTest_(self, point):
+        hit = objc.super(IndicatorBackground, self).hitTest_(point)
+        # Labels and the meter are part of the background as far as the mouse goes.
+        return hit if hit is None or isinstance(hit, NSButton) else self
+
+    def acceptsFirstMouse_(self, event):
+        return True  # The bar is never key: the first click is the drag.
+
+    def mouseDown_(self, event):
+        self.begin_drag(NSEvent.mouseLocation())
+
+    def mouseDragged_(self, event):
+        self.drag_to(NSEvent.mouseLocation())
+
+    def mouseUp_(self, event):
+        self.end_drag()
+
+    @objc.python_method
+    def begin_drag(self, mouse):
+        origin = self.window().frame().origin
+        self._grab = ((mouse.x, mouse.y), (origin.x, origin.y))
+        self._moved = False
+
+    @objc.python_method
+    def drag_to(self, mouse):
+        if self._grab is None:
+            return
+        (start_x, start_y), (origin_x, origin_y) = self._grab
+        self.window().setFrameOrigin_((origin_x + mouse.x - start_x, origin_y + mouse.y - start_y))
+        self._moved = True
+
+    @objc.python_method
+    def end_drag(self):
+        moved, self._grab, self._moved = self._moved, None, False
+        if moved and self.on_drop is not None:
+            self.on_drop()
 
     @objc.python_method
     def refresh_background(self):
@@ -226,6 +330,7 @@ class DictationIndicator(NSObject):
         )
         content = IndicatorBackground.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, HEIGHT))
         content.refresh_background()
+        content.on_drop = self._dropped
         self.panel.setContentView_(content)
 
         # One row, everything centred on the bar's horizontal axis.
@@ -276,24 +381,52 @@ class DictationIndicator(NSObject):
         return button
 
     @objc.python_method
-    def show(self, shortcut):
+    def show(self, shortcut, placement):
+        """Bring the bar up for a new dictation, at `placement` (see bar_origin)."""
+        self.begin(shortcut)
+        self.place(placement)
+        self.panel.orderFrontRegardless()
+
+    @objc.python_method
+    def begin(self, shortcut):
+        """Lay the bar out for a new dictation: the microphone is not open yet."""
         self._token += 1
         self._finished = False
         self.stop_button.set_kind(Glyph.STOP, f"Finish dictation ({shortcut} or {STOP.label})")
         self.stop_button.setEnabled_(True)
         self.meter.reset()
-        self._show_waiting(True)  # The microphone is not open yet.
+        self._show_waiting(True)
         self._layout_text(True)
         self.detail.setStringValue_(f"{shortcut} or {STOP.label} to finish")
         self.detail.setToolTip_(None)
+
+    @objc.python_method
+    def place(self, placement):
+        """Move the bar to `placement` on the screen in use."""
         screen = NSScreen.mainScreen()
         if screen is not None:
-            visible = screen.visibleFrame()
-            self.panel.setFrame_display_(NSMakeRect(
-                visible.origin.x + (visible.size.width - WIDTH) / 2,
-                visible.origin.y + 24, WIDTH, HEIGHT,
-            ), True)
-        self.panel.orderFrontRegardless()
+            self.panel.setFrameOrigin_(bar_origin(screen.visibleFrame(), placement))
+
+    @objc.python_method
+    def _dropped(self):
+        """A drag ended: settle the bar whole on the screen it was dropped on,
+        snapped back if beside its default place, and say where it is now."""
+        screen = self.panel.screen() or NSScreen.mainScreen()
+        if screen is None:
+            return
+        visible = screen.visibleFrame()
+        origin = self.panel.frame().origin
+        placement = placement_at(visible, (origin.x, origin.y))
+        self.panel.setFrameOrigin_(bar_origin(visible, placement))
+        self.delegate.bar_moved(placement)
+
+    @objc.python_method
+    def take_view(self):
+        """The bar's view, to show a bar inside another window (the welcome's
+        demonstration). This bar's own panel is then never shown."""
+        view = self.panel.contentView()
+        self.panel.setContentView_(NSView.alloc().initWithFrame_(view.frame()))
+        return view
 
     @objc.python_method
     def set_status(self, message):

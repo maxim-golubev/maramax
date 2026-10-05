@@ -47,7 +47,8 @@ def check_windows() -> None:
         store = RecordingStore(Path(directory))
         delegate = SimpleNamespace(
             config=AppConfig(), is_busy=False,
-            transcriber=SimpleNamespace(status_message=lambda: "Speech model ready"), models_failed=lambda: False,
+            transcriber=SimpleNamespace(status_message=lambda: "Speech model ready", is_ready=lambda: True),
+            models_failed=lambda: False,
             qwen=SimpleNamespace(status_message=lambda: "High-accuracy model ready"),
             updates=SimpleNamespace(status_text=lambda: "Not checked yet.", can_check=lambda: True),
             current_shortcut=lambda: DEFAULT_DICTATE, choose_shortcut=lambda key, modifiers: None,

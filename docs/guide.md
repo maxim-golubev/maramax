@@ -20,14 +20,14 @@ Everything the app does and where it keeps things. For a first launch, see [the 
   anything said then would not be recorded. Bluetooth headphones take two or
   three seconds; the built-in microphone a fraction of a second. Stopping in
   that moment is not an error: it says nothing was recorded yet. Cmd+R is
-  registered globally only while recording from the compact bar; it is released
+  registered globally only while recording from the bar; it is released
   afterward.
 - **Settings → General → When you finish dictating** decides where the
   transcript goes: **Paste into the app you’re using** (it is copied too),
   **Copy to the clipboard** (the default), or **Keep in Maramax only**, which
   copies nothing; Settings warns about that choice, and each dictation says the
   transcript was not copied. Pasting goes into the app you were last working
-  in. In compact mode it is skipped if you switch to a different app while
+  in. From the bar it is skipped if you switch to a different app while
   dictating; the text stays copied. If the clipboard changes before pasting, or
   you cancel while it is transcribing, nothing is pasted and the transcript
   remains in history. Expanding the bar during an operation keeps its original
@@ -42,8 +42,12 @@ Everything the app does and where it keeps things. For a first launch, see [the 
   refuses this one. Until it is allowed, transcripts are copied and the bar says
   so; Maramax never opens System Settings by itself.
 - Use the arrow in the bar or **Open Transcript** for the full transcript, history,
-  and file queue. Live transcription previews remain available in that window.
-- Turn off **Use the compact dictation bar** to dictate in the full Maramax window.
+  and file queue. Live transcription previews remain available in that window,
+  and while it is open the shortcut dictates in it.
+- Drag the bar by anything but its buttons to put it wherever suits you; it
+  opens there from then on, on whichever display you are using. Dropping it
+  back near the bottom centre, or **Settings → General → Reset Position**,
+  returns it to its default place.
 - Capture continues for a fifth of a second after you press stop, so a last
   syllable still travelling through the driver or a Bluetooth link is not cut off.
 

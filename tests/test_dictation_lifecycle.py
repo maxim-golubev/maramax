@@ -65,7 +65,9 @@ def controller(monkeypatch):
         hide=lambda: calls.append("window hidden"),
     )
     app._dictate = module.dictation_shortcut(0x31, 1 << 11, KEY_NAMES)
-    app.indicator = SimpleNamespace(show=lambda shortcut: calls.extend(["passive bar", ("bar names", shortcut)]),
+    app.indicator = SimpleNamespace(show=lambda shortcut, placement: calls.extend(
+                                        ["passive bar", ("bar names", shortcut), ("bar at", placement)]),
+                                    place=lambda placement: calls.append(("bar moved to", placement)),
                                     set_capture=lambda _snapshot: None,
                                     set_transcribing=lambda: calls.append("bar transcribing"),
                                     finish=lambda message, duration: calls.append(("bar finished", duration)),
@@ -217,7 +219,6 @@ def test_failed_start_in_compact_mode_finishes_the_bar_instead_of_leaving_it_up(
     app._recording_started(False, 0)
     assert calls[-1] == ("bar finished", module.BAR_SECONDS_AFTER_PROBLEM)
     app.transcriber.is_ready = lambda: False
-    app.config.compact_dictation = True
     assert not app.start_recording()  # Model not ready: the bar explains, then goes away.
     assert ("bar finished", module.BAR_SECONDS_AFTER_PROBLEM) in calls[-2:]
 
@@ -512,20 +513,29 @@ def test_the_shortcut_dictates_from_an_open_idle_window(monkeypatch):
     app._phase = Phase.TRANSCRIBING
     app.dictation_hotkey_pressed()
     assert calls[-1] == "focused"            # Busy: it only brings the window forward.
-    app._phase = Phase.IDLE
-    app.config.auto_start_recording = False
+
+
+def test_the_shortcut_dictates_on_the_bar_where_the_user_left_it(monkeypatch):
+    app, calls = controller(monkeypatch)
+    app.config.bar_position = [0.25, 0.75]
     app.dictation_hotkey_pressed()
-    assert calls[-1] == "focused" and app._phase is Phase.IDLE   # Set to start from the window.
+    app._start_thread.join(timeout=2)
+    assert app._phase is Phase.CONNECTING and app._compact_session
+    assert ("bar at", [0.25, 0.75]) in calls
 
 
-def test_the_window_intro_says_what_the_shortcut_does(monkeypatch):
-    app, _ = controller(monkeypatch)
-    shown = []
-    app.overlay_controller.set_intro_text = shown.append
-    app._save_settings = lambda: True
-    app.toggle_setting("auto_start_recording")
-    assert shown == [module.intro_text("Option+Space", app.config)]
-    assert shown[0].startswith("Press Cmd+R or Dictate to start")
+def test_dragging_the_bar_is_remembered_and_settings_can_put_it_back(monkeypatch):
+    app, calls = controller(monkeypatch)
+    saved = []
+    app._save_settings = lambda: saved.append(app.config.bar_position) or True
+    app.bar_moved((0.1, 0.9))
+    assert app.config.bar_position == [0.1, 0.9] and saved == [[0.1, 0.9]]
+    app.bar_moved(None)                      # Dropped beside its default place.
+    assert app.config.bar_position is None
+    app.config.bar_position = [0.5, 0.5]
+    app.reset_bar_position()
+    assert app.config.bar_position is None and saved[-1] is None
+    assert calls[-1] == ("bar moved to", None)          # An open bar goes back at once.
 
 
 def test_cancelling_while_the_microphone_connects_closes_the_window(monkeypatch):
@@ -678,7 +688,6 @@ def test_pressing_the_shortcut_after_a_failed_model_load_tries_again(monkeypatch
     app.transcriber.is_ready = lambda: False
     app.transcriber.load_error = RuntimeError("offline")
     app.retry_speech_model = lambda: calls.append("retry")
-    app.config.compact_dictation = False
     assert not app.start_recording()
     assert "retry" in calls
     app.transcriber.load_error = None                     # Still loading: nothing to retry.
