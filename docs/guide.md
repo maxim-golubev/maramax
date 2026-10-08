@@ -45,9 +45,10 @@ Everything the app does and where it keeps things. For a first launch, see [the 
   and file queue. Live transcription previews remain available in that window,
   and while it is open the shortcut dictates in it.
 - Drag the bar by anything but its buttons to put it wherever suits you; it
-  opens there from then on, on whichever display you are using. Dropping it
-  back near the bottom centre, or **Settings → General → Reset Position**,
-  returns it to its default place.
+  opens there from then on, on whichever display you are using. Double-click
+  the bar, drop it back near the bottom centre, or choose **Reset Bar Position**
+  in the menu (it is there while the bar has been moved) to return it to its
+  default place.
 - Capture continues for a fifth of a second after you press stop, so a last
   syllable still travelling through the driver or a Bluetooth link is not cut off.
 
@@ -78,6 +79,17 @@ shortcut again: that retries the download. So do **Retry Speech Model**, which
 appears at the top of the menu while it is needed, and **Retry** in Settings →
 Advanced; both also retry the high-accuracy model if its download failed. A second copy of Maramax is blocked before it loads models or opens
 audio; quit the old copy before opening a different version.
+
+## Audio and video files
+
+Drop a file on the Maramax icon in the menu bar, or choose **Transcribe
+Files…**, to transcribe it; several files go to the Queue tab of the Maramax
+window, where **Start** asks where their transcripts should go. Files can also
+be dropped on that window. A recording can be dragged straight out of Voice
+Memos and other apps that hand over a file only when it is asked for; Maramax
+keeps its copy of such a file until it is next opened (or until **Clear History
+& Recordings…**), and cannot save a transcript "next to the original" for it.
+Nothing can be dropped while you are dictating.
 
 ## Microphones and AirPods
 

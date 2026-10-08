@@ -30,6 +30,8 @@ DEFAULT_BOTTOM = 24
 # A bar dropped this close to its default place goes back to it, so the
 # default can be found again by hand.
 SNAP_DISTANCE = 12
+# How far the pointer travels with the button down before the bar follows it.
+DRAG_START = 3
 BUTTON = 30
 BUTTON_GAP = 8
 METER_BARS = 7
@@ -122,12 +124,14 @@ class PassivePanel(NSPanel):
 
 class IndicatorBackground(NSView):
     """The bar's background, which is also where it is dragged from: anywhere
-    but its two buttons. `on_drop` is told when a drag that moved it ends."""
+    but its two buttons. `on_drop` is told when a drag that moved it ends,
+    `on_double_click` when it is clicked twice without being dragged."""
 
     def initWithFrame_(self, frame):
         self = objc.super(IndicatorBackground, self).initWithFrame_(frame)
         if self is not None:
             self.on_drop = None
+            self.on_double_click = None
             self._grab = None  # (mouse, window origin) where the drag began
             self._moved = False
         return self
@@ -150,7 +154,7 @@ class IndicatorBackground(NSView):
         self.drag_to(NSEvent.mouseLocation())
 
     def mouseUp_(self, event):
-        self.end_drag()
+        self.end_click(event.clickCount())
 
     @objc.python_method
     def is_dragged(self):
@@ -167,8 +171,18 @@ class IndicatorBackground(NSView):
         if self._grab is None:
             return
         (start_x, start_y), (origin_x, origin_y) = self._grab
+        if not self._moved and math.hypot(mouse.x - start_x, mouse.y - start_y) < DRAG_START:
+            return  # A click's own tremor: neither a move nor the end of a double-click.
         self.window().setFrameOrigin_((origin_x + mouse.x - start_x, origin_y + mouse.y - start_y))
         self._moved = True
+
+    @objc.python_method
+    def end_click(self, clicks):
+        """The mouse button came up for the `clicks`-th time in a row."""
+        moved = self._moved
+        self.end_drag()
+        if not moved and clicks == 2 and self.on_double_click is not None:
+            self.on_double_click()
 
     @objc.python_method
     def end_drag(self):
@@ -335,6 +349,7 @@ class DictationIndicator(NSObject):
         content = IndicatorBackground.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, HEIGHT))
         content.refresh_background()
         content.on_drop = self._dropped
+        content.on_double_click = self._double_clicked
         self._background = content  # Also once take_view() has moved it out of the panel.
         self._placement = None
         self.panel.setContentView_(content)
@@ -436,6 +451,11 @@ class DictationIndicator(NSObject):
         placement = placement_at(visible, (origin.x, origin.y))
         self.panel.setFrameOrigin_(bar_origin(visible, placement))
         self.delegate.bar_moved(placement)
+
+    @objc.python_method
+    def _double_clicked(self):
+        """The way back to the default place without looking for it."""
+        self.delegate.reset_bar_position()
 
     @objc.python_method
     def take_view(self):

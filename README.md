@@ -65,7 +65,7 @@ The speech model was the easy part. Most of the work went into four problems:
   trimming, beam search, and collapsing repeated words were kept out: each made
   real transcripts worse.
 
-About 680 tests run without a microphone, a screen, or model weights: a fake
+About 700 tests run without a microphone, a screen, or model weights: a fake
 audio device drives the real helper process, and the native windows are built
 and measured off-screen.
 
@@ -105,11 +105,10 @@ bash build_app.sh                         # dist/Maramax.app, checked before it 
 
 ## Credits
 
-Maramax started as a fork of Osada Paranaliyanage's
+Maramax began as a fork of
 [parakeet-dictation](https://github.com/osadalakmal/parakeet-dictation), itself
-built on Ashwin P Chandran's
-[whisper-dictation](https://github.com/ashwin-pc/whisper-dictation). It has
-since been almost entirely rewritten. Recognition uses NVIDIA's Parakeet TDT 0.6B v2 through
+built on [whisper-dictation](https://github.com/ashwin-pc/whisper-dictation); it
+has since been rewritten. Recognition uses NVIDIA's Parakeet TDT 0.6B v2 through
 [parakeet-mlx](https://github.com/senstella/parakeet-mlx), and optionally
 Qwen3-ASR through [qwen3-asr-mlx](https://github.com/gabrimatic/qwen3-asr-mlx).
 MIT licensed.

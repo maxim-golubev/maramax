@@ -17,7 +17,7 @@ NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPo
 
 # Every title the menu can show. The record and update items change theirs.
 FIXED = ["Retry Speech Model", "Copy Last Transcript", "Open Transcript", "History", "Recordings…",
-         "Recover Last Recording", "Transcribe Files…", "Settings…", "Quit Maramax"]
+         "Recover Last Recording", "Transcribe Files…", "Reset Bar Position", "Settings…", "Quit Maramax"]
 RECORD = ["Start Dictation", "Stop Dictation", "Transcribing…"]
 UPDATE = sorted({menu_title(step, "10.10.10", 100) for step in Step} | {menu_title(Step.IDLE, None)})
 # Every preset, and every modifier with a function key. Space with three or

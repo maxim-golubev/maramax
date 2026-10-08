@@ -90,7 +90,10 @@ def _copy_to_clipboard(items: list[QueuedFile]) -> None:
 
 def _save_each(items: list[QueuedFile], folder_for: Callable[[Path], Path]) -> None:
     """One text file per transcript, named after its source, in the folder
-    `folder_for` gives for that source. An existing file is never replaced."""
+    `folder_for` gives for that source. An existing file is never replaced.
+    One that cannot be written does not keep the rest from being saved: the
+    error names the first and says how many were."""
+    failures: list[tuple[str, OSError]] = []
     for item in items:
         source = Path(item.path)
         folder = folder_for(source)
@@ -103,7 +106,13 @@ def _save_each(items: list[QueuedFile], folder_for: Callable[[Path], Path]) -> N
                 out_path = folder / f"{source.stem}_{counter}.txt"
             out_path.write_text(item.result_text, encoding="utf-8")
         except OSError as exc:
-            raise ExportError(f"could not write {source.stem}.txt to {folder.name}: {_reason(exc)}") from exc
+            failures.append((f"could not write {source.stem}.txt to {folder.name}: {_reason(exc)}", exc))
+    if failures:
+        message, cause = failures[0]
+        saved = len(items) - len(failures)
+        if saved:
+            message += f" ({saved} of {_transcripts(len(items))} saved; the rest are in History)"
+        raise ExportError(message) from cause
 
 
 def _save_together(items: list[QueuedFile], path: Path) -> None:

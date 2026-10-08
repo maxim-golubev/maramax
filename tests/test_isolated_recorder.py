@@ -661,3 +661,31 @@ def test_a_stream_failover_reopened_is_not_kept_warm_for_the_device_it_replaced(
     assert not recorder.warm_start              # Opened afresh for what the request names.
     recorder.stop()
     recorder.cleanup()
+
+
+def test_quitting_mid_dictation_keeps_a_capture_that_had_no_spill_of_its_own(tmp_path, monkeypatch):
+    in_progress_path(tmp_path).write_bytes(b"\x09\x00" * 16000)             # An earlier capture, still not set aside.
+    monkeypatch.setattr(recovery, "promote_in_progress", lambda base: False)
+    recorder = recorder_for(tmp_path, helper())
+    assert recorder.start() and not recorder.spill_holds_capture
+    wait_for(lambda: sum(map(len, recorder.frames)) > 64000)
+    recorder.cleanup()                                                      # The app quits.
+    kept = recovery.unsaved_recordings(tmp_path)
+    assert len(kept) == 1 and kept[0].stat().st_size > 64000                # Written from memory.
+    assert in_progress_path(tmp_path).read_bytes() == b"\x09\x00" * 16000   # The earlier one is untouched.
+
+
+def test_a_spill_that_does_not_close_does_not_cost_the_audio(tmp_path):
+    recorder = recorder_for(tmp_path, helper())
+    try:
+        assert recorder.start()
+        wait_for(lambda: sum(map(len, recorder.frames)) > 16000)
+
+        class Unclosable:
+            def close(self):
+                raise OSError(5, "Input/output error")
+        recorder._spill.close()
+        recorder._spill = Unclosable()
+        assert len(recorder.stop()) > 16000
+    finally:
+        recorder.cleanup()

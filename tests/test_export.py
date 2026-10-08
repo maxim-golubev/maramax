@@ -2,7 +2,7 @@ import pytest
 
 from parakeet_dictation.clipboard import ClipboardError
 from parakeet_dictation.export import ExportError, OutputMode, ToFile, ToFolder, export_results
-from parakeet_dictation.file_queue import QueuedFile
+from parakeet_dictation.file_queue import QueuedFile, QueueStatus
 
 
 def _make_item(filename="test.mp3", path="/tmp/test.mp3", text="hello world", status="done"):
@@ -168,3 +168,19 @@ def test_export_raises_on_no_completed():
 
     with pytest.raises(ExportError, match="no completed"):
         export_results(items, OutputMode.CLIPBOARD)
+
+
+def test_one_folder_that_cannot_be_written_does_not_keep_the_other_transcripts_from_being_saved(tmp_path):
+    locked, open_folder = tmp_path / "locked", tmp_path / "open"
+    locked.mkdir()
+    open_folder.mkdir()
+    locked.chmod(0o500)
+    try:
+        items = [QueuedFile("a", str(locked / "a.m4a"), "a.m4a", QueueStatus.DONE, "first"),
+                 QueuedFile("b", str(open_folder / "b.m4a"), "b.m4a", QueueStatus.DONE, "second")]
+        with pytest.raises(ExportError, match=r"could not write a.txt to locked: Permission denied "
+                                              r"\(1 of 2 transcripts saved; the rest are in History\)"):
+            export_results(items, OutputMode.NEXT_TO_ORIGINALS)
+        assert (open_folder / "b.txt").read_text() == "second"
+    finally:
+        locked.chmod(0o700)

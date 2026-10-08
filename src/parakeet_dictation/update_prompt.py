@@ -96,6 +96,10 @@ _INLINE = re.compile(
     r"|`(?P<code>[^`]+)`"
     r"|(?<!\w)\*(?P<italic>[^*\s][^*]*?)\*|(?<!\w)_(?P<italic2>[^_\s][^_]*?)_(?!\w)"
 )
+# A longer line or paragraph is shown as it is written: looking for markup
+# takes time that grows with the square of the length (seconds for a release
+# body of unmatched brackets), on the main thread.
+MAX_MARKED_UP = 2000
 _HEADING = re.compile(r"#{1,6}\s+(.*)")
 _BULLET = re.compile(r"\s*[-*+]\s+(.*)")
 _NUMBERED = re.compile(r"\s*(\d{1,9}[.)])\s+(.*)")
@@ -103,6 +107,8 @@ _NUMBERED = re.compile(r"\s*(\d{1,9}[.)])\s+(.*)")
 
 def inline_parts(text: str) -> Parts:
     """One line of Markdown as runs of text and links, without the markup."""
+    if len(text) > MAX_MARKED_UP:
+        return (Run(text, Emphasis.PLAIN),)
     parts: list[Run | Link] = []
     position = 0
     for match in _INLINE.finditer(text):
@@ -356,8 +362,10 @@ def rendered_notes(blocks: list[Block]):
 
 
 def _ours(url: str) -> bool:
-    """Whether `url` is on Maramax's own GitHub pages, the only links release notes may make."""
-    return url == REPOSITORY_URL or url.startswith(REPOSITORY_URL + "/")
+    """Whether `url` is on Maramax's own GitHub pages, the only links release
+    notes may make. Not one that climbs out of them again ("/../", or the
+    same in percent escapes)."""
+    return url == REPOSITORY_URL or (url.startswith(REPOSITORY_URL + "/") and "/." not in url and "%" not in url)
 
 
 def _tab(alignment, location):

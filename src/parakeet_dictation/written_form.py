@@ -16,7 +16,10 @@ _FILLERS = rf"{_FILLER}(?:,?\s+{_FILLER})*"
 # milk, and bread". A list's tail is short items to the end of the sentence.
 # The words either side are read whole, so "$5, um, $6" counts as two numbers.
 _BETWEEN_COMMAS = re.compile(rf"(?<!\S)(\S*),\s+{_FILLERS},\s+(?=(\S*)([^.?!]*))")
-_ITEM = r"\w+(?:\s\w+)?"
+# An item is one or two words, neither of them the connector: read as a word
+# of an item too, "and" would give a run of them more readings at each one.
+_WORD = r"(?!(?:and|or)\b)\w+"
+_ITEM = rf"{_WORD}(?:\s{_WORD})?"
 # The connector is possessive: read as an item's first word too, "and" would
 # give each item two readings, and a long non-list sentence exponential work.
 _LIST_TAIL = re.compile(rf"{_ITEM}(?:,\s*(?:(?:and|or)\s+)?+{_ITEM}|\s(?:and|or)\s{_ITEM})+\s*")
@@ -29,8 +32,9 @@ _CLOSING = re.compile(rf",\s*{_FILLERS}(?=\s*(?:[.?!;:…]|$))")
 # A filler sentence that ends the text goes with its own punctuation: "That is all. Um." reads "That is all."
 _TRAILING = re.compile(rf"(?<=[.?!…])(?:\s+{_FILLER}(?:\.\.\.|[,.?!;:…])?)+\s*$")
 # Opening a sentence: its capital goes to the next word, "Um, so" reads "So",
-# unless that word has capitals of its own ("iPhone").
-_OPENING = re.compile(rf"(^|[.?!]\s+)(?:{_FILLER}(?:[,.?!;:…]|\.\.\.)?\s+)+(\w+)")
+# unless that word has capitals of its own ("iPhone"). A quotation opens one
+# too: 'He said, "Um, I see."' reads 'He said, "I see."'
+_OPENING = re.compile(rf"((?:^|[.?!]\s+)[\"“‘(]?|,\s+[\"“‘])(?:{_FILLER}(?:[,.?!;:…]|\.\.\.)?\s+)+(\w+)")
 _ANYWHERE = re.compile(rf"\s*(?<![\w-]){_FILLER}[,]?")
 _ALONE = re.compile(rf"^(?:{_FILLER}(?:\.\.\.|[,.?!;:…])?\s*)+$")
 
@@ -70,8 +74,9 @@ def without_fillers(text: str) -> str:
         return ""
     text = _TRAILING.sub("", text)
     text = _CLOSING.sub("", text)  # Before the commas, so a closing filler does not read as a list item.
-    text = _BETWEEN_COMMAS.sub(_between_commas, text)
+    # Before the commas: "Um, okay, um, let's go" then opens with "Okay", whose comma stays.
     text = _OPENING.sub(lambda match: match.group(1) + _capitalised(match.group(2)), text)
+    text = _BETWEEN_COMMAS.sub(_between_commas, text)
     text = _ANYWHERE.sub("", text)
     return text.strip()
 

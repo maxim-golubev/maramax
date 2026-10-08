@@ -119,3 +119,21 @@ def test_a_long_run_without_spaces_takes_no_time():
     started = time.monotonic()
     written("a," * 25000 + " um, done.")
     assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.parametrize("heard, wanted", [
+    ("Uh, no, uh, I don't think so.", "No, I don't think so."),            # The opening word keeps its comma.
+    ("Um, okay, um, let's start.", "Okay, let's start."),
+    ('He said, "Um, I don\'t know."', 'He said, "I don\'t know."'),      # A quotation opens a sentence too.
+    ('"Um, so that is it."', '"So that is it."'),
+    ("“Uh, fine,” she said.", "“Fine,” she said."),
+])
+def test_a_filler_opening_a_sentence_or_a_quotation_leaves_it_whole(heard, wanted):
+    assert without_fillers(heard) == wanted
+
+
+def test_a_run_of_connectors_after_a_filler_is_tidied_at_once():
+    import time
+    started = time.perf_counter()
+    without_fillers("We need, um, a" + " and and" * 40 + " b c d!")
+    assert time.perf_counter() - started < 0.1      # Each pair once doubled the time.

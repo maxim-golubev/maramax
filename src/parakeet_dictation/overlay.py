@@ -41,11 +41,8 @@ from .capture import CaptureHealth
 from .export import Destination, OutputMode, ToFile, ToFolder
 from .file_queue import QueueStatus
 from .hotkeys import STOP
+from . import media_drop
 from .main_thread import call_later
-
-MEDIA_EXTENSIONS = [
-    "aac", "aiff", "flac", "m4a", "mov", "mp3", "mp4", "ogg", "opus", "wav", "webm",
-]
 
 _COMMAND_ONLY_MASK = (
     NSEventModifierFlagCommand
@@ -113,10 +110,6 @@ def _content_types(extensions):
     """The file types a file panel offers, by filename extension."""
     content_type = objc.lookUpClass("UTType")
     return [content_type.typeWithFilenameExtension_(extension) for extension in extensions]
-
-
-def _is_media(path: str) -> bool:
-    return "." in path and path.rsplit(".", 1)[-1].lower() in MEDIA_EXTENSIONS
 
 
 class OverlayPanel(NSPanel):
@@ -195,25 +188,19 @@ class OverlayDropView(NSView):
             return None
 
         self.controller = controller
-        self.registerForDraggedTypes_(["public.file-url"])
+        self.registerForDraggedTypes_(media_drop.drag_types())
         self.setWantsLayer_(True)
         return self
 
     def viewDidChangeEffectiveAppearance(self):
         self.controller.apply_appearance()
 
-    @objc.python_method
-    def _dragged_media(self, sender):
-        urls = sender.draggingPasteboard().readObjectsForClasses_options_([objc.lookUpClass("NSURL")], None) or []
-        # A web address dragged along has a path too, of a file that is not here.
-        return [url.path() for url in urls if url.isFileURL() and url.path() and _is_media(url.path())]
-
     def draggingEntered_(self, sender):
         # A drop starts or queues work and opens the Queue tab, over Stop
         # and the live draft: not while recording.
-        media = self._dragged_media(sender)
-        if not self.controller.is_recording and media:
-            self.controller.set_drop_state(self.controller.drop_target(len(media)))
+        count = media_drop.offered_count(sender.draggingPasteboard())
+        if not self.controller.is_recording and count:
+            self.controller.set_drop_state(self.controller.drop_target(count))
             return NSDragOperationCopy
         return 0
 
@@ -226,12 +213,8 @@ class OverlayDropView(NSView):
         return True
 
     def performDragOperation_(self, sender):
-        paths = self._dragged_media(sender)
         self.controller.set_drop_state(None)
-        if not paths:
-            return False
-        self.controller.files_dropped(paths)
-        return True
+        return self.controller.delegate.receive_media(sender.draggingPasteboard(), self.controller.files_dropped)
 
 
 class OverlayController(NSObject):
@@ -262,7 +245,7 @@ class OverlayController(NSObject):
         self._queue_processing = False
         self._selected_queue_file_id = None
         self._rendering_queue = False
-        self._positioned = False
+        self._open = False  # On screen: between focus() and hide().
         self._build_window()
         self._refresh_text_view()
         self._apply_recording_state()
@@ -719,13 +702,24 @@ class OverlayController(NSObject):
             return ToFile(Path(str(panel.URL().path())))
 
     @objc.python_method
-    def _choose_media_files(self):
+    def choose_media_files(self):
+        """The media files the user picks in a file panel; none if they cancel."""
+        # Also asked from the menu with no Maramax window open: the panel
+        # must come up in front, with the keyboard.
+        application = NSApplication.sharedApplication()
+        borrowed = not application.isActive()
+        application.activateIgnoringOtherApps_(True)
         panel = NSOpenPanel.openPanel()
         panel.setCanChooseDirectories_(False)
         panel.setCanChooseFiles_(True)
         panel.setAllowsMultipleSelection_(True)
-        panel.setAllowedContentTypes_(_content_types(MEDIA_EXTENSIONS))
-        return [url.path() for url in panel.URLs()] if panel.runModal() else []
+        panel.setAllowedContentTypes_(_content_types(media_drop.MEDIA_EXTENSIONS))
+        paths = [url.path() for url in panel.URLs()] if panel.runModal() else []
+        if borrowed and not paths:
+            # Nothing of Maramax's is left in front: the app the user was in
+            # gets the keyboard back, so the next dictation can be pasted into it.
+            application.deactivate()
+        return paths
 
     # -- Showing and hiding --
 
@@ -733,7 +727,8 @@ class OverlayController(NSObject):
     def focus(self):
         # Activation must not depend on the app that is in front agreeing to
         # give way: the hotkey can arrive while any app is active.
-        self._place_on_a_screen()  # Not on a display that has since been unplugged.
+        self._place_on_a_screen()
+        self._open = True
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         self.panel.makeKeyAndOrderFront_(None)
         self.panel.makeMainWindow()
@@ -757,17 +752,16 @@ class OverlayController(NSObject):
     def show_mode(self, mode: Mode):
         self._set_mode(mode)
         self.mode_control.setSelectedSegment_(_SEGMENTS.index(mode))
-        self._place_on_a_screen()
         self.focus()
 
     @objc.python_method
     def _place_on_a_screen(self):
-        """Centred the first time; afterwards where the user left it, unless
-        that is on no screen now (a display was unplugged). AppKit does not
-        bring a borderless window back by itself."""
-        if not self._positioned or self.panel.screen() is None:
+        """Centred every time it opens, so it is always found in one place.
+        While open it stays where the user drags it, unless that is on no
+        screen now (a display was unplugged): AppKit does not bring a
+        borderless window back by itself."""
+        if not self._open or self.panel.screen() is None:
             self.panel.center()
-            self._positioned = True
 
     @objc.python_method
     def _set_mode(self, mode: Mode):
@@ -805,6 +799,7 @@ class OverlayController(NSObject):
     @objc.python_method
     def hide(self):
         self.panel.orderOut_(None)
+        self._open = False
         self.current_text = ""
         self._cancel_copy_feedback()
         self._refresh_text_view()
@@ -900,10 +895,7 @@ class OverlayController(NSObject):
 
     @objc.python_method
     def files_dropped(self, paths):
-        if self.drop_target(len(paths)) is DropTarget.TRANSCRIBE:
-            self.delegate.transcribe_file_directly(paths[0])
-        else:
-            self.delegate.queue_add_files(paths)
+        self.delegate.transcribe_media(paths, self.mode)
 
     # -- Actions --
 
@@ -921,7 +913,7 @@ class OverlayController(NSObject):
 
     def openFiles_(self, sender):
         del sender
-        paths = self._choose_media_files()
+        paths = self.choose_media_files()
         if paths:
             self.files_dropped(paths)
 
@@ -931,7 +923,7 @@ class OverlayController(NSObject):
 
     def queueAddFiles_(self, sender):
         del sender
-        paths = self._choose_media_files()
+        paths = self.choose_media_files()
         if paths:
             self.delegate.queue_add_files(paths)
 

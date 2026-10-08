@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import subprocess
+import time
 
 import objc
 from AppKit import (
@@ -79,7 +80,8 @@ _AX_VALUE_CF_RANGE = 4  # kAXValueCFRangeType
 # Bounds the one call to tccutil, which answers in milliseconds.
 _TCCUTIL_SECONDS = 5
 # How long the app being pasted into may take to say what is before the
-# cursor: the read runs on the main thread, just before Cmd+V.
+# cursor, over the three questions that takes: the read runs on the main
+# thread, just before Cmd+V.
 _CURSOR_READ_SECONDS = 0.25
 # After one of these a transcript follows on without a space.
 _OPENERS = "([{<“‘«/\\-@#"
@@ -150,9 +152,18 @@ def text_before_cursor() -> str | None:
         if not system:
             return None
         owned.append(system)
-        _app_services.AXUIElementSetMessagingTimeout(system, _CURSOR_READ_SECONDS)  # For every element.
+        deadline = time.monotonic() + _CURSOR_READ_SECONDS
+
+        def allow_the_rest() -> bool:
+            """Give the next question what is left of the time; False when none is."""
+            left = deadline - time.monotonic()
+            if left > 0:
+                _app_services.AXUIElementSetMessagingTimeout(system, left)  # For every element.
+            return left > 0
+
+        allow_the_rest()
         focused = _copy_attribute(system, "AXFocusedUIElement", owned)
-        selection = focused and _copy_attribute(focused, "AXSelectedTextRange", owned)
+        selection = focused and allow_the_rest() and _copy_attribute(focused, "AXSelectedTextRange", owned)
         cursor = _CFRange()
         if not selection or not _app_services.AXValueGetValue(selection, _AX_VALUE_CF_RANGE, ctypes.byref(cursor)):
             return None
@@ -165,7 +176,7 @@ def text_before_cursor() -> str | None:
             return None
         owned.append(span)
         value = ctypes.c_void_p()
-        if _app_services.AXUIElementCopyParameterizedAttributeValue(
+        if not allow_the_rest() or _app_services.AXUIElementCopyParameterizedAttributeValue(
                 focused, _name("AXStringForRange", owned), span, ctypes.byref(value)) != 0 or not value.value:
             return None
         owned.append(value.value)

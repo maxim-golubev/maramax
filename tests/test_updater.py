@@ -134,8 +134,10 @@ def fake_bundle(root, identifier="com.maramax.dictation", version="0.5.2"):
     app = root / "Maramax.app"
     (app / "Contents" / "MacOS").mkdir(parents=True)
     (app / "Contents" / "Info.plist").write_bytes(plistlib.dumps(
-        {"CFBundleIdentifier": identifier, "CFBundleShortVersionString": version}))
-    (app / "Contents" / "MacOS" / "Maramax").write_text("#!/bin/sh\n")
+        {"CFBundleIdentifier": identifier, "CFBundleShortVersionString": version, "CFBundleExecutable": "Maramax"}))
+    executable = app / "Contents" / "MacOS" / "Maramax"
+    executable.write_text(f"#!/bin/sh\necho maramax {version}\n")
+    executable.chmod(0o755)
     return app
 
 
@@ -233,7 +235,7 @@ def test_a_connection_that_breaks_mid_download_is_a_download_error_and_is_cleare
         def __exit__(self, *exc):
             return False
 
-        def read(self, amount):
+        def read1(self, amount):
             raise failure
     monkeypatch.setattr(updater, "_open", lambda url, version: Breaking() if url == release.archive.url
                         else real_open(url, version))
@@ -1436,3 +1438,51 @@ def test_access_control_lists_are_removed_without_following_a_link(tmp_path):
     updater._restrict_permissions(app)                                   # Does not fail on it,
     listing = subprocess.run(["ls", "-le", str(outside)], capture_output=True, text=True, check=True).stdout
     assert "everyone" in listing                                        # nor reach past the bundle.
+
+
+def test_a_download_that_would_not_open_is_refused_though_its_signature_holds(tmp_path, codesign):
+    """Permission bits are outside the signature: an executable that is not one would install and never run."""
+    installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
+    release = published(tmp_path, modes={"Contents/MacOS/Maramax": 0o644})
+    with pytest.raises(updater.UpdateError, match="does not start"):
+        updater.download(release, "0.5.1", installed, tmp_path / "staging", lambda *a: None, lambda: False)
+    assert len(codesign) == 1 and not (installed.parent / updater.STAGED_NAME).exists()
+    assert not (tmp_path / "staging").exists()
+
+
+def test_a_download_larger_than_the_release_says_is_stopped(tmp_path, codesign):
+    installed = fake_bundle(tmp_path / "Applications", version="0.5.1")
+    release = published(tmp_path)
+    smaller = updater.Asset(**{**release.archive.__dict__, "size": 10})
+    with pytest.raises(updater.UpdateError, match="is larger than the 10 bytes"):
+        updater.download(updater.Release(**{**release.__dict__, "archive": smaller}), "0.5.1", installed,
+                         tmp_path / "staging", lambda *a: None, lambda: False)
+    assert codesign == [] and not (tmp_path / "staging").exists()
+
+
+def test_a_delta_whose_files_lead_out_of_it_is_refused(tmp_path):
+    old, new = two_versions(tmp_path)
+    delta = tmp_path / "delta"
+    bundle_delta.make(old, new, delta)
+    (delta / "files").rename(delta / "kept")
+    (delta / "files").symlink_to(delta / "kept")       # In a hostile delta: a link to /dev, whose "files" never end.
+    with pytest.raises(bundle_delta.DeltaError, match="link to somewhere else"):
+        apply_to_a_clone(tmp_path, old, delta)
+
+
+def test_the_swap_installs_even_when_its_log_cannot_be_written(tmp_path):
+    staged = staged_beside(tmp_path)
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "update.log").mkdir()         # A folder where the log should be.
+    installed, result, opened = run_swap(tmp_path, staged=staged)
+    assert result is updater.InstallResult.INSTALLED and version_of(installed) == "0.5.2" and opened == [str(installed)]
+
+
+def test_release_notes_link_only_into_the_repository_and_long_lines_are_shown_plain():
+    from parakeet_dictation.update_prompt import MAX_MARKED_UP, Emphasis, Paragraph, Run, _ours, note_blocks
+    assert _ours("https://github.com/maxim-golubev/maramax/releases/tag/v1.0.0")
+    assert not _ours("https://github.com/maxim-golubev/maramax/../../evil/tool/releases")
+    assert not _ours("https://github.com/maxim-golubev/maramax/%2e%2e/%2e%2e/evil/tool")
+    assert not _ours("https://github.com/maxim-golubev/maramax-evil")
+    brackets = "[" * (MAX_MARKED_UP + 1)
+    assert note_blocks(brackets) == [Paragraph((Run(brackets, Emphasis.PLAIN),))]
