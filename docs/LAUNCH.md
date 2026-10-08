@@ -56,9 +56,11 @@ for updates automatically**.
 - **The bar** stays out of the way and leaves the app you are typing in
   focused. Its meter shows incoming audio and its timer the captured length.
   The red button finishes; the arrow opens the full window. Drag the bar
-  anywhere you like: it opens where you leave it.
+  anywhere you like: it opens where you leave it, and a double-click puts
+  it back.
 - **Open Transcript** shows the transcript, history, and a queue for
-  transcribing audio and video files.
+  transcribing audio and video files. To transcribe a file, drop it on the
+  Maramax icon in the menu bar, or choose **Transcribe Files…**.
 - **Settings…** has where the transcript goes (paste, copy, or keep), live
   preview, the microphone, word replacements (a phrase it keeps mishearing and
   the spelling you want; the original wording stays in history and

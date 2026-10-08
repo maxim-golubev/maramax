@@ -61,6 +61,8 @@ _HISTORY_CHOICES = (50, 100, 250, 500, 1000)
 _RECORDINGS_CHOICES = (10, 20, 50, 100)
 _HISTORY_NOTE = (f"Nothing leaves this Mac. Recordings also stay under {MAX_ARCHIVE_BYTES // (1024 * 1024)} MB "
                  "in all. With a lower number, the oldest are deleted when the next one is saved.")
+_BAR_HELP = ("Drag the dictation bar anywhere on the screen: it opens where you leave it. Double-click it to put "
+             "it back.")
 PAGE_TOP = 20
 ROW_GAP = 8  # Between controls that share a row.
 SECTION_GAP = 22  # Between groups on a page; inside one, PAGE_SPACING.
@@ -252,17 +254,8 @@ class PreferencesController(NSObject):
             [about],
             [shortcut_row],
             [self._header("When you finish dictating"), *self._delivery_choices()],
-            [self._header("Dictation"), self._option("live_preview"), self._bar_row()],
+            [self._header("Dictation"), self._option("live_preview"), self._help(_BAR_HELP)],
         ])
-
-    @objc.python_method
-    def _bar_row(self):
-        """Where the dictation bar opens, and the way back to its default place."""
-        self.bar_reset = self._button("Reset Position", "resetBarPosition:")
-        width = CONTENT_WIDTH - aligned_width(self.bar_reset) - ROW_GAP
-        note = self._help("Drag the dictation bar anywhere on the screen: it opens where you leave it.", width)
-        note.widthAnchor().constraintEqualToConstant_(width).setActive_(True)  # So Reset ends at the page's edge.
-        return stack([note, self.bar_reset], horizontal=True, spacing=ROW_GAP)
 
     @objc.python_method
     def _delivery_choices(self):
@@ -359,7 +352,6 @@ class PreferencesController(NSObject):
         for name, button in self.options.items():
             button.setState_(int(getattr(config, name)))
         self._show_delivery()
-        self.bar_reset.setEnabled_(config.bar_position is not None)
         self.model_status.setStringValue_(self._model_message())
         self.model_retry.setHidden_(not self.delegate.models_failed())
         if not self.shortcut_picker.is_recording():
@@ -514,10 +506,6 @@ class PreferencesController(NSObject):
             if button is sender:
                 self.delegate.choose_delivery(delivery)
                 return
-
-    def resetBarPosition_(self, sender):
-        del sender
-        self.delegate.reset_bar_position()
 
     def requestPastePermission_(self, sender):
         del sender

@@ -862,3 +862,76 @@ replaced version until the next update.
 Dragging the bar with the mouse, the welcome's demonstration on screen, and a
 dictation on macOS 26 and 27.
 
+## 1.1.0 files from anywhere, the bar's way back, and a bug hunt — October 8, 2026
+
+Measured from source on this Mac (M3 Pro, macOS 15.7.9). 699 tests.
+
+### Files and the bar
+
+Media dropped on the menu bar icon is taken (the icon highlights, the pointer
+shows a copy), **Transcribe Files…** shows the file panel alone, and a drag
+that only promises its file (a recording out of Voice Memos) is accepted on
+the icon and on the window: the file is written under `dropped/` in the support
+folder, waited for 60 s at most, and deleted at the next launch or by Clear
+History & Recordings…. One rule decides what becomes of files wherever they
+come from: one is transcribed at once when nothing is running and the model is
+ready, otherwise they wait in the Queue tab. Reset Position left Settings: a
+double-click on the bar, or **Reset Bar Position** in the menu while the bar
+has been moved, puts it back; the bar follows the pointer only after 3 pt, so
+a click's tremor neither moves it nor spoils a double-click. Settings →
+General was rendered off-screen and looked at.
+
+Checked without a screen: that a promised recording is recognized as media
+and a promised document is not, that a promise never kept is given up on once
+and leaves nothing behind, and the icon's drop handling against a stand-in for
+the status item's window.
+
+### Bug hunt
+
+Four independent reviews: these changes, audio and recovery, updates and
+packaging, and recognition, text, and the windows. Confirmed and fixed:
+
+- Quitting mid-dictation lost a capture that had no whole spill of its own (an
+  earlier capture still held the recovery file); it is now written from memory.
+  Recover Last Recording returned to a recording whose WAV could not be read,
+  every time; a spill whose close failed cost `stop()` its audio.
+- An update whose executable had lost its execute bit passed the signature and
+  would have installed an app that never opens: the download is now run with
+  `--version` first (a 1.0.0 bundle answers in 1.5 s). The whole-app path kept
+  extended attributes from the ZIP; Cancel went unseen for a block at a time on
+  a slow connection; a delta whose `files` was a link could be copied without
+  end; release notes could link out of the repository through `..`, and a long
+  unmatched line stalled the main thread; a log that could not be opened ended
+  the swap script before it began.
+- "Um, okay, um, let's start" lost the comma after "Okay"; a filler after an
+  opening quote left a space; a run of "and" after a filler took exponential
+  time. The 20 archived recordings, recognized again, and the last 100
+  transcripts come out byte-identical under the new rules.
+- One folder that could not be written kept every other transcript of a queue
+  run from being saved; a replacement rule written with one apostrophe did not
+  match the other; the cursor read before a paste could take three timeouts
+  rather than one.
+
+### Speech models
+
+The Artificial Analysis word-error index puts Parakeet v2 last of the models it
+lists, but every entry at the top is a hosted service. Of the open models, v3
+and a tuned v3 ("Ultra") run through the same code at the same speed: on the 20
+archived recordings they differ from v2 on 3.0–3.1 % of words, some better
+("Claude.md" for "clawed.md"), some worse (numbers spelled out, a name
+misheard). Against Qwen3-ASR as an independent listener v2 differs on 9.0 % of
+words and v3 and Ultra on 8.6 %: too little to change the default on. Not
+tested: Cohere Transcribe (4 GB, gated, several seconds a dictation).
+
+### Known and left as is
+
+After a removed filler, a pair is read as a list: "I like, um, cats and dogs"
+keeps the comma, so that "Invite Anna, uh, Ben and Carla" keeps its own. The
+name "Umm" is taken for a filler. A file panel opened from the menu makes
+Maramax the active app; cancelling it hands activation back.
+
+### Still to verify on real hardware
+
+A drop on the menu bar icon, a recording dragged out of Voice Memos, a
+double-click on the bar, and the file panel cancelled with no Maramax window
+open.

@@ -136,6 +136,8 @@ def apply(delta_dir: Path, app: Path) -> None:
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise DeltaError(f"The delta's manifest is unreadable: {exc}") from exc
     _require_one_name_each(tree)
+    if (delta_dir / _FILES).is_symlink():
+        raise DeltaError("The delta's files are a link to somewhere else")
     try:
         for relative in sorted(deleted, key=_depth, reverse=True):
             _remove(_inside(app, relative))
@@ -148,7 +150,8 @@ def apply(delta_dir: Path, app: Path) -> None:
                 target.mkdir(exist_ok=True)
             elif relative in carried:
                 source = _inside(delta_dir / _FILES, relative)
-                if source.is_symlink() != (kind == "link"):
+                # Not a device or a pipe either: copying one never ends.
+                if source.is_symlink() != (kind == "link") or not (source.is_symlink() or source.is_file()):
                     raise DeltaError(f"The delta carries {relative!r} as something other than a {kind}")
                 _remove(target)
                 if kind == "link":

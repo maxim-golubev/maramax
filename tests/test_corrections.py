@@ -164,3 +164,11 @@ def test_rules_that_matching_tells_apart_can_both_be_kept():
     assert apply_replacements("STRASSE and Straße", rules) == "Road and Street"
     refused = edited_rules(rules, "STRAßE", "Lane", at=None)       # but the same letters in capitals are one rule.
     assert isinstance(refused, RuleRefused)
+
+
+def test_either_apostrophe_matches_either():
+    rules = [{"heard": "don't", "replacement": "do not"}]
+    assert apply_replacements("Don’t stop, don't go.", rules) == "do not stop, do not go."
+    assert apply_replacements("don't", [{"heard": "don’t", "replacement": "do not"}]) == "do not"
+    refused = edited_rules(rules, "don’t", "never", None)       # The same words: one rule, not two.
+    assert isinstance(refused, RuleRefused)

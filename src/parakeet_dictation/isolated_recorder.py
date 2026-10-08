@@ -511,8 +511,13 @@ class IsolatedAudioRecorder:
         locked = self._data_lock.acquire(timeout=1.0)
         try:
             if self._spill is not None:
-                self._spill.close()
-                self._spill = None
+                spill, self._spill = self._spill, None
+                try:
+                    spill.close()
+                except OSError as exc:
+                    # Every buffer was flushed as it arrived; a close that
+                    # fails must not cost stop() the audio it is about to return.
+                    logger.warning(f"The recording's spill did not close cleanly: {exc}")
         finally:
             if locked:
                 self._data_lock.release()
@@ -547,7 +552,11 @@ class IsolatedAudioRecorder:
         if self._closed:
             return
         self._closed = True
-        self.stop()
+        pcm = self.stop()
+        if pcm and not self.spill_holds_capture:
+            # Quitting mid-dictation: a capture with no whole spill of its own
+            # is in memory only, and this is the last that is seen of it.
+            recovery.keep_unsaved(self._recovery_dir, pcm)
         with self._operation_lock:
             process = self._process
             if process is not None and process.stdin is not None:

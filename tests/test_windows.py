@@ -17,7 +17,12 @@ delegate = SimpleNamespace(
     transcribe_file_directly=lambda path: calls.append(("file", path)),
     queue_add_files=lambda paths: calls.append(("queue", paths)),
     dismiss_requested=lambda: calls.append("dismiss"),
+    transcribe_media=lambda paths, mode: calls.append(("media", paths, str(mode))),
 )
+def receive_media(pasteboard, on_files):
+    from parakeet_dictation import media_drop
+    return media_drop.receive(pasteboard, Path("/no/such/support"), on_files, calls.append)
+delegate.receive_media = receive_media
 def visible_rect(view):
     return view.alignmentRectForFrame_(view.frame())
 '''
@@ -514,6 +519,36 @@ assert moves[-1] is None and (bar.panel.frame().origin.x, bar.panel.frame().orig
 ''')
 
 
+def test_a_double_click_on_the_bar_asks_for_its_default_place_unless_it_was_a_drag():
+    run(r'''
+from AppKit import NSPoint
+from parakeet_dictation.indicator import DictationIndicator
+resets, moves = [], []
+bar = DictationIndicator.alloc().initWithDelegate_(SimpleNamespace(
+    bar_moved=moves.append, reset_bar_position=lambda: resets.append("reset")))
+bar.begin("Option+Space")
+bar.place((0.2, 0.8))
+view = bar.panel.contentView()
+view.begin_drag(NSPoint(500, 100))
+view.end_click(1)
+assert resets == []                                        # One click does nothing.
+view.begin_drag(NSPoint(500, 100))
+view.end_click(2)
+assert resets == ["reset"] and moves == []
+view.begin_drag(NSPoint(500, 100))
+view.drag_to(NSPoint(501, 99))                             # A click's tremor is not a drag.
+view.end_click(2)
+assert resets == ["reset", "reset"] and moves == []
+view.begin_drag(NSPoint(500, 100))
+view.drag_to(NSPoint(450, 160))                            # The second press dragged it: that is a move.
+view.end_click(2)
+assert len(resets) == 2 and len(moves) == 1
+view.begin_drag(NSPoint(500, 100))
+view.end_click(3)
+assert len(resets) == 2
+''')
+
+
 def test_the_welcome_demonstration_plays_a_whole_dictation_on_a_bar_that_takes_no_clicks():
     run(r'''
 from AppKit import NSPoint
@@ -566,14 +601,104 @@ assert calls[-1] == ("remove", "c"), calls
 def test_a_web_address_dragged_along_with_a_file_is_not_queued():
     run(r'''
 from AppKit import NSPasteboard, NSURL
-from parakeet_dictation.overlay import OverlayController
+from parakeet_dictation.overlay import Mode, OverlayController
 window = OverlayController.alloc().initWithDelegate_(delegate)
 board = NSPasteboard.pasteboardWithUniqueName()
 board.clearContents()
 board.writeObjects_([NSURL.fileURLWithPath_("/tmp/real.wav"), NSURL.URLWithString_("https://host/podcast/episode.mp3")])
 dragged = SimpleNamespace(draggingPasteboard=lambda: board)
-assert window.content_view._dragged_media(dragged) == ["/tmp/real.wav"]
+assert window.content_view.draggingEntered_(dragged) != 0
+assert window.content_view.performDragOperation_(dragged)
+assert calls == [("media", ["/tmp/real.wav"], "result")], calls   # The controller decides what becomes of it.
+window._set_mode(Mode.QUEUE)
+window.files_dropped(["/tmp/other.wav"])
+assert calls[-1] == ("media", ["/tmp/other.wav"], "queue")
 board.releaseGlobally()
+''')
+
+
+def test_a_recording_promised_by_another_app_counts_as_media_and_a_promised_document_does_not(tmp_path):
+    run(r'''
+from AppKit import NSFilePromiseProvider, NSPasteboard
+from Foundation import NSObject
+from parakeet_dictation import media_drop
+class VoiceMemos(NSObject):
+    def filePromiseProvider_fileNameForType_(self, provider, file_type):
+        return "Memo"
+    def filePromiseProvider_writePromiseToURL_completionHandler_(self, provider, url, done):
+        done(None)
+source = VoiceMemos.alloc().init()
+def dragged(*file_types):
+    board = NSPasteboard.pasteboardWithUniqueName()
+    board.clearContents()
+    board.writeObjects_([NSFilePromiseProvider.alloc().initWithFileType_delegate_(kind, source) for kind in file_types])
+    return board
+assert set(media_drop.drag_types()) >= set(dragged("com.apple.m4a-audio").types()) & {
+    "com.apple.NSFilePromiseItemMetaData", "com.apple.pasteboard.promised-file-content-type"}
+assert media_drop.offered_count(dragged("com.apple.m4a-audio")) == 1
+assert media_drop.offered_count(dragged("com.apple.m4a-audio", "com.apple.quicktime-movie")) == 2
+assert media_drop.offered_count(dragged("com.adobe.pdf")) == 0
+assert not media_drop.receive(dragged("com.adobe.pdf"), Path(sys.argv[1]), calls.append, calls.append) and calls == []
+
+# Outside a real drag the promise is never kept: the wait ends, the reason is said once, nothing is left behind.
+timers = []
+media_drop.call_later = lambda delay, function, *args: timers.append((delay, function))
+support = Path(sys.argv[1])
+assert media_drop.receive(dragged("com.apple.m4a-audio"), support, lambda paths: calls.append(("files", paths)),
+                          lambda reason: calls.append(("failed", reason)))
+(delay, give_up), = timers
+assert delay == media_drop.PROMISE_SECONDS and calls == []
+assert len(list(media_drop.received_folder(support).iterdir())) == 1          # A folder for this drop.
+give_up()
+give_up()
+assert calls == [("failed", "the app it came from did not hand it over")], calls
+assert list(media_drop.received_folder(support).iterdir()) == []
+kept = media_drop.received_folder(support) / "drop" / "Memo.m4a"
+kept.parent.mkdir()
+kept.write_bytes(b"audio")
+assert media_drop.is_received(str(kept), support) and not media_drop.is_received("/Users/me/Memo.m4a", support)
+media_drop.discard_received(support)
+assert not media_drop.received_folder(support).exists()
+media_drop.discard_received(support)                                           # Nothing there: nothing to do.
+''', str(tmp_path))
+
+
+def test_the_menu_bar_icon_takes_dropped_media_except_while_recording():
+    run(r'''
+from AppKit import NSDragOperationCopy, NSPasteboard, NSURL
+from parakeet_dictation.menu_bar_drop import MenuBarDrop
+window_calls = []
+window = SimpleNamespace(registerForDraggedTypes_=lambda types: window_calls.append(list(types)),
+                         setDelegate_=lambda target: window_calls.append(target), delegate=lambda: None)
+lit = []
+button = SimpleNamespace(window=lambda: window, highlight_=lit.append)
+recording = [False]
+from parakeet_dictation import media_drop
+drop = MenuBarDrop.alloc().initWithButton_accepts_receive_(
+    button, lambda: not recording[0], lambda pasteboard: media_drop.receive(
+        pasteboard, Path("/no/such/support"), lambda paths: calls.append(("files", paths)), calls.append))
+assert "public.file-url" in window_calls[0] and window_calls[1] is drop
+def dragged(*urls):
+    board = NSPasteboard.pasteboardWithUniqueName()
+    board.clearContents()
+    board.writeObjects_(list(urls))
+    return SimpleNamespace(draggingPasteboard=lambda: board)
+memo = dragged(NSURL.fileURLWithPath_("/tmp/memo.m4a"))
+assert drop.draggingEntered_(memo) == NSDragOperationCopy and lit == [True]   # The icon lights up, the pointer shows a copy.
+drop.draggingExited_(memo)
+assert lit == [True, False]
+assert drop.draggingEntered_(dragged(NSURL.fileURLWithPath_("/tmp/notes.pdf"))) == 0 and lit == [True, False]
+assert drop.performDragOperation_(memo) and calls == [("files", ["/tmp/memo.m4a"])]
+recording[0] = True
+assert drop.draggingEntered_(memo) == 0
+assert not drop.performDragOperation_(memo) and len(calls) == 1
+taken = SimpleNamespace(window=lambda: SimpleNamespace(delegate=lambda: "AppKit's own"))
+try:
+    MenuBarDrop.alloc().initWithButton_accepts_receive_(taken, lambda: True, lambda pasteboard: True)
+except RuntimeError as refused:
+    assert "already has a delegate" in str(refused)                    # Never taken from whoever has it.
+else:
+    raise AssertionError("replaced a delegate")
 ''')
 
 

@@ -273,6 +273,7 @@ def download(release: Release, current_version: str, installed_app: Path, stagin
             _reset(staging)
             new_app = _from_archive(release, current_version, installed_app, staging, progress, cancelled)
         _restrict_permissions(new_app)
+        _require_it_starts(new_app, release.version)
         staged = _place_beside(new_app, installed_app)
     except OSError as exc:
         shutil.rmtree(staging, ignore_errors=True)
@@ -303,12 +304,18 @@ def _fetch(asset: Asset, current_version: str, destination: Path, progress: Prog
         digest = hashlib.sha256()
         received = 0
         with _open(asset.url, current_version) as response, destination.open("wb") as file:
-            while block := response.read(_DOWNLOAD_BLOCK):
+            # read1 returns what one read of the connection gives rather
+            # than waiting for a whole block, which on a slow connection
+            # would keep a cancel unseen for a minute at a time.
+            while block := response.read1(_DOWNLOAD_BLOCK):
                 if cancelled():
                     raise UpdateCancelled("The download was cancelled")
+                received += len(block)
+                if received > asset.size:
+                    raise UpdateError(f"The download of {asset.name} is larger than the {asset.size:,} bytes "
+                                      "the release says it has")
                 file.write(block)
                 digest.update(block)
-                received += len(block)
                 progress(received, asset.size)
     except (OSError, http.client.HTTPException) as exc:
         # OSError covers URLError, timeouts, and a reset connection;
@@ -334,6 +341,7 @@ def _from_archive(release: Release, current_version: str, installed_app: Path, s
     apps = [*unpacked.glob("*/*.app"), *unpacked.glob("*.app")]
     if len(apps) != 1:
         raise UpdateError(f"Expected one app in the Maramax {release.version} archive, found {len(apps)}")
+    _clear_extended_attributes(apps[0])
     _verify(apps[0], installed_app, release.version)
     return apps[0]
 
@@ -357,15 +365,39 @@ def _from_delta(release: Release, delta: Asset, current_version: str, installed_
         logger.info(f"{exc}; copying it instead")
         shutil.rmtree(new_app, ignore_errors=True)
         _run(["/usr/bin/ditto", str(installed_app), str(new_app)], f"copy {installed_app} to rebuild it")
-    # A copy installed from a browser download carries quarantine; the
-    # update must not, or Gatekeeper would stop it at the relaunch.
-    _run(["/usr/bin/xattr", "-cr", str(new_app)], "clear the rebuilt app's extended attributes")
+    _clear_extended_attributes(new_app)
     try:
         bundle_delta.apply(unpacked, new_app)
     except bundle_delta.DeltaError as exc:
         raise UpdateError(str(exc)) from exc
     _verify(new_app, installed_app, release.version)
     return new_app
+
+
+def _clear_extended_attributes(app: Path) -> None:
+    """The update must not carry quarantine, or Gatekeeper would stop it at
+    the relaunch: a copy installed from a browser download does (and a delta
+    is rebuilt from it), and a release's ZIP can hold the attribute too."""
+    _run(["/usr/bin/xattr", "-cr", str(app)], f"clear the extended attributes of {app}")
+
+
+def _require_it_starts(app: Path, version: str) -> None:
+    """Run the verified app far enough to say its version. The signature
+    covers no permission bits, so an app could pass it and still not open
+    (its executable not executable); installed, that copy could never
+    update again."""
+    name = _bundle_info(app).get("CFBundleExecutable")
+    if not isinstance(name, str) or "/" in name or not name:
+        raise UpdateError(f"Maramax {version} does not name its executable: {name!r}")
+    try:
+        result = subprocess.run([str(app / "Contents" / "MacOS" / name), "--version"], capture_output=True,
+                                text=True, timeout=120, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise UpdateError(f"The downloaded Maramax {version} does not start: {exc}") from exc
+    said = result.stdout.strip()
+    if result.returncode != 0 or said != f"maramax {version}":
+        raise UpdateError(f"The downloaded Maramax {version} does not start as that version: it answered "
+                          f"{said or result.stderr.strip()[-200:]!r} (exit status {result.returncode})")
 
 
 def running_macos() -> str:
@@ -449,6 +481,8 @@ def swap_script(*, pid: int, staged_app: Path, installed_app: Path, previous_app
     return f"""#!/bin/sh
 # Written by Maramax to replace itself once it has quit.
 {variables}
+# A log that cannot be written must not stop the install: exec failing would end the script here.
+( : >>"$log" ) 2>/dev/null || log=/dev/null
 exec >>"$log" 2>&1
 finish() {{
   echo "$1" > "$result"

@@ -22,6 +22,7 @@ def controller(monkeypatch):
                                       finish_drafts=lambda: True)
     app.qwen = SimpleNamespace(failed=False, unload=lambda: calls.append("qwen unloaded"))
     app.retry_model_item = SimpleNamespace(hidden=True)
+    app.reset_bar_item = SimpleNamespace(hidden=True)
     app.recorder = SimpleNamespace(start=lambda cancel: True, last_error=None, frames=[],
                                   capture_snapshot=CaptureMeter().snapshot, prepare=lambda: calls.append("helper"))
     app._shutting_down = False
@@ -527,18 +528,66 @@ def test_the_shortcut_dictates_on_the_bar_where_the_user_left_it(monkeypatch):
     assert ("bar at", [0.25, 0.75]) in calls
 
 
-def test_dragging_the_bar_is_remembered_and_settings_can_put_it_back(monkeypatch):
+def test_dragging_the_bar_is_remembered_and_the_menu_offers_the_way_back_only_then(monkeypatch):
     app, calls = controller(monkeypatch)
     saved = []
     app._save_settings = lambda: saved.append(app.config.bar_position) or True
     app.bar_moved((0.1, 0.9))
     assert app.config.bar_position == [0.1, 0.9] and saved == [[0.1, 0.9]]
+    assert not app.reset_bar_item.hidden
     app.bar_moved(None)                      # Dropped beside its default place.
-    assert app.config.bar_position is None
-    app.config.bar_position = [0.5, 0.5]
-    app.reset_bar_position()
-    assert app.config.bar_position is None and saved[-1] is None
+    assert app.config.bar_position is None and app.reset_bar_item.hidden
+    app.bar_moved((0.5, 0.5))
+    app.menu_reset_bar(None)                 # The menu item, or a double-click on the bar.
+    assert app.config.bar_position is None and saved[-1] is None and app.reset_bar_item.hidden
     assert calls[-1] == ("bar moved to", None)          # An open bar goes back at once.
+
+
+def test_media_from_the_menu_or_the_icon_is_transcribed_at_once_only_when_nothing_else_is_going_on(monkeypatch):
+    app, calls = controller(monkeypatch)
+    app.queue = TranscriptionQueue()
+    app.transcribe_file_directly = lambda path: calls.append(("transcribe", path))
+    app.transcribe_media(["/x/memo.m4a"])
+    assert calls[-1] == ("transcribe", "/x/memo.m4a") and app.queue.items() == []
+    app.transcribe_media(["/x/a.m4a", "/x/b.m4a"])       # Several: the Queue tab opens with them.
+    assert len(app.queue.items()) == 2 and calls[-1] == "activated window"
+    app.transcriber.is_ready = lambda: False             # Still loading: the file waits where the status is read.
+    app.transcribe_media(["/x/c.m4a"])
+    assert len(app.queue.items()) == 3 and calls[-1] == "activated window"
+    app.transcriber.is_ready = lambda: True
+    app._phase = Phase.TRANSCRIBING
+    app.overlay_visible = False                          # A dictation on the bar is being transcribed.
+    app.transcribe_media(["/x/d.m4a"])
+    assert len(app.queue.items()) == 4 and calls[-1] == "1 file waits in the Queue tab"
+    app.overlay_visible = True                           # The window shows the queue itself.
+    del calls[:]
+    app.transcribe_media(["/x/e.m4a"])
+    assert len(app.queue.items()) == 5 and calls == []
+    app._phase = Phase.IDLE
+    app.transcribe_media(["/x/f.m4a"], module.Mode.QUEUE)   # Dropped on the Queue tab: it joins the queue.
+    assert len(app.queue.items()) == 6
+    app._media_not_received("the disk is full")
+    assert calls[-1] == "The dropped file did not arrive — the disk is full"
+
+
+def test_a_file_dragged_out_of_another_app_is_not_saved_beside_an_original_it_does_not_have(monkeypatch, tmp_path):
+    app, calls = controller(monkeypatch)
+    app._support_dir = tmp_path
+    app.queue = TranscriptionQueue()
+    copy = module.media_drop.received_folder(tmp_path) / "drop" / "Memo.m4a"
+    app.queue.add_many([str(copy), "/Users/me/talk.m4a"])
+    app.overlay_controller.show_output_mode_dialog = lambda: module.OutputMode.NEXT_TO_ORIGINALS
+    app.queue_start_requested()
+    assert app._phase is Phase.IDLE and "no original to save beside" in calls[-1]
+
+
+def test_transcribe_files_shows_the_file_panel_without_the_window(monkeypatch):
+    app, calls = controller(monkeypatch)
+    app.overlay_controller.choose_media_files = lambda: calls.append("file panel") or ["/x/memo.m4a"]
+    app.transcribe_file_directly = lambda path: calls.append(("transcribe", path))
+    monkeypatch.setattr(module.AppHelper, "callAfter", lambda function, *args: function(*args))
+    app.menu_open_files(None)
+    assert calls == ["file panel", ("transcribe", "/x/memo.m4a")]      # No window before a file is chosen.
 
 
 def test_cancelling_while_the_microphone_connects_closes_the_window(monkeypatch):
@@ -729,6 +778,11 @@ def test_a_confirmed_clear_deletes_every_recording_and_kept_capture(monkeypatch,
     app._support_dir = tmp_path
     recovery.keep_unsaved(tmp_path, b"\x02\x00" * 16000)                 # From a failed archive.
     recovery.in_progress_path(tmp_path).write_bytes(b"\x03\x00" * 16000)  # One that could not be set aside.
+    memo = module.media_drop.received_folder(tmp_path) / "drop" / "Memo.m4a"  # Dragged out of another app.
+    memo.parent.mkdir(parents=True)
+    memo.write_bytes(b"audio")
+    app.queue = TranscriptionQueue()
+    app.queue.add_many([str(memo), "/Users/me/talk.m4a"])
     app.recorder.discard_recovery = lambda: None
     app.history_store = SimpleNamespace(render=lambda: None, clear=lambda: True)
     app.current_transcript = "words"
@@ -737,6 +791,7 @@ def test_a_confirmed_clear_deletes_every_recording_and_kept_capture(monkeypatch,
     app.clear_history_requested()
     assert app.recordings.list_recordings() == [] and recovery.unsaved_recordings(tmp_path) == []
     assert not recovery.in_progress_path(tmp_path).exists()
+    assert not memo.exists() and [item.path for item in app.queue.items()] == ["/Users/me/talk.m4a"]
     assert calls[-1] == "History and recordings cleared"
 
 
@@ -777,3 +832,19 @@ def test_a_second_esc_after_the_outcome_still_leaves_the_outcome_said(monkeypatc
     app.dismiss_requested()                                          # Esc twice, or the X clicked twice.
     app._complete_operation_on_main(0)
     assert shown[-1] == (module.COPIED_STATUS, 5)
+
+
+def test_recovery_moves_past_a_recording_whose_audio_file_cannot_be_read(monkeypatch, tmp_path):
+    app, calls = controller(monkeypatch)
+    store = RecordingStore(tmp_path)
+    older = store.save(b"\x01\x00" * 16000)
+    newer = store.save(b"\x02\x00" * 16000)
+    store.audio_path(newer.id).write_bytes(b"RIFF")        # Damaged on disk since it was saved.
+    app.recordings = store
+    app._support_dir = tmp_path
+    app._recover_worker(0, newer.id)
+    assert calls[-1] == "This recording's audio file could not be read"
+    chosen = []
+    app.transcribe_recording = chosen.append
+    app.recover_last_recording()
+    assert chosen == [older.id]                            # Not the unreadable one again.

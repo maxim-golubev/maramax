@@ -73,10 +73,11 @@ with patch.object(module, "ParakeetTranscriber", lambda: transcriber), \
     assert list(app.menu.keys())[:2] == ["Status", "Retry Speech Model"]
     titles = [key for key in app.menu.keys() if not str(key).startswith("SeparatorMenuItem")]
     assert titles == ["Status", "Retry Speech Model", "Start Dictation", "Copy Last Transcript", "Open Transcript",
-                      "History", "Recordings…", "Recover Last Recording", "Transcribe Files…", "Settings…",
-                      "Check for Updates…", "Quit Maramax"], titles
+                      "History", "Recordings…", "Recover Last Recording", "Transcribe Files…",
+                      "Reset Bar Position", "Settings…", "Check for Updates…", "Quit Maramax"], titles
     assert all(app.menu[title].callback is not None for title in titles[1:])
     assert app.menu["Retry Speech Model"].hidden            # The model has not failed to load.
+    assert app.menu["Reset Bar Position"].hidden            # The bar is in its default place.
     assert app.status_line._menuitem.view() is not None and app.status_line.text == app._resting_status
     from AppKit import NSEventModifierFlagControl, NSEventModifierFlagOption
     start = app.menu["Start Dictation"]._menuitem

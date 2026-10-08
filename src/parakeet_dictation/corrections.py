@@ -41,10 +41,10 @@ def _malformed(heard: str, replacement: str) -> str | None:
 
 def rule_key(heard: str) -> str:
     """What makes two rules one rule: the same words heard, however spaced or
-    capitalized. Lower case rather than casefold(), which would also take
+    capitalized, with either apostrophe. Lower case rather than casefold(), which would also take
     "STRASSE" for "Straße", which matching never does. (Matching, unlike
     lower(), also takes a handful of archaic letters such as ſ for s.)"""
-    return _cleaned(heard, "")[0].lower()
+    return _cleaned(heard, "")[0].lower().replace("’", "'")
 
 
 def normalize_rules(value: object) -> list[dict[str, str]]:
@@ -102,7 +102,8 @@ def _matcher(heard: str) -> str:
     """A regular expression for one heard phrase: literal text, any run of
     whitespace between its words, and a word boundary only on an edge that
     is itself a word character (a rule such as "..." has no such edge)."""
-    body = r"\s+".join(re.escape(part) for part in heard.split())
+    # Either apostrophe for either: one recognizer writes "don't", another "don’t".
+    body = r"\s+".join(re.sub("['’]", "['’]", re.escape(part)) for part in heard.split())
     before = r"(?<!\w)" if re.match(r"\w", heard[0]) else ""
     after = r"(?!\w)" if re.match(r"\w", heard[-1]) else ""
     return before + body + after

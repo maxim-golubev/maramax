@@ -1,6 +1,6 @@
 [project]
 name = "parakeet-dictation"
-version = "1.0.0"
+version = "1.1.0"
 description = "A dictation tool powered by Parakeet"
 readme = "README.md"
 license = { text = "MIT" }

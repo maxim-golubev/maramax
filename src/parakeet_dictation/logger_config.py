@@ -16,41 +16,36 @@ _LOGGER_NAME = "maramax"
 logger = logging.getLogger(_LOGGER_NAME)
 
 
-class ColoredFormatter(logging.Formatter):
-    COLORS = {
-        "DEBUG": "\033[36m",
-        "INFO": "\033[32m",
-        "WARNING": "\033[33m",
-        "ERROR": "\033[31m",
-        "CRITICAL": "\033[1;31m",
-    }
-    RESET = "\033[0m"
+# Console tints by severity, most severe first: the lowest level each applies
+# to and its ANSI SGR parameters.
+_TINTS = (
+    (logging.CRITICAL, "1;31"),
+    (logging.ERROR, "31"),
+    (logging.WARNING, "33"),
+    (logging.INFO, "32"),
+    (logging.DEBUG, "36"),
+)
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.use_colors = "NO_COLOR" not in os.environ
+
+def _tint(level: int) -> str | None:
+    """The SGR parameters for a record of `level`, or None for one below DEBUG."""
+    return next((parameters for lowest, parameters in _TINTS if level >= lowest), None)
+
+
+class ConsoleFormatter(logging.Formatter):
+    """A console line: the time, then the level and message, which take the
+    severity's tint when `tinted`."""
+
+    def __init__(self, tinted: bool):
+        super().__init__("%(levelname)s - %(message)s", datefmt="%H:%M:%S")
+        self._tinted = tinted
 
     def format(self, record: logging.LogRecord) -> str:
-        if not self.use_colors:
-            return super().format(record)
-
-        original_level = record.levelname
-        level_color = self.COLORS.get(original_level, "")
-        if not level_color:
-            return super().format(record)
-
-        try:
-            record.levelname = f"{level_color}{original_level}{self.RESET}"
-            log_message = super().format(record)
-        finally:
-            record.levelname = original_level
-
-        parts = log_message.split(" - ", 2)
-        if len(parts) < 3:
-            return log_message
-
-        timestamp, level, message = parts[0], parts[1], parts[2]
-        return f"{timestamp} - {level} - {level_color}{message}{self.RESET}"
+        said = super().format(record)
+        parameters = _tint(record.levelno) if self._tinted else None
+        if parameters is not None:
+            said = f"\033[{parameters}m{said}\033[0m"
+        return f"{self.formatTime(record, self.datefmt)} - {said}"
 
 
 def setup_logging(log_path: Path | None = None) -> logging.Logger:
@@ -70,11 +65,11 @@ def setup_logging(log_path: Path | None = None) -> logging.Logger:
     if _LOGGER_CONFIGURED:
         return logger
 
-    log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
-    logger.setLevel(log_level)
+    wanted = os.environ.get("LOG_LEVEL", "").upper()
+    logger.setLevel(logging.getLevelNamesMapping().get(wanted, logging.INFO))
 
     handler = logging.StreamHandler()
-    handler.setFormatter(ColoredFormatter("%(asctime)s - %(levelname)s - %(message)s", datefmt="%H:%M:%S"))
+    handler.setFormatter(ConsoleFormatter(tinted="NO_COLOR" not in os.environ))
 
     logger.addHandler(handler)
     _LOGGER_CONFIGURED = True

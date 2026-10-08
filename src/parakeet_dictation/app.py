@@ -5,13 +5,14 @@ from __future__ import annotations
 import enum
 import threading
 import time
+import wave
 from pathlib import Path
 
 import rumps
 from AppKit import NSApplication, NSMenu, NSMenuItem
 from PyObjCTools import AppHelper
 
-from . import __version__, recovery
+from . import __version__, media_drop, recovery
 from .audio_format import seconds as pcm_seconds
 from .audio_format import whole_samples
 from .autopaste import (PasteError, PasteTarget, accessibility_trusted, request_accessibility, send_paste_keystroke,
@@ -32,7 +33,8 @@ from .indicator import (BAR_SECONDS_AFTER_PROBLEM, BAR_SECONDS_AFTER_SUCCESS, CO
 from .isolated_recorder import IsolatedAudioRecorder
 from .logger_config import logger
 from .main_thread import call_later
-from .overlay import Mode, OverlayController
+from .menu_bar_drop import MenuBarDrop
+from .overlay import DropTarget, Mode, OverlayController, drop_target
 from .paths import app_bundle, app_support_dir, bundle_identifier, resource_path
 from .preferences import DELIVERY_LABELS, PreferencesController
 from .recordings import RecordingStatus, RecordingStore, recovery_candidate
@@ -75,6 +77,7 @@ SWITCHED_APPS_STATUS = "Copied, not pasted — you switched apps"
 MARAMAX_IN_FRONT_STATUS = "Copied, not pasted — a Maramax window was in front"
 INCOMPLETE_STATUS = "Microphone stopped — the transcript may be incomplete"
 CANCELLING_STATUS = "Cancelling…"
+RESET_BAR_TITLE = "Reset Bar Position"
 ADOPTING_STATUS = "Moving recovered audio into Recordings — try again in a moment"
 
 
@@ -186,6 +189,8 @@ class DictationApp(rumps.App):
             logger.info("Found unsaved recording from a previous session")
             threading.Thread(target=self._adopt_recovered_audio, daemon=True).start()
         adopt_legacy_history(self._support_dir)
+        # Copies of files dragged out of other apps in an earlier run: the queue that named them is gone.
+        media_drop.discard_received(self._support_dir)
         self.history_store = HistoryStore(self._support_dir, history_limit=self.config.history_limit)
         self.queue = TranscriptionQueue()
         self.current_transcript = ""
@@ -231,6 +236,8 @@ class DictationApp(rumps.App):
         self.retry_model_item = rumps.MenuItem("Retry Speech Model")
         self.retry_model_item.hidden = True
         self.record_menu = rumps.MenuItem("Start Dictation")
+        # Only while the bar has been dragged from its default place.
+        self.reset_bar_item = rumps.MenuItem(RESET_BAR_TITLE)
         update_item = rumps.MenuItem(CHECK_TITLE)
         self.menu = [
             self.status_line,
@@ -245,12 +252,14 @@ class DictationApp(rumps.App):
             rumps.MenuItem("Recover Last Recording"),
             rumps.MenuItem("Transcribe Files…"),
             None,
+            self.reset_bar_item,
             rumps.MenuItem("Settings…", key=","),
             update_item,
             None,
             rumps.MenuItem("Quit Maramax", key="q"),
         ]
         self._show_shortcut_in_menu()
+        self._show_bar_placement()
 
         self.overlay_controller = OverlayController.alloc().initWithDelegate_(self)
         self.indicator = DictationIndicator.alloc().initWithDelegate_(self)
@@ -265,6 +274,9 @@ class DictationApp(rumps.App):
         )
 
         self._install_edit_menu()
+        # The menu bar icon exists only once rumps has started the app.
+        self._icon_drop: MenuBarDrop | None = None
+        rumps.events.before_start.register(self._accept_media_on_menu_bar_icon)
         self._start_model_watchdog()
         self._register_global_hotkeys()
         self.updates.start()
@@ -948,6 +960,45 @@ class DictationApp(rumps.App):
         self.overlay_controller.show_mode(Mode.RESULT)
         self.overlay_controller.set_transcribing(True)
 
+    def transcribe_media(self, paths: list[str], mode: Mode = Mode.RESULT) -> None:
+        """Media files chosen from the menu, or dropped on the menu bar icon
+        or on the window while it shows `mode`: one is transcribed at once
+        when nothing else is going on; otherwise they wait in the Queue tab,
+        which opens unless something is running."""
+        waiting = self.is_busy or not self.transcriber.is_ready()
+        if drop_target(mode, len(paths), waiting) is DropTarget.TRANSCRIBE:
+            self.transcribe_file_directly(paths[0])
+            return
+        self.queue_add_files(paths)
+        if self.is_busy and not self.overlay_visible:
+            # Nothing on screen shows the queue: say where the files went.
+            files = "1 file waits" if len(paths) == 1 else f"{len(paths)} files wait"
+            self._push_status(f"{files} in the Queue tab", revert_after=5)
+
+    def _choose_media_to_transcribe(self) -> None:
+        # The panel alone: the window opens once there is something to show in it.
+        paths = self.overlay_controller.choose_media_files()
+        if paths:
+            self.transcribe_media(paths)
+
+    def receive_media(self, pasteboard, on_files) -> bool:
+        """Hand the media a drop carries to `on_files`; False when it carries none."""
+        return media_drop.receive(pasteboard, self._support_dir, on_files, self._media_not_received)
+
+    def _media_not_received(self, reason: str) -> None:
+        """A file dragged out of another app was promised and never written."""
+        self._push_status(f"The dropped file did not arrive — {reason}", revert_after=8)
+
+    def _accept_media_on_menu_bar_icon(self) -> None:
+        try:
+            self._icon_drop = MenuBarDrop.alloc().initWithButton_accepts_receive_(
+                self._nsapp.nsstatusitem.button(), lambda: not self.recording_active and not self._shutting_down,
+                lambda pasteboard: self.receive_media(pasteboard, self.transcribe_media))
+        except Exception:
+            # rumps only prints what a start-up callback raises. Without
+            # this the icon takes no drops; everything else works.
+            logger.exception("The menu bar icon could not be made to take dropped files")
+
     def _transcribe_file_worker(self, path: str, filename: str, session: int) -> None:
         def _progress(current_pos, total_pos):
             if self._cancel_event.is_set():
@@ -1014,8 +1065,18 @@ class DictationApp(rumps.App):
         try:
             # Loaded here, not on the menu-click (main) thread: an hour of
             # PCM is ~115 MB.
-            pcm_bytes = (self.recordings.load_pcm(recording) if isinstance(recording, str)
-                         else recovery.load_unsaved(recording))
+            pcm_bytes: bytes | None
+            if isinstance(recording, str):
+                try:
+                    pcm_bytes = self.recordings.load_pcm(recording)
+                except (OSError, EOFError, ValueError, wave.Error) as exc:
+                    # Tried now, so Recover Last Recording moves on to audio that can be read.
+                    logger.error(f"Recording {recording} could not be read: {exc}")
+                    self.recordings.update(recording, status=RecordingStatus.FAILED,
+                                           message="Audio file could not be read")
+                    raise TranscriptionError("This recording's audio file could not be read") from exc
+            else:
+                pcm_bytes = recovery.load_unsaved(recording)
             if not pcm_bytes:
                 self._push_status("No recording to recover", revert_after=5)
                 return
@@ -1106,6 +1167,12 @@ class DictationApp(rumps.App):
 
         destination = self.overlay_controller.show_output_mode_dialog()
         if destination is None:
+            return
+        if destination is OutputMode.NEXT_TO_ORIGINALS and any(
+                item.status == QueueStatus.PENDING and media_drop.is_received(item.path, self._support_dir)
+                for item in self.queue.items()):
+            self._push_status("A file dragged out of another app has no original to save beside — "
+                              "choose another place", revert_after=8)
             return
         # The dialog runs a nested event loop: the hotkey may have started
         # a dictation while it was open.
@@ -1372,14 +1439,19 @@ class DictationApp(rumps.App):
         """The bar was dragged: it opens there from now on (None: its default place)."""
         self.config.bar_position = None if placement is None else list(placement)
         self._save_settings()
-        self._refresh_preferences()
+        self._show_bar_placement()
 
     def reset_bar_position(self) -> None:
-        """Settings' Reset Position: the bar opens in its default place again, and moves there if it is up."""
+        """The menu's Reset Bar Position, or a double-click on the bar: it
+        opens in its default place again, and moves there if it is up."""
         self.config.bar_position = None
         self._save_settings()
         self.indicator.place(None)
-        self._refresh_preferences()
+        self._show_bar_placement()
+
+    def _show_bar_placement(self) -> None:
+        """The menu offers the way back only while the bar is somewhere else."""
+        self.reset_bar_item.hidden = self.config.bar_position is None
 
     def set_recordings_limit(self, count: int) -> None:
         self.config.recordings_limit = count
@@ -1564,6 +1636,11 @@ class DictationApp(rumps.App):
         recovery.discard_every_unsaved(self._support_dir)
         # A spill that could not even be set aside is audio too; nothing is recording now.
         recovery.discard_in_progress(self._support_dir)
+        media_drop.discard_received(self._support_dir)  # Recordings dragged out of other apps are audio too.
+        for item in self.queue.items():
+            if media_drop.is_received(item.path, self._support_dir):
+                self.queue.remove(item.id)
+        self._refresh_queue_on_main()
         cleared = self.history_store.clear()
         self.current_transcript = ""
         self.overlay_controller.set_current_text("")
@@ -1724,8 +1801,12 @@ class DictationApp(rumps.App):
         del sender
         if not self._can_begin_transcribing():
             return  # Said before the file panel, not after a choice it cannot act on.
-        self.open_transcript_window()
-        AppHelper.callAfter(self.overlay_controller.openFiles_, None)
+        AppHelper.callAfter(self._choose_media_to_transcribe)
+
+    @rumps.clicked(RESET_BAR_TITLE)
+    def menu_reset_bar(self, sender):
+        del sender
+        self.reset_bar_position()
 
     @rumps.clicked("Settings…")
     def menu_settings(self, sender):
