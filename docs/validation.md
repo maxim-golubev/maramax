@@ -935,3 +935,13 @@ Maramax the active app; cancelling it hands activation back.
 A drop on the menu bar icon, a recording dragged out of Voice Memos, a
 double-click on the bar, and the file panel cancelled with no Maramax window
 open.
+
+## 1.1.1 the transcript window opens centred — October 8, 2026
+
+The Maramax window opens centred on the main screen every time, instead of
+where it was last dragged until the app quit; while open it stays where it is
+dragged, and one left on a display that is unplugged is centred again. The
+placement test covers all three. Seen on screen in 1.1.0: a file dropped on the
+menu bar icon, a recording dragged out of Voice Memos, and a double-click on
+the bar. Still to see on screen: this window's placement, and the file panel
+cancelled with no Maramax window open.

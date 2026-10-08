@@ -358,7 +358,7 @@ finally:
 ''')
 
 
-def test_a_window_left_on_a_display_that_is_gone_comes_back():
+def test_the_window_opens_centred_every_time_and_one_on_a_display_that_is_gone_comes_back():
     run(r'''
 from AppKit import NSMakeRect
 from parakeet_dictation.overlay import OverlayController
@@ -367,9 +367,14 @@ window._place_on_a_screen()
 frame = window.panel.frame()
 visible = window.panel.screen().visibleFrame()
 moved = NSMakeRect(visible.origin.x + 10, visible.origin.y + 10, frame.size.width, frame.size.height)
+window._open = True                                  # As focus() leaves it.
 window.panel.setFrame_display_(moved, False)
 window._place_on_a_screen()
-assert window.panel.frame() == moved                 # Where the user left it.
+assert window.panel.frame() == moved                 # While open: where the user dragged it.
+window.hide()
+window._place_on_a_screen()
+assert window.panel.frame() == frame                 # Opened again: centred, as the first time.
+window._open = True
 window.panel.setFrame_display_(NSMakeRect(100000, 100000, frame.size.width, frame.size.height), False)
 assert window.panel.screen() is None                 # On a display that was unplugged.
 window._place_on_a_screen()

@@ -245,7 +245,7 @@ class OverlayController(NSObject):
         self._queue_processing = False
         self._selected_queue_file_id = None
         self._rendering_queue = False
-        self._positioned = False
+        self._open = False  # On screen: between focus() and hide().
         self._build_window()
         self._refresh_text_view()
         self._apply_recording_state()
@@ -727,7 +727,8 @@ class OverlayController(NSObject):
     def focus(self):
         # Activation must not depend on the app that is in front agreeing to
         # give way: the hotkey can arrive while any app is active.
-        self._place_on_a_screen()  # Not on a display that has since been unplugged.
+        self._place_on_a_screen()
+        self._open = True
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         self.panel.makeKeyAndOrderFront_(None)
         self.panel.makeMainWindow()
@@ -751,17 +752,16 @@ class OverlayController(NSObject):
     def show_mode(self, mode: Mode):
         self._set_mode(mode)
         self.mode_control.setSelectedSegment_(_SEGMENTS.index(mode))
-        self._place_on_a_screen()
         self.focus()
 
     @objc.python_method
     def _place_on_a_screen(self):
-        """Centred the first time; afterwards where the user left it, unless
-        that is on no screen now (a display was unplugged). AppKit does not
-        bring a borderless window back by itself."""
-        if not self._positioned or self.panel.screen() is None:
+        """Centred every time it opens, so it is always found in one place.
+        While open it stays where the user drags it, unless that is on no
+        screen now (a display was unplugged): AppKit does not bring a
+        borderless window back by itself."""
+        if not self._open or self.panel.screen() is None:
             self.panel.center()
-            self._positioned = True
 
     @objc.python_method
     def _set_mode(self, mode: Mode):
@@ -799,6 +799,7 @@ class OverlayController(NSObject):
     @objc.python_method
     def hide(self):
         self.panel.orderOut_(None)
+        self._open = False
         self.current_text = ""
         self._cancel_copy_feedback()
         self._refresh_text_view()
