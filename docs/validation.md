@@ -939,3 +939,33 @@ Maramax the active app; cancelling it hands activation back.
 
 The Maramax window's placement, and the file panel cancelled with no Maramax
 window open.
+
+## 1.1.2 AirPods without macOS's noise suppression — October 13, 2026
+
+Measured from source on this Mac (M3 Pro, macOS 15.8.1). 700 tests.
+
+### The cuts in AirPods dictations
+
+Dictations through AirPods Pro 2 lost words: dozens of drops of 0.2–3 s to
+-85 dBFS in a five-minute recording, with the Bluetooth link clean throughout
+(0–2 concealed packets a second, codec unchanged). coreaudiod's log named the
+cause for every AirPods recording: `NEGOTIATE [com.maramax.dictation] …
+semantics = airpods noise suppression`, a neural network (`AirpodsNoiseSuppression.dspg`)
+that macOS runs on AirPods input for apps that do not do their own voice
+processing, and that cut whatever it judged ambient, quiet speech included.
+
+Before each open the audio helper now asks CoreAudio to leave out every DSP
+offload the device lists (`'dsOa'`, input scope), through the per-process
+`'dsOb'` property. It needs no entitlement, and nothing else on the Mac is
+affected. If CoreAudio refuses, the recording goes ahead as before and the log
+says so.
+
+Checked on the AirPods, with the change's own function and the app's PyAudio
+open: 10 s of speech came through without a gap ("Testing, testing, …" twelve
+times), against a near-silent recording without it; the room alone measured
+0 % of 10 ms frames below -75 dBFS with the bypass and 78–89 % without; coreaudiod
+logged `Client Has Bypassed Offloads` and an empty negotiation.
+
+The CoreAudio calls in `recorder.py` (default input, built-in microphones,
+the bypass) now share one declaration of their C signatures and one device
+list.

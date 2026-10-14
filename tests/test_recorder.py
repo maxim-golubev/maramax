@@ -52,6 +52,8 @@ def recorder(monkeypatch):
     monkeypatch.setattr(module, "lid_closed", lambda: False)
     # Nor on which microphones this Mac has.
     monkeypatch.setattr(module, "builtin_input_names", lambda: {"MacBook Pro Microphone"})
+    # And never asks this Mac's real audio devices for anything.
+    monkeypatch.setattr(module, "bypass_device_noise_suppression", lambda: None)
     instance = module.AudioRecorder()
     yield instance
     instance.cleanup()
@@ -68,6 +70,15 @@ def test_explicit_airpods_choice_is_respected(recorder):
     recorder.device_name = "AirPods"
     assert recorder.start()
     assert FakeAudio.opens[-1]["input_device_index"] == 1
+
+
+def test_noise_suppression_is_bypassed_before_every_open(recorder, monkeypatch):
+    opens_seen = []
+    monkeypatch.setattr(module, "bypass_device_noise_suppression", lambda: opens_seen.append(len(FakeAudio.opens)))
+    recorder.device_name = "AirPods"
+    assert recorder.start()
+    assert opens_seen == [0]
+    assert len(FakeAudio.opens) == 1
 
 
 def test_missing_locked_mic_does_not_silently_switch(recorder):

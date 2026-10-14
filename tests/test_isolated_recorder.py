@@ -64,6 +64,7 @@ sys.modules["pyaudio"] = m
 import parakeet_dictation.recorder as recorder
 recorder.lid_closed = lambda: False  # Independent of this Mac's real lid,
 recorder.builtin_input_names = lambda: {"MacBook Pro Microphone"}  # and of its microphones.
+recorder.bypass_device_noise_suppression = lambda: None  # Never touches this Mac's real audio devices.
 REQUESTS = []
 
 def default_input_device():  # What CoreAudio would say; PortAudio's copy is STATE.

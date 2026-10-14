@@ -74,22 +74,56 @@ class _PropertyAddress(ctypes.Structure):
     _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("element", ctypes.c_uint32)]
 
 
+def _four_char_code(value: str) -> int:
+    return int.from_bytes(value.encode("ascii"), "big")
+
+
+def _address(selector: str, scope: str = "glob") -> _PropertyAddress:
+    """A property of an audio object's main element."""
+    return _PropertyAddress(_four_char_code(selector), _four_char_code(scope), 0)
+
+
+def _core_audio() -> Any:
+    """CoreAudio's property functions, with their C signatures declared."""
+    core_audio = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+    address = ctypes.POINTER(_PropertyAddress)
+    size = ctypes.POINTER(ctypes.c_uint32)
+    core_audio.AudioObjectHasProperty.restype = ctypes.c_bool
+    core_audio.AudioObjectHasProperty.argtypes = [ctypes.c_uint32, address]
+    core_audio.AudioObjectGetPropertyDataSize.restype = ctypes.c_int32
+    core_audio.AudioObjectGetPropertyDataSize.argtypes = [ctypes.c_uint32, address, ctypes.c_uint32, ctypes.c_void_p,
+                                                          size]
+    core_audio.AudioObjectGetPropertyData.restype = ctypes.c_int32
+    core_audio.AudioObjectGetPropertyData.argtypes = [ctypes.c_uint32, address, ctypes.c_uint32, ctypes.c_void_p,
+                                                      size, ctypes.c_void_p]
+    core_audio.AudioObjectSetPropertyData.restype = ctypes.c_int32
+    core_audio.AudioObjectSetPropertyData.argtypes = [ctypes.c_uint32, address, ctypes.c_uint32, ctypes.c_void_p,
+                                                      ctypes.c_uint32, ctypes.c_void_p]
+    return core_audio
+
+
+def _audio_device_ids(core_audio: Any) -> list[int]:
+    """Every audio device CoreAudio lists now (kAudioHardwarePropertyDevices
+    of kAudioObjectSystemObject, 1)."""
+    size = ctypes.c_uint32(0)
+    status = core_audio.AudioObjectGetPropertyDataSize(1, ctypes.byref(_address("dev#")), 0, None, ctypes.byref(size))
+    devices = (ctypes.c_uint32 * (size.value // 4))()
+    if status != 0 or core_audio.AudioObjectGetPropertyData(
+            1, ctypes.byref(_address("dev#")), 0, None, ctypes.byref(size), devices) != 0:
+        raise OSError(f"the device list could not be read ({status})")
+    return list(devices)
+
+
 def default_input_device() -> int | None:
     """CoreAudio's identifier of the system default input as it is now, or
     None when it cannot be read. PortAudio cannot tell: it fixes its device
     list, default included, when it initializes."""
     try:
-        core_audio = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
-        get = core_audio.AudioObjectGetPropertyData
-        get.restype = ctypes.c_int32
-        get.argtypes = [ctypes.c_uint32, ctypes.POINTER(_PropertyAddress), ctypes.c_uint32, ctypes.c_void_p,
-                        ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
-        # kAudioHardwarePropertyDefaultInputDevice of kAudioObjectSystemObject,
-        # global scope, main element.
-        address = _PropertyAddress(int.from_bytes(b"dIn ", "big"), int.from_bytes(b"glob", "big"), 0)
+        # kAudioHardwarePropertyDefaultInputDevice of kAudioObjectSystemObject.
         device = ctypes.c_uint32(0)
         size = ctypes.c_uint32(ctypes.sizeof(device))
-        status = get(1, ctypes.byref(address), 0, None, ctypes.byref(size), ctypes.byref(device))
+        status = _core_audio().AudioObjectGetPropertyData(
+            1, ctypes.byref(_address("dIn ")), 0, None, ctypes.byref(size), ctypes.byref(device))
         if status != 0:
             raise OSError(f"AudioObjectGetPropertyData returned {status}")
         return device.value
@@ -100,52 +134,33 @@ def default_input_device() -> int | None:
         return None
 
 
-def _four_char_code(value: str) -> int:
-    return int.from_bytes(value.encode("ascii"), "big")
-
-
 def builtin_input_names() -> set[str] | None:
     """The names of the Mac's own microphones as CoreAudio lists them (its
     transport type is built-in), in whatever language macOS is set to; None
     when CoreAudio cannot be read."""
     try:
-        core_audio = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+        core_audio = _core_audio()
         cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
-        size_of = core_audio.AudioObjectGetPropertyDataSize
-        size_of.restype = ctypes.c_int32
-        size_of.argtypes = [ctypes.c_uint32, ctypes.POINTER(_PropertyAddress), ctypes.c_uint32, ctypes.c_void_p,
-                            ctypes.POINTER(ctypes.c_uint32)]
-        get = core_audio.AudioObjectGetPropertyData
-        get.restype = ctypes.c_int32
-        get.argtypes = [ctypes.c_uint32, ctypes.POINTER(_PropertyAddress), ctypes.c_uint32, ctypes.c_void_p,
-                        ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
         cf.CFStringGetCString.restype = ctypes.c_bool
         cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
         cf.CFRelease.argtypes = [ctypes.c_void_p]
 
-        def address(selector: str, scope: str = "glob") -> _PropertyAddress:
-            return _PropertyAddress(_four_char_code(selector), _four_char_code(scope), 0)
-
         def read(device: int, selector: str, value) -> None:
             size = ctypes.c_uint32(ctypes.sizeof(value))
-            status = get(device, ctypes.byref(address(selector)), 0, None, ctypes.byref(size), ctypes.byref(value))
+            status = core_audio.AudioObjectGetPropertyData(
+                device, ctypes.byref(_address(selector)), 0, None, ctypes.byref(size), ctypes.byref(value))
             if status != 0:
                 raise OSError(f"AudioObjectGetPropertyData({selector!r}) returned {status}")
 
-        size = ctypes.c_uint32(0)
-        # kAudioHardwarePropertyDevices of kAudioObjectSystemObject (1).
-        status = size_of(1, ctypes.byref(address("dev#")), 0, None, ctypes.byref(size))
-        devices = (ctypes.c_uint32 * (size.value // 4))()
-        if status != 0 or get(1, ctypes.byref(address("dev#")), 0, None, ctypes.byref(size), devices) != 0:
-            raise OSError(f"the device list could not be read ({status})")
         names = set()
-        for device in devices:
+        for device in _audio_device_ids(core_audio):
             transport = ctypes.c_uint32(0)
             streams = ctypes.c_uint32(0)     # kAudioDevicePropertyStreams, input scope: bytes of stream ids
             name = ctypes.c_void_p()
             try:
                 read(device, "tran", transport)  # kAudioDevicePropertyTransportType
-                size_of(device, ctypes.byref(address("stm#", "inpt")), 0, None, ctypes.byref(streams))
+                core_audio.AudioObjectGetPropertyDataSize(
+                    device, ctypes.byref(_address("stm#", "inpt")), 0, None, ctypes.byref(streams))
                 if transport.value != _four_char_code("bltn") or not streams.value:
                     continue
                 read(device, "lnam", name)       # kAudioObjectPropertyName: a CFString this call hands over
@@ -163,6 +178,44 @@ def builtin_input_names() -> set[str] | None:
         # The English names are looked for instead (_find_builtin_index).
         logger.warning(f"Built-in microphones unavailable from CoreAudio: {exc}")
         return None
+
+
+def bypass_device_noise_suppression() -> None:
+    """Asks CoreAudio to give this process every input without the processing
+    macOS adds on its own: for AirPods, the hosted "airpods noise suppression"
+    DSP, which cuts quiet speech to near-silence. The request is per process,
+    so it is made before each open; devices that connected since the last open
+    are covered too."""
+    try:
+        core_audio = _core_audio()
+        cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+        # Input scope: the offloads a device offers ('dsOa', a dictionary keyed
+        # by offload name) and the ones this process skips ('dsOb', same shape).
+        available = _address("dsOa", "inpt")
+        bypassed = _address("dsOb", "inpt")
+        for device in _audio_device_ids(core_audio):
+            if not (core_audio.AudioObjectHasProperty(device, ctypes.byref(available))
+                    and core_audio.AudioObjectHasProperty(device, ctypes.byref(bypassed))):
+                continue
+            offloads = ctypes.c_void_p()  # A CFDictionary this call hands over.
+            size = ctypes.c_uint32(ctypes.sizeof(offloads))
+            status = core_audio.AudioObjectGetPropertyData(
+                device, ctypes.byref(available), 0, None, ctypes.byref(size), ctypes.byref(offloads))
+            if status != 0 or not offloads.value:
+                logger.warning(f"Audio device {device} did not list its offloads ({status})")
+                continue
+            try:
+                status = core_audio.AudioObjectSetPropertyData(
+                    device, ctypes.byref(bypassed), 0, None, ctypes.sizeof(offloads), ctypes.byref(offloads))
+                if status != 0:
+                    logger.warning(f"Audio device {device} refused the noise suppression bypass ({status})")
+            finally:
+                cf.CFRelease(offloads)
+    except Exception as exc:
+        # Never lose audio: without the bypass the recording still works, only
+        # with macOS's own noise suppression on the AirPods.
+        logger.warning(f"Noise suppression bypass unavailable: {exc}")
 
 
 class AudioRecorder:
@@ -498,6 +551,7 @@ class AudioRecorder:
 
             return (None, pyaudio.paComplete)
 
+        bypass_device_noise_suppression()
         with self._stream_lock:
             # PyAudio starts an input stream on open. Avoid a second start
             # during Bluetooth route negotiation.

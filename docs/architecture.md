@@ -26,8 +26,9 @@ src/parakeet_dictation/
                        keep-warm, failover (route_failed is the pure decision), list, release, ping.
   recorder.py          AudioRecorder: PyAudio capture with the PortAudio wedge defenses (bounded locks, abandoned sessions,
                        zombie guards), reopen() (same recording, new device), rearm() (new recording, same stream), lid_closed()
-                       (IOKit), default_input_device() (CoreAudio, read live). Imported only by the helper: the app process
-                       never loads PortAudio.
+                       (IOKit), default_input_device() (CoreAudio, read live), bypass_device_noise_suppression()
+                       (CoreAudio: before each open, asks that this process get every input without macOS's own AirPods
+                       noise suppression). Imported only by the helper: the app process never loads PortAudio.
   capture.py           CaptureMeter / CaptureSnapshot / CaptureHealth: what the stream is delivering and whether that is healthy;
                        summary() is the "microphone · m:ss" line the bar and the window show.
   audio_format.py      The one PCM format (16 kHz mono 16-bit) and its arithmetic.
